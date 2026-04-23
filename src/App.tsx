@@ -42,7 +42,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './lib/db';
-import { CustomReaction, ChatMessage, DictionaryEntry, SemanticAttribute, SemanticAttributeCollection } from './types';
+import { CustomReaction, ChatMessage, DictionaryEntry, SemanticAttribute, SemanticAttributeCollection, SegmentationTrace } from './types';
 import { v4 as uuidv4 } from 'uuid';
 
 /**
@@ -186,7 +186,8 @@ export default function App() {
   const [potentialCapture, setPotentialCapture] = useState<{ 
     title: string, 
     segments: any[], 
-    analysis: any 
+    analysis: any,
+    analysisTrace?: SegmentationTrace,
   } | null>(null);
   const [isWizardOpen, setIsWizardOpen] = useState(false);
   const [wizardTitle, setWizardTitle] = useState('');
@@ -422,6 +423,18 @@ export default function App() {
   const selectedSemanticAttributes = selectedSemanticCollection
     ? semanticAttributes.filter((a) => selectedSemanticCollection.attributeIds.includes(a.id))
     : [];
+  const buildSegmentationTrace = (): SegmentationTrace => ({
+    runId: uuidv4(),
+    timestamp: Date.now(),
+    provider: selectedModel,
+    granularityId: selectedGranularityProfile.id,
+    granularityName: selectedGranularityProfile.name,
+    granularityInstruction: selectedGranularityProfile.instruction,
+    semanticCollectionId: selectedSemanticCollection?.id || undefined,
+    semanticCollectionName: selectedSemanticCollection?.name || undefined,
+    semanticAttributeLabels: selectedSemanticAttributes.map((a) => a.label),
+    similarityThreshold: selectedSemanticSimilarity,
+  });
 
   useEffect(() => {
     if (!granularityProfiles.some((p) => p.id === selectedGranularityId)) {
@@ -597,6 +610,7 @@ export default function App() {
 
     setIsAnalyzing(true);
     try {
+      const analysisTrace = buildSegmentationTrace();
       const { analyzeAndSegmentConversation } = await loadGeminiService();
       const result = await analyzeAndSegmentConversation(inputText, {
         granularity: getCoreGranularity(selectedGranularityProfile.id),
@@ -607,6 +621,7 @@ export default function App() {
       });
       const enrichedResult = {
         ...result,
+        analysisTrace,
         analysis: {
           ...result.analysis,
           knowledgeGraph: applyAdherenceToGraph(result.analysis?.knowledgeGraph),
@@ -639,6 +654,10 @@ export default function App() {
       const isSessionUpdate = activeTab === 'chat' && currentChatConvId;
       const convId = isSessionUpdate ? currentChatConvId! : uuidv4();
       const now = Date.now();
+      const captureTrace: SegmentationTrace = potentialCapture.analysisTrace || buildSegmentationTrace();
+      const existingConversation = isSessionUpdate ? await db.conversations.get(convId) : undefined;
+      const previousTraces = existingConversation?.segmentationTraces || (existingConversation?.analysisTrace ? [existingConversation.analysisTrace] : []);
+      const segmentationTraces = [...previousTraces, captureTrace].slice(-25);
 
       const convData: any = {
         id: convId,
@@ -653,7 +672,9 @@ export default function App() {
           deviations: potentialCapture.analysis?.deviations || []
         },
         semanticSignature: potentialCapture.analysis?.semanticSignature || uuidv4(),
-        knowledgeGraph: potentialCapture.analysis?.knowledgeGraph || { nodes: [], edges: [] }
+        knowledgeGraph: potentialCapture.analysis?.knowledgeGraph || { nodes: [], edges: [] },
+        analysisTrace: captureTrace,
+        segmentationTraces,
       };
 
       if (!isSessionUpdate) {
@@ -688,7 +709,8 @@ export default function App() {
           previousSegmentId: prevId,
           parentLabel: seg.metadata?.reason,
           knowledgeGraph: seg.knowledgeGraph,
-          metadata: seg.metadata || {}
+          metadata: seg.metadata || {},
+          analysisTrace: captureTrace,
         });
         prevId = segId;
       }
@@ -944,6 +966,7 @@ export default function App() {
     if (chatMessages.length === 0) return;
     setIsAnalyzing(true);
     try {
+      const analysisTrace = buildSegmentationTrace();
       const fullText = chatMessages.map(m => `[${m.role.toUpperCase()}]: ${m.content}`).join('\n\n');
       const { analyzeAndSegmentConversation } = await loadGeminiService();
       const result = await analyzeAndSegmentConversation(fullText, {
@@ -955,6 +978,7 @@ export default function App() {
       });
       const enrichedResult = {
         ...result,
+        analysisTrace,
         analysis: {
           ...result.analysis,
           knowledgeGraph: applyAdherenceToGraph(result.analysis?.knowledgeGraph),

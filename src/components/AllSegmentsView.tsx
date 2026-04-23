@@ -2,7 +2,7 @@ import React from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from '../lib/db';
 import { motion } from 'motion/react';
-import { Tag, Quote, MessageSquare, Search, ChevronRight, Maximize2 } from 'lucide-react';
+import { Tag, Quote, MessageSquare, Search, ChevronRight, Maximize2, Fingerprint } from 'lucide-react';
 import { cn } from '../lib/utils';
 
 interface AllSegmentsViewProps {
@@ -84,6 +84,12 @@ export function AllSegmentsView({ onSelectConversation }: AllSegmentsViewProps) 
                 <div className="pt-3 mt-2 border-t border-dashed border-natural-sand text-[10px] text-natural-stone uppercase tracking-wider font-semibold">
                   {parentConv ? `Conversation: ${parentConv.title}` : `Conversation: ${segment.conversationId.slice(0, 8)}`}
                 </div>
+                {(segment.analysisTrace || parentConv?.analysisTrace) && (
+                  <div className="text-[10px] text-natural-muted uppercase tracking-wider font-semibold flex items-center gap-2">
+                    <Fingerprint className="w-3 h-3" />
+                    {`Granularite: ${(segment.analysisTrace || parentConv?.analysisTrace)?.granularityName || 'n/a'} | Collection: ${(segment.analysisTrace || parentConv?.analysisTrace)?.semanticCollectionName || 'Aucune'} | Similarite: ${((segment.analysisTrace || parentConv?.analysisTrace)?.similarityThreshold ?? 0.35).toFixed(2)}`}
+                  </div>
+                )}
               </div>
             </div>
           </div>

@@ -3,6 +3,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+export interface SegmentationTrace {
+  runId: string;
+  timestamp: number;
+  provider: string;
+  granularityId: string;
+  granularityName: string;
+  granularityInstruction?: string;
+  semanticCollectionId?: string;
+  semanticCollectionName?: string;
+  semanticAttributeLabels: string[];
+  similarityThreshold: number;
+}
+
 export interface Segment {
   id: string;
   conversationId: string;
@@ -25,6 +38,7 @@ export interface Segment {
     isDeviation?: boolean;
     reason?: string;
   };
+  analysisTrace?: SegmentationTrace;
 }
 
 export interface KnowledgeNode {
@@ -63,6 +77,8 @@ export interface Conversation {
   };
   deepAnalysis?: string;
   selectedModel?: string;
+  analysisTrace?: SegmentationTrace;
+  segmentationTraces?: SegmentationTrace[];
 }
 
 export interface DictionaryEntry {

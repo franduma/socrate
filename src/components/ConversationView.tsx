@@ -30,7 +30,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from '../lib/db';
 import { Suspense, lazy, useState } from 'react';
-import { Segment } from '../types';
+import { Segment, SegmentationTrace } from '../types';
 
 const ConceptualMap = lazy(() =>
   import('./ConceptualMap').then((module) => ({ default: module.ConceptualMap }))
@@ -61,6 +61,15 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
   const [isGraphFullscreen, setIsGraphFullscreen] = useState(false);
   const [activeSemanticDetail, setActiveSemanticDetail] = useState<{ id: string, type: 'vector' | 'interpretation' } | null>(null);
   const [semanticLoadingBySegment, setSemanticLoadingBySegment] = useState<Record<string, boolean>>({});
+  const latestConversationTrace: SegmentationTrace | undefined = conversation?.analysisTrace
+    || (conversation?.segmentationTraces && conversation.segmentationTraces.length > 0
+      ? conversation.segmentationTraces[conversation.segmentationTraces.length - 1]
+      : undefined);
+  const formatTrace = (trace?: SegmentationTrace) => {
+    if (!trace) return '';
+    const collection = trace.semanticCollectionName || 'Aucune collection';
+    return `Granularite: ${trace.granularityName} | Collection: ${collection} | Similarite: ${trace.similarityThreshold.toFixed(2)} | Provider: ${trace.provider}`;
+  };
 
   const renderDeferredPanel = (node: React.ReactNode, minHeightClass = 'min-h-[300px]') => (
     <Suspense
@@ -167,6 +176,12 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                   <Tag className="w-3.5 h-3.5" />
                   {conversation.segmentsCount} segments
                 </span>
+                {latestConversationTrace && (
+                  <span className="flex items-center gap-2 px-3 py-1 bg-white border border-natural-sand rounded-full text-natural-muted" title={formatTrace(latestConversationTrace)}>
+                    <Fingerprint className="w-3.5 h-3.5" />
+                    Trace active
+                  </span>
+                )}
                 <div className="flex bg-natural-bg/50 rounded-2xl p-1.5 border border-natural-sand shadow-inner ml-4">
                   <button 
                     onClick={() => setViewMode('flux')}
@@ -287,6 +302,11 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                     <div className="text-[10px] text-natural-stone uppercase tracking-wider font-semibold border-t border-dashed border-natural-sand pt-3">
                       Conversation: {conversation.title}
                     </div>
+                    {(segment.analysisTrace || latestConversationTrace) && (
+                      <div className="text-[10px] text-natural-muted uppercase tracking-wider font-semibold">
+                        {formatTrace(segment.analysisTrace || latestConversationTrace)}
+                      </div>
+                    )}
                     
                     {segment.semanticSignature && (
                       <div className="text-[10px] text-natural-accent font-medium italic opacity-70 flex items-center gap-2">
@@ -314,6 +334,11 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
             ))
           ) : viewMode === 'carte' ? (
             <div className="relative group/map">
+              {latestConversationTrace && (
+                <div className="mb-3 px-4 py-2 rounded-2xl border border-natural-sand bg-white text-[10px] font-bold uppercase tracking-wider text-natural-muted">
+                  {formatTrace(latestConversationTrace)}
+                </div>
+              )}
               {renderDeferredPanel(
                 <ConceptualMap 
                   conversation={conversation} 
@@ -326,6 +351,11 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
             </div>
           ) : (
             <div className="min-h-[600px]">
+              {latestConversationTrace && (
+                <div className="mb-3 px-4 py-2 rounded-2xl border border-natural-sand bg-white text-[10px] font-bold uppercase tracking-wider text-natural-muted">
+                  {formatTrace(latestConversationTrace)}
+                </div>
+              )}
               {renderDeferredPanel(
                 <KnowledgeGraphView 
                   graph={conversation.knowledgeGraph || { nodes: [], edges: [] }} 
@@ -354,6 +384,9 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                   <div>
                     <h2 className="font-serif text-2xl text-natural-heading">{conversation.title}</h2>
                     <p className="text-[10px] font-bold text-natural-muted uppercase tracking-[0.2em]">Visualisation Pleine Écran</p>
+                    {latestConversationTrace && (
+                      <p className="text-[10px] font-semibold text-natural-stone uppercase tracking-wider mt-1">{formatTrace(latestConversationTrace)}</p>
+                    )}
                   </div>
                 </div>
                 <button 
@@ -414,6 +447,11 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                         <p className="text-[10px] font-semibold text-natural-stone uppercase tracking-wider mt-1">
                           Conversation: {conversation.title}
                         </p>
+                        {(inspectedSegment.analysisTrace || latestConversationTrace) && (
+                          <p className="text-[10px] font-semibold text-natural-muted uppercase tracking-wider mt-1">
+                            {formatTrace(inspectedSegment.analysisTrace || latestConversationTrace)}
+                          </p>
+                        )}
                       </div>
                     </div>
                     <button 
@@ -696,6 +734,9 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
               <div>
                 <h2 className="font-serif text-3xl text-natural-heading">{conversation.title}</h2>
                 <p className="text-[10px] font-black text-natural-muted uppercase tracking-[0.3em]">Graphe Sémantique Plein Écran</p>
+                {latestConversationTrace && (
+                  <p className="text-[10px] font-semibold text-natural-stone uppercase tracking-wider mt-1">{formatTrace(latestConversationTrace)}</p>
+                )}
               </div>
             </div>
             <button 
