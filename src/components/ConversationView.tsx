@@ -29,11 +29,20 @@ import { formatDate, cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from '../lib/db';
-import { useState } from 'react';
-import { ConceptualMap } from './ConceptualMap';
-import { KnowledgeGraphView } from './KnowledgeGraphView';
+import { Suspense, lazy, useState } from 'react';
 import { Segment } from '../types';
-import { deepAnalyzeConversation } from '../services/geminiService';
+
+const ConceptualMap = lazy(() =>
+  import('./ConceptualMap').then((module) => ({ default: module.ConceptualMap }))
+);
+
+const KnowledgeGraphView = lazy(() =>
+  import('./KnowledgeGraphView').then((module) => ({ default: module.KnowledgeGraphView }))
+);
+
+async function loadGeminiService() {
+  return import('../services/geminiService');
+}
 
 interface ConversationViewProps {
   convId: string;
@@ -51,6 +60,19 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
 
   const [isGraphFullscreen, setIsGraphFullscreen] = useState(false);
   const [activeSemanticDetail, setActiveSemanticDetail] = useState<{ id: string, type: 'vector' | 'interpretation' } | null>(null);
+
+  const renderDeferredPanel = (node: React.ReactNode, minHeightClass = 'min-h-[300px]') => (
+    <Suspense
+      fallback={
+        <div className={`${minHeightClass} bg-white rounded-[32px] border border-natural-sand shadow-sm p-8 text-sm text-natural-muted flex items-center gap-3`}>
+          <Loader2 className="w-4 h-4 animate-spin" />
+          Chargement de la visualisation...
+        </div>
+      }
+    >
+      {node}
+    </Suspense>
+  );
 
   if (!conversation) return null;
 
@@ -70,6 +92,7 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
     try {
       // Concatenate all segments original text for deep analysis
       const allText = segments?.map(s => s.originalText || s.content).join('\n\n') || '';
+      const { deepAnalyzeConversation } = await loadGeminiService();
       const analysis = await deepAnalyzeConversation(allText);
       await db.conversations.update(convId, { deepAnalysis: analysis });
     } catch (error) {
@@ -248,19 +271,25 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
             ))
           ) : viewMode === 'carte' ? (
             <div className="relative group/map">
-              <ConceptualMap 
-                conversation={conversation} 
-                segments={segments || []} 
-                onFullscreen={() => setIsMapFullscreen(true)}
-                onSelectSegment={setInspectedSegment}
-              />
+              {renderDeferredPanel(
+                <ConceptualMap 
+                  conversation={conversation} 
+                  segments={segments || []} 
+                  onFullscreen={() => setIsMapFullscreen(true)}
+                  onSelectSegment={setInspectedSegment}
+                />,
+                'min-h-[700px]'
+              )}
             </div>
           ) : (
             <div className="min-h-[600px]">
-              <KnowledgeGraphView 
-                graph={conversation.knowledgeGraph || { nodes: [], edges: [] }} 
-                onFullscreen={() => setIsGraphFullscreen(true)}
-              />
+              {renderDeferredPanel(
+                <KnowledgeGraphView 
+                  graph={conversation.knowledgeGraph || { nodes: [], edges: [] }} 
+                  onFullscreen={() => setIsGraphFullscreen(true)}
+                />,
+                'min-h-[600px]'
+              )}
             </div>
           )}
         </div>
@@ -292,14 +321,17 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                 </button>
               </div>
               <div className="flex-1 bg-natural-bg/30">
-                <ConceptualMap 
-                  conversation={conversation} 
-                  segments={segments || []} 
-                  onSelectSegment={(s) => {
-                    setInspectedSegment(s);
-                    setIsMapFullscreen(false);
-                  }}
-                />
+                {renderDeferredPanel(
+                  <ConceptualMap 
+                    conversation={conversation} 
+                    segments={segments || []} 
+                    onSelectSegment={(s) => {
+                      setInspectedSegment(s);
+                      setIsMapFullscreen(false);
+                    }}
+                  />,
+                  'min-h-[500px]'
+                )}
               </div>
             </motion.div>
           )}
@@ -408,7 +440,7 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
 
                   {inspectedSegment.knowledgeGraph && inspectedSegment.knowledgeGraph.nodes?.length > 0 && (
                     <div className="h-[300px] border border-natural-sand rounded-3xl overflow-hidden shadow-sm mt-4">
-                      <KnowledgeGraphView graph={inspectedSegment.knowledgeGraph} standalone={true} />
+                      {renderDeferredPanel(<KnowledgeGraphView graph={inspectedSegment.knowledgeGraph} standalone={true} />, 'min-h-[300px]')}
                     </div>
                   )}
                   </div>
@@ -629,10 +661,13 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
           </div>
           
           <div className="flex-1 min-h-0 bg-white rounded-[40px] border border-natural-sand shadow-sm overflow-hidden p-2">
-            <KnowledgeGraphView 
-              graph={conversation.knowledgeGraph || { nodes: [], edges: [] }} 
-              standalone={true}
-            />
+            {renderDeferredPanel(
+              <KnowledgeGraphView 
+                graph={conversation.knowledgeGraph || { nodes: [], edges: [] }} 
+                standalone={true}
+              />,
+              'min-h-[500px]'
+            )}
           </div>
         </motion.div>
       )}

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { Suspense, lazy, useState, useEffect, useRef } from 'react';
 import { 
   Search, 
   Plus, 
@@ -42,17 +42,25 @@ import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './lib/db';
-import { analyzeAndSegmentConversation, chatWithGemini, deepAnalyzeConversation, testGeminiConnection } from './services/geminiService';
 import { CustomReaction, ChatMessage, DictionaryEntry } from './types';
 import { v4 as uuidv4 } from 'uuid';
-import { ConversationView } from './components/ConversationView';
 
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { AllSegmentsView } from './components/AllSegmentsView';
+const ConversationView = lazy(() =>
+  import('./components/ConversationView').then((module) => ({ default: module.ConversationView }))
+);
+
+const AllSegmentsView = lazy(() =>
+  import('./components/AllSegmentsView').then((module) => ({ default: module.AllSegmentsView }))
+);
+
+async function loadGeminiService() {
+  return import('./services/geminiService');
+}
 
 export default function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
@@ -138,6 +146,7 @@ export default function App() {
   const handleTestConnection = async () => {
     setIsTestingConnection(true);
     try {
+      const { testGeminiConnection } = await loadGeminiService();
       const ok = await testGeminiConnection();
       if (ok) {
         alert("✅ Connexion à l'IA réussie ! Socrate est prêt.");
@@ -153,6 +162,19 @@ export default function App() {
   const [isExporting, setIsExporting] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [showExportConfirm, setShowExportConfirm] = useState(false);
+
+  const renderDeferredView = (node: React.ReactNode) => (
+    <Suspense
+      fallback={
+        <div className="bg-white rounded-[32px] border border-natural-sand shadow-sm p-8 text-sm text-natural-muted flex items-center gap-3">
+          <Loader2 className="w-4 h-4 animate-spin" />
+          Chargement de la vue...
+        </div>
+      }
+    >
+      {node}
+    </Suspense>
+  );
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -181,6 +203,7 @@ export default function App() {
 
     setIsAnalyzing(true);
     try {
+      const { analyzeAndSegmentConversation } = await loadGeminiService();
       const result = await analyzeAndSegmentConversation(inputText);
       setPotentialCapture(result);
       setWizardTitle(result.title);
@@ -445,6 +468,7 @@ export default function App() {
     setChatInput('');
     setIsChatLoading(true);
     try {
+      const { chatWithGemini } = await loadGeminiService();
       const modelHistory = chatMessages.map(m => ({ role: m.role, content: m.content }));
       const responsePromise = chatWithGemini(actualContent, modelHistory);
       const response = await responsePromise;
@@ -498,6 +522,7 @@ export default function App() {
     setIsAnalyzing(true);
     try {
       const fullText = chatMessages.map(m => `[${m.role.toUpperCase()}]: ${m.content}`).join('\n\n');
+      const { analyzeAndSegmentConversation } = await loadGeminiService();
       const result = await analyzeAndSegmentConversation(fullText);
       
       // Update potentialCapture
@@ -1037,7 +1062,9 @@ export default function App() {
                   </div>
                 </motion.div>
             ) : activeTab === 'segments' && !selectedConvId ? (
-              <motion.div key="segments-view" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }} className="max-w-4xl mx-auto w-full"><AllSegmentsView onSelectConversation={(convId) => { setSelectedConvId(convId); setSourceTab('segments'); }} /></motion.div>
+              <motion.div key="segments-view" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }} className="max-w-4xl mx-auto w-full">
+                {renderDeferredView(<AllSegmentsView onSelectConversation={(convId) => { setSelectedConvId(convId); setSourceTab('segments'); }} />)}
+              </motion.div>
             ) : !selectedConvId ? (
               <motion.div key="workspace-home" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }} className="max-w-4xl mx-auto w-full">
                 <section className="bg-white p-10 rounded-[32px] border border-natural-sand shadow-sm flex flex-col transition-all hover:shadow-md">
@@ -1070,7 +1097,7 @@ export default function App() {
                 </section>
               </motion.div>
             ) : (
-              <ConversationView convId={selectedConvId} onBack={() => { setSelectedConvId(null); setActiveTab(sourceTab); }} />
+              renderDeferredView(<ConversationView convId={selectedConvId} onBack={() => { setSelectedConvId(null); setActiveTab(sourceTab); }} />)
             )}
            </AnimatePresence>
         </div>
