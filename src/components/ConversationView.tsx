@@ -60,6 +60,7 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
 
   const [isGraphFullscreen, setIsGraphFullscreen] = useState(false);
   const [activeSemanticDetail, setActiveSemanticDetail] = useState<{ id: string, type: 'vector' | 'interpretation' } | null>(null);
+  const [semanticLoadingBySegment, setSemanticLoadingBySegment] = useState<Record<string, boolean>>({});
 
   const renderDeferredPanel = (node: React.ReactNode, minHeightClass = 'min-h-[300px]') => (
     <Suspense
@@ -100,6 +101,41 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
       alert("Erreur lors de l'analyse profonde.");
     } finally {
       setIsAnalyzingDeep(false);
+    }
+  };
+
+  const handleSegmentSemanticAction = async (
+    segment: Segment,
+    type: 'vector' | 'interpretation'
+  ) => {
+    const hasData = type === 'vector' ? !!segment.semanticVectorDescription : !!segment.semanticInterpretation;
+    if (hasData) {
+      setActiveSemanticDetail(
+        activeSemanticDetail?.id === segment.id && activeSemanticDetail?.type === type
+          ? null
+          : { id: segment.id, type }
+      );
+      return;
+    }
+
+    setSemanticLoadingBySegment((prev) => ({ ...prev, [segment.id]: true }));
+    try {
+      const { enrichSegmentSemantics } = await loadGeminiService();
+      const enriched = await enrichSegmentSemantics(
+        segment.originalText || segment.content,
+        segment.role,
+        conversation.semanticAnalysis?.summary || ''
+      );
+      await db.segments.update(segment.id, {
+        semanticVectorDescription: enriched.semanticVectorDescription,
+        semanticInterpretation: enriched.semanticInterpretation,
+      });
+      setActiveSemanticDetail({ id: segment.id, type });
+    } catch (error) {
+      console.error(error);
+      alert("Impossible de calculer l'analyse sémantique de ce segment.");
+    } finally {
+      setSemanticLoadingBySegment((prev) => ({ ...prev, [segment.id]: false }));
     }
   };
 
@@ -212,37 +248,44 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                         <button 
                           onClick={(e) => {
                             e.stopPropagation();
-                            setActiveSemanticDetail(activeSemanticDetail?.id === segment.id && activeSemanticDetail?.type === 'vector' ? null : { id: segment.id, type: 'vector' });
+                            handleSegmentSemanticAction(segment, 'vector');
                           }}
+                          disabled={!!semanticLoadingBySegment[segment.id]}
                           className={cn(
                             "p-2 rounded-lg transition-all border",
                             activeSemanticDetail?.id === segment.id && activeSemanticDetail?.type === 'vector' 
                               ? "bg-natural-accent text-white border-natural-accent shadow-md" 
-                              : "bg-white text-natural-stone border-natural-sand hover:bg-natural-bg"
+                              : "bg-white text-natural-stone border-natural-sand hover:bg-natural-bg",
+                            semanticLoadingBySegment[segment.id] && "opacity-60 cursor-wait"
                           )}
                           title="Vecteur Sémantique"
                         >
-                          <Activity className="w-3.5 h-3.5" />
+                          {semanticLoadingBySegment[segment.id] ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Activity className="w-3.5 h-3.5" />}
                         </button>
                         <button 
                           onClick={(e) => {
                             e.stopPropagation();
-                            setActiveSemanticDetail(activeSemanticDetail?.id === segment.id && activeSemanticDetail?.type === 'interpretation' ? null : { id: segment.id, type: 'interpretation' });
+                            handleSegmentSemanticAction(segment, 'interpretation');
                           }}
+                          disabled={!!semanticLoadingBySegment[segment.id]}
                           className={cn(
                             "p-2 rounded-lg transition-all border",
                             activeSemanticDetail?.id === segment.id && activeSemanticDetail?.type === 'interpretation' 
                               ? "bg-natural-accent text-white border-natural-accent shadow-md" 
-                              : "bg-white text-natural-stone border-natural-sand hover:bg-natural-bg"
+                              : "bg-white text-natural-stone border-natural-sand hover:bg-natural-bg",
+                            semanticLoadingBySegment[segment.id] && "opacity-60 cursor-wait"
                           )}
                           title="Interprétation Sémantique"
                         >
-                          <BookOpenText className="w-3.5 h-3.5" />
+                          {semanticLoadingBySegment[segment.id] ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <BookOpenText className="w-3.5 h-3.5" />}
                         </button>
                       </div>
                     </div>
                     <div className="text-natural-text leading-relaxed whitespace-pre-wrap text-base md:text-lg font-serif">
                       {segment.originalText || segment.content}
+                    </div>
+                    <div className="text-[10px] text-natural-stone uppercase tracking-wider font-semibold border-t border-dashed border-natural-sand pt-3">
+                      Conversation: {conversation.title}
                     </div>
                     
                     {segment.semanticSignature && (
@@ -367,6 +410,9 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                         <h4 className="font-serif text-2xl text-natural-heading">Inspection du segment</h4>
                         <p className="text-[10px] font-bold text-natural-muted uppercase tracking-widest">
                           {inspectedSegment.role === 'assistant' ? 'Socrate' : 'Explorateur'} • ID: {inspectedSegment.id.substring(0, 8)}
+                        </p>
+                        <p className="text-[10px] font-semibold text-natural-stone uppercase tracking-wider mt-1">
+                          Conversation: {conversation.title}
                         </p>
                       </div>
                     </div>

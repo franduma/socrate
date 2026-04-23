@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useId, useMemo, useRef } from 'react';
 import * as d3 from 'd3';
 import { KnowledgeGraph } from '../types';
 import { Share2, Info, Maximize2, Download } from 'lucide-react';
@@ -12,10 +12,43 @@ interface KnowledgeGraphViewProps {
 export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: KnowledgeGraphViewProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const nodeRadius = 50;
+  const arrowOffset = 14;
+  const rawMarkerId = useId();
+  const markerId = useMemo(() => `arrowhead-${rawMarkerId.replace(/[^a-zA-Z0-9_-]/g, '')}`, [rawMarkerId]);
+  const safeGraph = useMemo(() => {
+    const rawNodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+    const nodes = rawNodes
+      .filter((n: any) => n && typeof n.id === 'string' && n.id.trim().length > 0)
+      .map((n: any) => ({
+        id: n.id,
+        label: typeof n.label === 'string' && n.label.trim().length > 0 ? n.label : n.id,
+        type: typeof n.type === 'string' && n.type.trim().length > 0 ? n.type : 'Concept',
+        properties: n.properties || {},
+      }));
+
+    const nodeIds = new Set(nodes.map((n) => n.id));
+    const rawEdges = Array.isArray(graph?.edges) ? graph.edges : [];
+    const edges = rawEdges
+      .filter((e: any) => {
+        if (!e) return false;
+        const source = String(e.source ?? '');
+        const target = String(e.target ?? '');
+        return source.length > 0 && target.length > 0 && nodeIds.has(source) && nodeIds.has(target);
+      })
+      .map((e: any) => ({
+        id: typeof e.id === 'string' && e.id.trim().length > 0 ? e.id : `${e.source}-${e.target}`,
+        source: String(e.source),
+        target: String(e.target),
+        label: typeof e.label === 'string' && e.label.trim().length > 0 ? e.label : 'related',
+      }));
+
+    return { nodes, edges };
+  }, [graph]);
 
   useEffect(() => {
     if (!svgRef.current || !containerRef.current) return;
-    if (!graph || !graph.nodes || !graph.nodes.length) return;
+    if (!safeGraph.nodes.length) return;
 
     const updateDimensions = () => {
       if (!containerRef.current || !svgRef.current) return;
@@ -48,39 +81,41 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
 
       svg.call(zoom as any);
 
-      const simulation = d3.forceSimulation<any>(graph.nodes)
-        .force("link", d3.forceLink<any, any>(graph.edges).id(d => d.id).distance(250))
+      try {
+      const simulation = d3.forceSimulation<any>(safeGraph.nodes)
+        .force("link", d3.forceLink<any, any>(safeGraph.edges).id(d => d.id).distance(250))
         .force("charge", d3.forceManyBody().strength(-1200))
         .force("center", d3.forceCenter(width / 2, height / 2))
         .force("collision", d3.forceCollide().radius(100));
 
       // Define arrow marker
       svg.append("defs").append("marker")
-        .attr("id", "arrowhead")
-        .attr("viewBox", "-0 -5 10 10")
-        .attr("refX", 55) // Offset arrow for node radius
+        .attr("id", markerId)
+        .attr("viewBox", "0 -6 12 12")
+        .attr("refX", 52)
         .attr("refY", 0)
         .attr("orient", "auto")
-        .attr("markerWidth", 6)
-        .attr("markerHeight", 6)
-        .attr("xoverflow", "visible")
+        .attr("markerUnits", "userSpaceOnUse")
+        .attr("markerWidth", 12)
+        .attr("markerHeight", 12)
+        .attr("overflow", "visible")
         .append("path")
-        .attr("d", "M 0,-5 L 10,0 L 0,5")
-        .attr("fill", "#9a9a83")
+        .attr("d", "M 0,-6 L 12,0 L 0,6")
+        .attr("fill", "#8b5e34")
         .style("stroke", "none");
 
       const link = g.append("g")
         .attr("stroke", "#9a9a83")
         .attr("stroke-opacity", 0.4)
         .selectAll("line")
-        .data(graph.edges)
+        .data(safeGraph.edges)
         .join("line")
-        .attr("marker-end", "url(#arrowhead)")
+        .attr("marker-end", `url(#${markerId})`)
         .attr("stroke-width", 1.5);
 
       const edgeLabels = g.append("g")
         .selectAll("text")
-        .data(graph.edges)
+        .data(safeGraph.edges)
         .join("text")
         .attr("class", "edge-label")
         .attr("font-size", "9px")
@@ -92,7 +127,7 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
 
       const node = g.append("g")
         .selectAll("g")
-        .data(graph.nodes)
+        .data(safeGraph.nodes)
         .join("g")
         .attr("class", "node")
         .call(d3.drag<any, any>()
@@ -137,8 +172,18 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
         link
           .attr("x1", (d: any) => d.source.x)
           .attr("y1", (d: any) => d.source.y)
-          .attr("x2", (d: any) => d.target.x)
-          .attr("y2", (d: any) => d.target.y);
+          .attr("x2", (d: any) => {
+            const dx = d.target.x - d.source.x;
+            const dy = d.target.y - d.source.y;
+            const len = Math.hypot(dx, dy) || 1;
+            return d.target.x - (dx / len) * (nodeRadius + arrowOffset);
+          })
+          .attr("y2", (d: any) => {
+            const dx = d.target.x - d.source.x;
+            const dy = d.target.y - d.source.y;
+            const len = Math.hypot(dx, dy) || 1;
+            return d.target.y - (dy / len) * (nodeRadius + arrowOffset);
+          });
 
         node.attr("transform", (d: any) => `translate(${d.x},${d.y})`);
 
@@ -171,6 +216,11 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
       });
 
       return simulation;
+      } catch (error) {
+        console.error("KnowledgeGraph render failed:", error);
+        svg.selectAll("*").remove();
+        return null;
+      }
     };
 
     const simulation = updateDimensions();
@@ -180,11 +230,11 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
       if (simulation) simulation.stop();
       resizeObserver.disconnect();
     };
-  }, [graph]);
+  }, [safeGraph, markerId]);
 
   const exportToCypher = () => {
-    const nodes = graph.nodes.map(n => `CREATE (n${n.id.replace(/-/g, '')}:${n.type.replace(/\s+/g, '')} {id: "${n.id}", label: "${n.label}"})`).join('\n');
-    const edges = graph.edges.map(e => `MATCH (a), (b) WHERE a.id = "${e.source}" AND b.id = "${e.target}" CREATE (a)-[:${e.label.replace(/\s+/g, '_').toUpperCase()}]->(b)`).join('\n');
+    const nodes = safeGraph.nodes.map(n => `CREATE (n${n.id.replace(/-/g, '')}:${n.type.replace(/\s+/g, '')} {id: "${n.id}", label: "${n.label}"})`).join('\n');
+    const edges = safeGraph.edges.map(e => `MATCH (a), (b) WHERE a.id = "${e.source}" AND b.id = "${e.target}" CREATE (a)-[:${e.label.replace(/\s+/g, '_').toUpperCase()}]->(b)`).join('\n');
     const cypher = `${nodes}\n${edges}`;
     
     const blob = new Blob([cypher], { type: 'text/plain' });
@@ -233,7 +283,7 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
       </div>
       
       <div className="flex-1 w-full bg-natural-bg/5 relative">
-        {(!graph || !graph.nodes || graph.nodes.length === 0) && (
+        {safeGraph.nodes.length === 0 && (
           <div className="absolute inset-0 flex flex-col items-center justify-center text-natural-muted p-8 text-center bg-natural-sand/20">
             <Info className="w-10 h-10 mb-4 opacity-30" />
             <p className="font-serif text-lg italic opacity-70">Aucun graphe extrait pour ce segment</p>

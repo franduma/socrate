@@ -1,308 +1,917 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { Segment } from "../types";
-import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4 } from "uuid";
 
-const MODELS_TO_TRY = [
+type Provider = "gemini" | "hardwired_gemini" | "openai" | "claude" | "openrouter" | "codex";
+export type SegmentGranularity = "intact" | "balanced" | "fine";
+
+type AnalysisResult = {
+  title: string;
+  segments: (Partial<Segment> & { metadata: { isPivot?: boolean; reason?: string } })[];
+  analysis: {
+    summary: string;
+    themes: string[];
+    suggestedTags: string[];
+    deviations: string[];
+    semanticSignature: string;
+    knowledgeGraph: {
+      nodes: { id: string; label: string; type: string; properties?: Record<string, any> }[];
+      edges: { id: string; source: string; target: string; label: string }[];
+    };
+  };
+};
+
+export type ConnectionTestResult = {
+  ok: boolean;
+  provider: Provider;
+  model?: string;
+  details?: string;
+};
+
+type AnalyzeOptions = {
+  granularity?: SegmentGranularity;
+  customSegmentationInstruction?: string;
+};
+
+const GEMINI_MODELS_TO_TRY = [
   "gemini-1.5-flash",
   "gemini-1.5-pro",
   "gemini-1.5-flash-latest",
   "gemini-1.5-pro-latest",
   "gemini-1.5-flash-8b",
-  "gemini-pro"
+  "gemini-pro",
 ];
 
-function getApiKey() {
-  return localStorage.getItem('GEMINI_API_KEY_OVERRIDE') || (import.meta.env.VITE_GEMINI_API_KEY as string) || (process.env.GEMINI_API_KEY as string);
+const OPENAI_MODELS_TO_TRY = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"];
+
+const SEMANTIC_STOP_WORDS = new Set([
+  "le", "la", "les", "un", "une", "des", "du", "de", "d", "et", "ou", "mais", "donc", "or", "ni", "car",
+  "que", "qui", "quoi", "dont", "où", "ce", "cet", "cette", "ces", "se", "sa", "son", "ses", "en", "dans",
+  "sur", "sous", "avec", "sans", "pour", "par", "pas", "plus", "moins", "ne", "au", "aux", "a", "à", "est",
+  "sont", "être", "été", "avoir", "fait", "faire", "comme", "si", "on", "il", "elle", "ils", "elles", "nous",
+  "vous", "je", "tu", "mon", "ton", "ma", "ta", "mes", "tes", "leurs", "leur", "y", "lui", "eux", "cela",
+  "ça", "c", "j", "n", "m", "t", "s", "qu", "aujourd", "hui"
+]);
+
+function getSegmentationInstruction(granularity: SegmentGranularity) {
+  if (granularity === "intact") {
+    return "Segmentation=INTACT: conserve de grands blocs cohérents. Vise 1 à 4 segments maximum.";
+  }
+  if (granularity === "fine") {
+    return "Segmentation=FINE: découpe en micro-unités sémantiques (1 à 3 idées clés par segment). Vise 8 à 18 segments selon la longueur.";
+  }
+  return "Segmentation=BALANCED: découpe équilibrée par intention/question/réponse. Vise 4 à 10 segments selon la longueur.";
 }
 
-function getSelectedModel() {
-  return localStorage.getItem('GEMINI_MANUAL_MODEL') || null;
+function tokenizeSemantic(text: string): string[] {
+  return (text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 2 && !SEMANTIC_STOP_WORDS.has(w));
+}
+
+function toSemanticVector(text: string): Map<string, number> {
+  const vec = new Map<string, number>();
+  for (const token of tokenizeSemantic(text)) {
+    vec.set(token, (vec.get(token) || 0) + 1);
+  }
+  return vec;
+}
+
+function cosineSimilarityMap(a: Map<string, number>, b: Map<string, number>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  a.forEach((va, key) => {
+    na += va * va;
+    const vb = b.get(key) || 0;
+    dot += va * vb;
+  });
+  b.forEach((vb) => {
+    nb += vb * vb;
+  });
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  if (!denom) return 0;
+  return dot / denom;
+}
+
+function isQuestionLike(text: string): boolean {
+  const t = (text || "").toLowerCase();
+  if (t.includes("?")) return true;
+  return /\b(pourquoi|comment|que|quoi|quel|quelle|quels|quelles|est-ce|peux-tu|pouvez-vous|dois-je)\b/.test(t);
+}
+
+function getAnalysisSignalScore(text: string): number {
+  const t = (text || "").toLowerCase();
+  let score = 0;
+  if (/\b(analyse|interpretation|synthese|conclusion|hypothese|postulat|contradiction|deviation|raisonnement)\b/.test(t)) score += 2;
+  if (t.length > 240) score += 1;
+  if (/\b(donc|ainsi|en consequence|ce qui implique|il ressort)\b/.test(t)) score += 1;
+  if (isQuestionLike(t)) score -= 2;
+  return score;
+}
+
+function truncateText(text: string, max = 140): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max - 1)}…`;
+}
+
+function inferQuestionFromAnalysis(text: string): string {
+  const tokens = tokenizeSemantic(text);
+  const frequencies = new Map<string, number>();
+  tokens.forEach((t) => frequencies.set(t, (frequencies.get(t) || 0) + 1));
+  const topWords = [...frequencies.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4)
+    .map(([w]) => w);
+  if (topWords.length === 0) {
+    return "Quelle est la question de fond qui a motivé cette analyse socratique ?";
+  }
+  return `Comment clarifier le lien entre ${topWords.join(", ")} dans cette discussion ?`;
+}
+
+function buildLocalVectorDescription(text: string): string {
+  const vec = toSemanticVector(text);
+  const topTerms = [...vec.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([term, weight]) => `${term}:${weight}`);
+  if (topTerms.length === 0) return "Vecteur lexical indisponible (texte trop court).";
+  return `Vecteur lexical local (top dimensions): ${topTerms.join(" | ")}`;
+}
+
+function buildLocalInterpretation(text: string, role: Segment["role"]): string {
+  const questionTone = isQuestionLike(text) ? "orienté questionnement" : "orienté assertion";
+  const analysisSignal = getAnalysisSignalScore(text);
+  const posture = analysisSignal >= 2 ? "analyse structurée" : "propos exploratoire";
+  return `Lecture locale: segment ${questionTone}, posture "${posture}", rôle détecté "${role}".`;
+}
+
+function buildFallbackSegmentGraph(segment: any, index = 0) {
+  const sourceText = String(segment.originalText || segment.content || "");
+  const topTokens = tokenizeSemantic(sourceText).slice(0, 4);
+  const centerId = `seg-core-${index}`;
+  const nodes: Array<{ id: string; label: string; type: string; properties?: Record<string, any> }> = [
+    {
+      id: centerId,
+      label: segment.role === "assistant" ? `Analyse ${index + 1}` : `Position ${index + 1}`,
+      type: segment.role === "assistant" ? "Analysis" : "Question",
+      properties: {},
+    },
+  ];
+  const edges: Array<{ id: string; source: string; target: string; label: string }> = [];
+  topTokens.forEach((token, i) => {
+    const tokenId = `seg-${index}-kw-${i}`;
+    nodes.push({ id: tokenId, label: token, type: "Keyword", properties: {} });
+    edges.push({
+      id: `seg-${index}-edge-${i}`,
+      source: centerId,
+      target: tokenId,
+      label: "évoque",
+    });
+  });
+  return { nodes, edges };
+}
+
+function buildFallbackConversationGraph(parsed: any): {
+  nodes: { id: string; label: string; type: string; properties?: Record<string, any> }[];
+  edges: { id: string; source: string; target: string; label: string }[];
+} {
+  const rootId = `conv-${uuidv4().substring(0, 8)}`;
+  const rootLabel = parsed?.title || "Conversation";
+  const nodes: { id: string; label: string; type: string; properties?: Record<string, any> }[] = [
+    { id: rootId, label: rootLabel, type: "Conversation", properties: {} },
+  ];
+  const edges: { id: string; source: string; target: string; label: string }[] = [];
+
+  const segs = Array.isArray(parsed?.segments) ? parsed.segments : [];
+  const maxSegments = Math.min(segs.length, 14);
+  const tagNodeMap = new Map<string, string>();
+  const segmentNodeIds: string[] = [];
+
+  for (let i = 0; i < maxSegments; i++) {
+    const seg = segs[i];
+    const sid = `node-seg-${i}`;
+    segmentNodeIds.push(sid);
+    const rawLabel = String(seg?.content || seg?.originalText || `Segment ${i + 1}`);
+    nodes.push({
+      id: sid,
+      label: truncateText(rawLabel, 62),
+      type: seg?.role === "assistant" ? "SocraticAnalysis" : "InitialPosition",
+      properties: { index: i },
+    });
+    edges.push({
+      id: `edge-root-${i}`,
+      source: rootId,
+      target: sid,
+      label: seg?.role === "assistant" ? "analyse" : "position",
+    });
+
+    const tags = Array.isArray(seg?.tags) ? seg.tags.slice(0, 3) : [];
+    tags.forEach((tag: string) => {
+      if (!tag || typeof tag !== "string") return;
+      let tagNodeId = tagNodeMap.get(tag);
+      if (!tagNodeId) {
+        tagNodeId = `tag-${tagNodeMap.size}`;
+        tagNodeMap.set(tag, tagNodeId);
+        nodes.push({ id: tagNodeId, label: tag, type: "Tag", properties: {} });
+      }
+      edges.push({
+        id: `edge-tag-${i}-${tagNodeId}`,
+        source: sid,
+        target: tagNodeId,
+        label: "catégorie",
+      });
+    });
+  }
+
+  for (let i = 0; i < segmentNodeIds.length - 1; i++) {
+    edges.push({
+      id: `edge-seq-${i}`,
+      source: segmentNodeIds[i],
+      target: segmentNodeIds[i + 1],
+      label: "enchaîne",
+    });
+  }
+
+  return { nodes, edges };
+}
+
+function ensureGraphCompleteness(parsed: any) {
+  if (!parsed?.analysis) parsed.analysis = {};
+
+  const globalKg = parsed.analysis.knowledgeGraph || { nodes: [], edges: [] };
+  const globalNodes = Array.isArray(globalKg.nodes) ? globalKg.nodes : [];
+  const globalEdges = Array.isArray(globalKg.edges) ? globalKg.edges : [];
+  if (globalNodes.length === 0 || globalEdges.length === 0) {
+    parsed.analysis.knowledgeGraph = buildFallbackConversationGraph(parsed);
+  }
+
+  if (!Array.isArray(parsed.segments)) return;
+  parsed.segments = parsed.segments.map((seg: any, index: number) => {
+    const localKg = seg?.knowledgeGraph || { nodes: [], edges: [] };
+    const nodes = Array.isArray(localKg.nodes) ? localKg.nodes : [];
+    const edges = Array.isArray(localKg.edges) ? localKg.edges : [];
+    if (nodes.length === 0 || edges.length === 0) {
+      return { ...seg, knowledgeGraph: buildFallbackSegmentGraph(seg, index) };
+    }
+    return seg;
+  });
+}
+
+function reconcileSocraticRoles(segments: any[]): any[] {
+  const normalized = segments.map((seg) => ({
+    ...seg,
+    role: seg.role === "assistant" || seg.role === "system" ? "assistant" : "user",
+  }));
+
+  for (const seg of normalized) {
+    if (seg.role !== "user") continue;
+    const text = String(seg.originalText || seg.content || "");
+    if (!isQuestionLike(text) && getAnalysisSignalScore(text) >= 2) {
+      seg.role = "assistant";
+      seg.tags = Array.isArray(seg.tags) ? [...new Set([...seg.tags, "analyse-socratique-detectee"])] : ["analyse-socratique-detectee"];
+    }
+  }
+
+  const userSegments = normalized.filter((s) => s.role === "user");
+  if (userSegments.length === 0) {
+    const first = normalized[0];
+    const question = inferQuestionFromAnalysis(String(first?.originalText || first?.content || ""));
+    normalized.unshift({
+      content: question,
+      originalText: question,
+      role: "user",
+      semanticSignature: `inferred-q-${uuidv4().substring(0, 8)}`,
+      tags: ["question-inferree"],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: { reason: "Question initiale inférée par similarité sémantique locale." },
+    });
+  }
+
+  const userPool = normalized
+    .filter((s) => s.role === "user")
+    .map((s) => ({
+      text: String(s.originalText || s.content || ""),
+      vec: toSemanticVector(String(s.originalText || s.content || "")),
+    }))
+    .filter((s) => s.text.trim().length > 0);
+
+  for (const seg of normalized) {
+    if (seg.role !== "assistant") continue;
+    const assistantText = String(seg.originalText || seg.content || "");
+    const assistantVec = toSemanticVector(assistantText);
+    let best: { text: string; score: number } | null = null;
+    for (const cand of userPool) {
+      const score = cosineSimilarityMap(assistantVec, cand.vec);
+      if (!best || score > best.score) best = { text: cand.text, score };
+    }
+    if (best && best.score >= 0.12) {
+      const hint = `Question associée (similarité ${Math.round(best.score * 100)}%): "${truncateText(best.text)}"`;
+      seg.semanticInterpretation = seg.semanticInterpretation
+        ? `${seg.semanticInterpretation}\n\n${hint}`
+        : hint;
+      if (!seg.semanticVectorDescription) {
+        seg.semanticVectorDescription = buildLocalVectorDescription(assistantText);
+      }
+    }
+  }
+
+  return normalized;
+}
+
+function getSelectedProvider(): Provider {
+  return (localStorage.getItem("SELECTED_MODEL") as Provider) || "gemini";
+}
+
+function getGeminiApiKey() {
+  return (
+    localStorage.getItem("GEMINI_API_KEY_OVERRIDE") ||
+    (import.meta.env.VITE_GEMINI_API_KEY as string) ||
+    (process.env.GEMINI_API_KEY as string)
+  );
+}
+
+function getHardwiredGeminiApiKey() {
+  return (import.meta.env.VITE_GEMINI_API_KEY as string) || (process.env.GEMINI_API_KEY as string);
+}
+
+function getOpenAIApiKey() {
+  return localStorage.getItem("OPENAI_API_KEY") || localStorage.getItem("CODEX_API_KEY") || "";
+}
+
+function getSelectedGeminiModel() {
+  return localStorage.getItem("GEMINI_MANUAL_MODEL") || null;
 }
 
 function getAI(apiKey: string) {
   return new GoogleGenerativeAI(apiKey);
 }
 
-export async function analyzeAndSegmentConversation(text: string): Promise<{ 
-  title: string, 
-  segments: (Partial<Segment> & { metadata: { isPivot?: boolean, reason?: string } })[],
-  analysis: { 
-    summary: string, 
-    themes: string[], 
-    suggestedTags: string[], 
-    deviations: string[],
-    semanticSignature: string,
-    knowledgeGraph: {
-      nodes: { id: string, label: string, type: string, properties?: Record<string, any> }[],
-      edges: { id: string, source: string, target: string, label: string }[]
+function normalizeAnalysisPayload(parsed: any, originalText: string): AnalysisResult {
+  const safeParsed = parsed || {};
+
+  if (!safeParsed.segments || safeParsed.segments.length === 0) {
+    safeParsed.segments = [
+      {
+        content: originalText.length > 1000 ? `${originalText.substring(0, 1000)}...` : originalText,
+        originalText,
+        role: "user",
+        semanticSignature: `fallback-${uuidv4().substring(0, 8)}`,
+        tags: ["archive-brute"],
+        knowledgeGraph: { nodes: [], edges: [] },
+      },
+    ];
+  }
+
+  if (!safeParsed.analysis) {
+    safeParsed.analysis = {
+      summary: "Analyse sommaire indisponible",
+      themes: [],
+      suggestedTags: [],
+      deviations: [],
+      semanticSignature: uuidv4(),
+      knowledgeGraph: { nodes: [], edges: [] },
+    };
+  }
+
+  const globalKg = safeParsed.analysis.knowledgeGraph || { nodes: [], edges: [] };
+  globalKg.nodes = (globalKg.nodes || []).map((n: any) => ({
+    id: n.id || uuidv4(),
+    label: n.label || n.id || "Unit",
+    type: n.type || "Concept",
+    properties: n.properties || {},
+  }));
+  globalKg.edges = (globalKg.edges || []).map((e: any) => ({
+    id: e.id || uuidv4(),
+    source: e.source || "",
+    target: e.target || "",
+    label: e.label || "related",
+  }));
+  safeParsed.analysis.knowledgeGraph = globalKg;
+
+  safeParsed.segments = safeParsed.segments.map((seg: any) => {
+    const localKg = seg.knowledgeGraph || { nodes: [], edges: [] };
+    localKg.nodes = (localKg.nodes || []).map((n: any) => ({
+      id: n.id || uuidv4(),
+      label: n.label || n.id || "Unit",
+      type: n.type || "Concept",
+      properties: n.properties || {},
+    }));
+    localKg.edges = (localKg.edges || []).map((e: any) => ({
+      id: e.id || uuidv4(),
+      source: e.source || "",
+      target: e.target || "",
+      label: e.label || "related",
+    }));
+
+    return {
+      ...seg,
+      content: seg.content || "N/A",
+      originalText: seg.originalText || seg.content || "N/A",
+      tags: Array.isArray(seg.tags) ? seg.tags : [],
+      knowledgeGraph: localKg,
+      metadata: seg.metadata || {},
+    };
+  });
+
+  safeParsed.segments = reconcileSocraticRoles(safeParsed.segments);
+  ensureGraphCompleteness(safeParsed);
+
+  return safeParsed as AnalysisResult;
+}
+
+async function callOpenAIChatCompletion(
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+  options?: { temperature?: number; responseJson?: boolean }
+) {
+  const apiKey = getOpenAIApiKey();
+  if (!apiKey) throw new Error("Clé API OpenAI manquante.");
+
+  let lastError: any;
+  for (const model of OPENAI_MODELS_TO_TRY) {
+    try {
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: options?.temperature ?? 0.1,
+          ...(options?.responseJson ? { response_format: { type: "json_object" } } : {}),
+        }),
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        if (response.status === 404 || text.toLowerCase().includes("model")) {
+          lastError = new Error(`Modèle OpenAI indisponible: ${model}`);
+          continue;
+        }
+        throw new Error(`OpenAI HTTP ${response.status}: ${text}`);
+      }
+
+      const data = await response.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (typeof content === "string") return content;
+      if (Array.isArray(content)) {
+        const firstText = content.find((c: any) => c?.type === "text")?.text;
+        if (typeof firstText === "string") return firstText;
+      }
+      throw new Error("Réponse OpenAI vide ou invalide.");
+    } catch (error: any) {
+      lastError = error;
+      if (String(error?.message || "").includes("indisponible")) continue;
+      throw error;
     }
   }
-}> {
-  const apiKey = getApiKey();
-  const manualModel = getSelectedModel();
+
+  throw new Error(`Échec OpenAI: ${lastError?.message || "modèle indisponible"}`);
+}
+
+export async function analyzeAndSegmentConversation(text: string, options?: AnalyzeOptions): Promise<AnalysisResult> {
+  const provider = getSelectedProvider();
+  const segmentationInstruction =
+    options?.customSegmentationInstruction?.trim() ||
+    getSegmentationInstruction(options?.granularity || "balanced");
+
+  if (provider === "openai") {
+    const prompt = `
+ Tu es Socrate, expert en maieutique. Deconstruis cet echange.
+ ${segmentationInstruction}
+ Regle de role: si le segment est une question/probleme initial -> role="user"; si c'est une explication/raisonnement/reponse -> role="assistant".
+
+Retourne STRICTEMENT un objet JSON avec cette structure:
+{
+  "title": "Titre",
+  "analysis": {
+    "summary": "Resume",
+    "themes": [],
+    "suggestedTags": [],
+    "deviations": [],
+    "semanticSignature": "S1",
+    "knowledgeGraph": { "nodes": [], "edges": [] }
+  },
+  "segments": [
+    {
+      "content": "R",
+      "originalText": "T",
+      "role": "user",
+      "semanticSignature": "H1",
+      "tags": [],
+      "knowledgeGraph": { "nodes": [], "edges": [] }
+    }
+  ]
+}
+
+TEXTE: ${JSON.stringify(text)}
+`;
+
+    const rawText = await callOpenAIChatCompletion([{ role: "user", content: prompt }], {
+      temperature: 0.1,
+      responseJson: true,
+    });
+    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+    const jsonStr = jsonMatch ? jsonMatch[0] : rawText;
+    const parsed = JSON.parse(jsonStr);
+    return normalizeAnalysisPayload(parsed, text);
+  }
+
+  const apiKey = provider === "hardwired_gemini" ? getHardwiredGeminiApiKey() : getGeminiApiKey();
+  const manualModel = getSelectedGeminiModel();
 
   if (!apiKey) {
+    if (provider === "hardwired_gemini") {
+      throw new Error("Gemini hard wired indisponible. Configurez GEMINI_API_KEY dans l'environnement de l'app.");
+    }
     throw new Error("Clé API Gemini manquante. Veuillez la configurer dans les Paramètres.");
   }
 
   const genAI = getAI(apiKey);
-  const MAX_RETRIES = 2;
+  const maxRetries = 2;
   let lastError: any;
+  const modelsToUse = manualModel ? [manualModel] : GEMINI_MODELS_TO_TRY;
 
-  const modelsToUse = manualModel ? [manualModel] : MODELS_TO_TRY;
-
-  for (let modelIdx = 0; modelIdx < modelsToUse.length; modelIdx++) {
-    const currentModelName = modelsToUse[modelIdx];
-    
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+  for (const currentModelName of modelsToUse) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         if (attempt > 0) {
-          const waitTime = (lastError?.message?.includes('quota') ? 10000 : 2000) * attempt;
-          console.log(`Re-tentative ${attempt} avec ${currentModelName} après ${waitTime}ms...`);
-          await new Promise(r => setTimeout(r, waitTime));
+          const waitTime = (String(lastError?.message || "").includes("quota") ? 10000 : 2000) * attempt;
+          await new Promise((r) => setTimeout(r, waitTime));
         }
 
-        const model = genAI.getGenerativeModel({ 
+        const model = genAI.getGenerativeModel({
           model: currentModelName,
           generationConfig: {
-            responseMimeType: currentModelName.includes('pro') || currentModelName.includes('flash') ? "application/json" : undefined,
+            responseMimeType:
+              currentModelName.includes("pro") || currentModelName.includes("flash")
+                ? "application/json"
+                : undefined,
             temperature: 0.1,
-            maxOutputTokens: 8192
-          }
+            maxOutputTokens: 8192,
+          },
         });
 
-        console.log(`[GeminiService] Essai du modèle: ${currentModelName}`);
-        const timeoutPromise = new Promise((_, reject) => 
+        const timeoutPromise = new Promise((_, reject) =>
           setTimeout(() => reject(new Error(`Timeout (${currentModelName})`)), 180000)
         );
 
         const apiPromise = model.generateContent({
-          contents: [{
-            role: 'user',
-            parts: [{
-              text: `
-                Tu es Socrate, expert en maïeutique. Déconstruis cet échange.
-                
-                STRUCTURE (JSON STRICT) :
+          contents: [
+            {
+              role: "user",
+              parts: [
                 {
-                  "title": "Titre",
-                  "analysis": { "summary": "Résumé", "themes": [], "suggestedTags": [], "deviations": [], "semanticSignature": "S1", "knowledgeGraph": { "nodes": [], "edges": [] } },
-                  "segments": [{ "content": "R", "originalText": "T", "role": "user", "semanticSignature": "H1", "tags": [], "knowledgeGraph": { "nodes": [], "edges": [] } }]
-                }
+                  text: `
+ Tu es Socrate, expert en maieutique. Deconstruis cet echange.
+ ${segmentationInstruction}
+ Regle de role: si le segment est une question/probleme initial -> role="user"; si c'est une explication/raisonnement/reponse -> role="assistant".
 
-                TEXTE : ${JSON.stringify(text)}
-              `
-            }]
-          }]
+STRUCTURE (JSON STRICT):
+{
+  "title": "Titre",
+  "analysis": { "summary": "Resume", "themes": [], "suggestedTags": [], "deviations": [], "semanticSignature": "S1", "knowledgeGraph": { "nodes": [], "edges": [] } },
+  "segments": [{ "content": "R", "originalText": "T", "role": "user", "semanticSignature": "H1", "tags": [], "knowledgeGraph": { "nodes": [], "edges": [] } }]
+}
+
+TEXTE: ${JSON.stringify(text)}
+`,
+                },
+              ],
+            },
+          ],
         });
 
-        const response = await Promise.race([apiPromise, timeoutPromise]) as any;
+        const response = (await Promise.race([apiPromise, timeoutPromise])) as any;
         const rawText = response.response.text();
         const jsonMatch = rawText.match(/\{[\s\S]*\}/);
         const jsonStr = jsonMatch ? jsonMatch[0] : rawText;
-        
-        let parsed = JSON.parse(jsonStr);
-        
-        // Fallbacks segments
-        if (!parsed.segments || parsed.segments.length === 0) {
-          console.warn("L'IA n'a produit aucun segment. Création d'un segment unique par défaut.");
-          parsed.segments = [{
-            content: text.length > 1000 ? text.substring(0, 1000) + "..." : text,
-            originalText: text,
-            role: "user",
-            semanticSignature: "fallback-" + uuidv4().substring(0, 8),
-            tags: ["archive-brute"],
-            knowledgeGraph: { nodes: [], edges: [] }
-          }];
-        }
-
-        // Fallbacks analysis
-        if (!parsed.analysis) {
-          parsed.analysis = {
-            summary: "Analyse sommaire indisponible",
-            themes: [],
-            suggestedTags: [],
-            deviations: [],
-            semanticSignature: uuidv4(),
-            knowledgeGraph: { nodes: [], edges: [] }
-          };
-        }
-
-        // Post-processing Graphe Global
-        const globalKg = parsed.analysis.knowledgeGraph || { nodes: [], edges: [] };
-        globalKg.nodes = (globalKg.nodes || []).map((n: any) => ({
-          id: n.id || uuidv4(),
-          label: n.label || n.id || 'Unit',
-          type: n.type || 'Concept',
-          properties: n.properties || {}
-        }));
-        globalKg.edges = (globalKg.edges || []).map((e: any) => ({
-          id: e.id || uuidv4(),
-          source: e.source,
-          target: e.target,
-          label: e.label || 'related'
-        }));
-        parsed.analysis.knowledgeGraph = globalKg;
-
-        // Post-processing Segments
-        parsed.segments = parsed.segments.map((seg: any) => {
-          const localKg = seg.knowledgeGraph || { nodes: [], edges: [] };
-          localKg.nodes = (localKg.nodes || []).map((n: any) => ({
-            id: n.id || uuidv4(),
-            label: n.label || n.id || 'Unit',
-            type: n.type || 'Concept',
-            properties: n.properties || {}
-          }));
-          localKg.edges = (localKg.edges || []).map((e: any) => ({
-            id: e.id || uuidv4(),
-            source: e.source,
-            target: e.target,
-            label: e.label || 'related'
-          }));
-          
-          return {
-            ...seg,
-            content: seg.content || "N/A",
-            originalText: seg.originalText || seg.content || "N/A",
-            knowledgeGraph: localKg,
-            metadata: seg.metadata || {}
-          };
-        });
-
-        return parsed;
+        const parsed = JSON.parse(jsonStr);
+        return normalizeAnalysisPayload(parsed, text);
       } catch (err: any) {
         lastError = err;
-        console.warn(`Échec avec ${currentModelName} (Tentative ${attempt}):`, err.message);
-        
-        if (err.message?.includes('404') || err.message?.includes('not found')) {
-          break; 
+        if (String(err?.message || "").includes("404") || String(err?.message || "").includes("not found")) {
+          break;
         }
       }
     }
   }
 
-  throw new Error(`Échec de connexion aux services d'IA (Gemini). Tous les modèles testés ont échoué. Cause probable : Clé API incorrecte ou restreinte. Erreur finale : ${lastError?.message}`);
+  throw new Error(
+    `Échec de connexion aux services d'IA (Gemini). Tous les modèles testés ont échoué. Erreur finale: ${lastError?.message}`
+  );
 }
 
 export async function deepAnalyzeConversation(text: string): Promise<string> {
-  const apiKey = localStorage.getItem('GEMINI_API_KEY_OVERRIDE') || process.env.GEMINI_API_KEY;
+  const provider = getSelectedProvider();
+
+  if (provider === "openai") {
+    const prompt = `
+Tu es un expert en analyse semantique profonde.
+ANALYSE CE TEXTE:
+"${text.replace(/"/g, '\\"')}"
+FORMAT: Markdown structure.
+`;
+    return callOpenAIChatCompletion([{ role: "user", content: prompt }], { temperature: 0.2 });
+  }
+
+  const apiKey = provider === "hardwired_gemini" ? getHardwiredGeminiApiKey() : getGeminiApiKey();
   if (!apiKey) throw new Error("Clé API manquante.");
 
   const genAI = getAI(apiKey);
-  const model = genAI.getGenerativeModel({ model: MODELS_TO_TRY[0] });
+  const model = genAI.getGenerativeModel({ model: GEMINI_MODELS_TO_TRY[0] });
+  const result = await model.generateContent({
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text: `
+Tu es un expert en analyse semantique profonde.
+ANALYSE CE TEXTE: "${text.replace(/"/g, '\\"')}"
+FORMAT: Markdown structure.
+`,
+          },
+        ],
+      },
+    ],
+  });
+
+  return result.response.text() || "Analyse indisponible.";
+}
+
+export async function enrichSegmentSemantics(
+  text: string,
+  role: Segment["role"],
+  conversationSummary = ""
+): Promise<{ semanticVectorDescription: string; semanticInterpretation: string }> {
+  const localVector = buildLocalVectorDescription(text);
+  const localInterpretation = buildLocalInterpretation(text, role);
+  const provider = getSelectedProvider();
+
+  const prompt = `
+Tu dois produire une sortie JSON stricte:
+{
+  "semanticVectorDescription": "description vectorielle concise",
+  "semanticInterpretation": "interpretation socratique concise"
+}
+
+Contexte conversation: ${JSON.stringify(conversationSummary)}
+Role du segment: ${role}
+Texte du segment: ${JSON.stringify(text)}
+`;
 
   try {
-    const result = await model.generateContent({
-      contents: [{
-        role: 'user',
-        parts: [{
-          text: `
-            Tu es un expert en analyse sémantique profonde.
-            ANALYSE CE TEXTE : "${text.replace(/"/g, '\\"')}"
-            FORMAT : Markdown structuré.
-          `
-        }]
-      }]
+    if (provider === "openai") {
+      const raw = await callOpenAIChatCompletion([{ role: "user", content: prompt }], {
+        temperature: 0.1,
+        responseJson: true,
+      });
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
+      return {
+        semanticVectorDescription: parsed?.semanticVectorDescription || localVector,
+        semanticInterpretation: parsed?.semanticInterpretation || localInterpretation,
+      };
+    }
+
+    if (provider === "gemini" || provider === "hardwired_gemini") {
+      const apiKey = provider === "hardwired_gemini" ? getHardwiredGeminiApiKey() : getGeminiApiKey();
+      if (!apiKey) {
+        return { semanticVectorDescription: localVector, semanticInterpretation: localInterpretation };
+      }
+      const genAI = getAI(apiKey);
+      const modelName = getSelectedGeminiModel() || GEMINI_MODELS_TO_TRY[0];
+      const model = genAI.getGenerativeModel({
+        model: modelName,
+        generationConfig: { responseMimeType: "application/json", temperature: 0.1, maxOutputTokens: 1024 },
+      });
+      const result = await model.generateContent(prompt);
+      const raw = result.response.text();
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
+      return {
+        semanticVectorDescription: parsed?.semanticVectorDescription || localVector,
+        semanticInterpretation: parsed?.semanticInterpretation || localInterpretation,
+      };
+    }
+  } catch (_err) {
+    // Fallback local if provider call fails.
+  }
+
+  return { semanticVectorDescription: localVector, semanticInterpretation: localInterpretation };
+}
+
+export async function testGeminiConnection(): Promise<ConnectionTestResult> {
+  const apiKey = getGeminiApiKey();
+  if (!apiKey) {
+    return { ok: false, provider: "gemini", details: "Clé API Gemini absente." };
+  }
+
+  const preferredModel = getSelectedGeminiModel();
+  const modelsToTry = preferredModel ? [preferredModel] : GEMINI_MODELS_TO_TRY;
+  let lastError: any;
+
+  for (const modelName of modelsToTry) {
+    try {
+      const genAI = getAI(apiKey);
+      const model = genAI.getGenerativeModel({ model: modelName });
+      const result = await model.generateContent("test");
+      const ok = !!result.response.text();
+      if (ok) return { ok: true, provider: "gemini", model: modelName };
+    } catch (err: any) {
+      lastError = err;
+    }
+  }
+
+  return {
+    ok: false,
+    provider: "gemini",
+    model: preferredModel || GEMINI_MODELS_TO_TRY[0],
+    details: lastError?.message || "Échec de connexion Gemini.",
+  };
+}
+
+async function testOpenAIConnection(): Promise<ConnectionTestResult> {
+  const apiKey = getOpenAIApiKey();
+  if (!apiKey) {
+    return { ok: false, provider: "openai", details: "Clé API OpenAI absente." };
+  }
+
+  try {
+    const response = await fetch("https://api.openai.com/v1/models", {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+      },
     });
-    return result.response.text() || "Analyse indisponible.";
-  } catch (error) {
-    console.error("Deep Analysis Error:", error);
-    throw error;
-  }
-}
 
-export async function testGeminiConnection(): Promise<boolean> {
-  const apiKey = localStorage.getItem('GEMINI_API_KEY_OVERRIDE') || (import.meta.env.VITE_GEMINI_API_KEY as string) || (process.env.GEMINI_API_KEY as string);
-  if (!apiKey) return false;
-  
-  try {
-    const genAI = getAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: MODELS_TO_TRY[0] });
-    const result = await model.generateContent("test");
-    return !!result.response.text();
+    if (!response.ok) {
+      const text = await response.text();
+      return { ok: false, provider: "openai", details: `OpenAI HTTP ${response.status}: ${text}` };
+    }
+
+    const data = await response.json();
+    const availableIds = new Set<string>((data?.data || []).map((m: any) => m?.id).filter(Boolean));
+    const picked = OPENAI_MODELS_TO_TRY.find((m) => availableIds.has(m));
+
+    return { ok: true, provider: "openai", model: picked || "unknown" };
   } catch (err) {
-    console.error("Test Connection failed:", err);
-    return false;
+    console.error("Test OpenAI failed:", err);
+    return { ok: false, provider: "openai", details: (err as any)?.message || "Échec OpenAI." };
   }
 }
 
-export async function chatWithGemini(prompt: string, history: {role: 'user' | 'assistant' | 'system', content: string}[]): Promise<string> {
-  const selectedModel = localStorage.getItem('SELECTED_MODEL') || 'gemini';
-  
-  if (selectedModel === 'openrouter') {
-    const orKey = localStorage.getItem('OPENROUTER_API_KEY');
+export async function testProviderConnection(provider?: Provider): Promise<ConnectionTestResult> {
+  const selected = provider || getSelectedProvider();
+
+  if (selected === "gemini") return testGeminiConnection();
+  if (selected === "hardwired_gemini") {
+    const apiKey = getHardwiredGeminiApiKey();
+    if (!apiKey) {
+      return {
+        ok: false,
+        provider: "hardwired_gemini",
+        details: "GEMINI_API_KEY (env) introuvable pour Hard wired Gemini.",
+      };
+    }
+
+    const preferredModel = getSelectedGeminiModel() || GEMINI_MODELS_TO_TRY[0];
+    try {
+      const genAI = getAI(apiKey);
+      const model = genAI.getGenerativeModel({ model: preferredModel });
+      const result = await model.generateContent("test");
+      return {
+        ok: !!result.response.text(),
+        provider: "hardwired_gemini",
+        model: preferredModel,
+      };
+    } catch (err: any) {
+      return {
+        ok: false,
+        provider: "hardwired_gemini",
+        model: preferredModel,
+        details: err?.message || "Échec Hard wired Gemini.",
+      };
+    }
+  }
+  if (selected === "openai") return testOpenAIConnection();
+  if (selected === "openrouter") {
+    const ok = !!localStorage.getItem("OPENROUTER_API_KEY");
+    return { ok, provider: "openrouter", model: "google/gemini-2.0-flash-001" };
+  }
+  if (selected === "claude") {
+    const ok = !!localStorage.getItem("CLAUDE_API_KEY");
+    return { ok, provider: "claude", model: "configured-via-key" };
+  }
+  if (selected === "codex") {
+    const ok = !!localStorage.getItem("CODEX_API_KEY");
+    return { ok, provider: "codex", model: "configured-via-key" };
+  }
+
+  return { ok: false, provider: selected, details: "Provider inconnu." };
+}
+
+async function chatWithOpenAI(
+  prompt: string,
+  history: { role: "user" | "assistant" | "system"; content: string }[]
+): Promise<string> {
+  const messages = [
+    ...history.map((m) => ({ role: m.role, content: m.content })),
+    { role: "user" as const, content: prompt },
+  ];
+
+  return callOpenAIChatCompletion(messages, { temperature: 0.3 });
+}
+
+export async function chatWithGemini(
+  prompt: string,
+  history: { role: "user" | "assistant" | "system"; content: string }[]
+): Promise<string> {
+  const selectedProvider = getSelectedProvider();
+
+  if (selectedProvider === "openai") {
+    return chatWithOpenAI(prompt, history);
+  }
+
+  if (selectedProvider === "openrouter") {
+    const orKey = localStorage.getItem("OPENROUTER_API_KEY");
     if (!orKey) throw new Error("Clé API OpenRouter manquante.");
+
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${orKey}`,
-        "Content-Type": "application/json"
+        Authorization: `Bearer ${orKey}`,
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
         model: "google/gemini-2.0-flash-001",
         messages: [
-          ...history.map(m => ({
-            role: (m.role === 'system') ? 'system' : (m.role === 'user' ? 'user' : 'assistant'),
-            content: m.content
+          ...history.map((m) => ({
+            role: m.role === "system" ? "system" : m.role === "user" ? "user" : "assistant",
+            content: m.content,
           })),
-          { role: 'user', content: prompt }
-        ]
-      })
+          { role: "user", content: prompt },
+        ],
+      }),
     });
+
     const data = await response.json();
     return data.choices?.[0]?.message?.content || "Erreur OpenRouter";
   }
 
-  const apiKey = getApiKey();
-  const manualModel = getSelectedModel();
+  if (selectedProvider !== "gemini" && selectedProvider !== "hardwired_gemini") {
+    throw new Error(`Le provider "${selectedProvider}" n'est pas encore implémenté pour le chat.`);
+  }
 
+  const apiKey = selectedProvider === "hardwired_gemini" ? getHardwiredGeminiApiKey() : getGeminiApiKey();
+  const manualModel = getSelectedGeminiModel();
   if (!apiKey) throw new Error("Clé API Gemini manquante.");
 
   const genAI = getAI(apiKey);
-  const systemMessage = history.find(m => m.role === 'system');
-  const chatHistory = history.filter(m => m.role !== 'system');
+  const systemMessage = history.find((m) => m.role === "system");
+  const chatHistory = history.filter((m) => m.role !== "system");
   let lastError: any;
+  const modelsToUse = manualModel ? [manualModel] : GEMINI_MODELS_TO_TRY;
 
-  const modelsToUse = manualModel ? [manualModel] : MODELS_TO_TRY;
-
-  for (let modelIdx = 0; modelIdx < modelsToUse.length; modelIdx++) {
-    const currentModelName = modelsToUse[modelIdx];
+  for (const currentModelName of modelsToUse) {
     try {
-      const model = genAI.getGenerativeModel({ 
+      const model = genAI.getGenerativeModel({
         model: currentModelName,
-        systemInstruction: systemMessage ? systemMessage.content : undefined
+        systemInstruction: systemMessage ? systemMessage.content : undefined,
       });
 
-      // Gemini requiert une alternance stricte User -> Model.
-      const validHistory: { role: 'user' | 'model', parts: { text: string }[] }[] = [];
-      let expectedRole: 'user' | 'model' = 'user';
+      const validHistory: { role: "user" | "model"; parts: { text: string }[] }[] = [];
+      let expectedRole: "user" | "model" = "user";
 
       for (const msg of chatHistory) {
-        const role = msg.role === 'user' ? 'user' : 'model';
+        const role = msg.role === "user" ? "user" : "model";
         if (role === expectedRole) {
-          validHistory.push({
-            role,
-            parts: [{ text: msg.content }]
-          });
-          expectedRole = expectedRole === 'user' ? 'model' : 'user';
+          validHistory.push({ role, parts: [{ text: msg.content }] });
+          expectedRole = expectedRole === "user" ? "model" : "user";
         }
       }
 
-      const chat = model.startChat({
-        history: validHistory,
-      });
-
+      const chat = model.startChat({ history: validHistory });
       const result = await chat.sendMessage(prompt);
       return result.response.text() || "Désolé, je n'ai pas pu générer de réponse.";
     } catch (error: any) {
       lastError = error;
-      console.warn(`Chat: Échec avec ${currentModelName}:`, error.message);
-      if (error?.message?.includes('404') || error?.message?.includes('not found')) {
-        continue; // Essayer le modèle suivant
+      if (String(error?.message || "").includes("404") || String(error?.message || "").includes("not found")) {
+        continue;
       }
-      throw error; // Pour les autres erreurs (ex: quota), on laisse remonter
+      throw error;
     }
   }
 
-  throw new Error(`Le Chat Socrate n'a pas pu se connecter à l'IA. Vérifiez votre clé API Gemini dans les Paramètres. Erreur : ${lastError?.message}`);
+  throw new Error(
+    `Le Chat Socrate n'a pas pu se connecter à l'IA. Vérifiez votre clé API Gemini. Erreur: ${lastError?.message}`
+  );
 }

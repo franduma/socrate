@@ -11,7 +11,11 @@ interface AllSegmentsViewProps {
 
 export function AllSegmentsView({ onSelectConversation }: AllSegmentsViewProps) {
   const segments = useLiveQuery(() => db.segments.orderBy('timestamp').reverse().toArray());
+  const conversations = useLiveQuery(() => db.conversations.toArray()) || [];
   const [searchTerm, setSearchTerm] = React.useState('');
+  const conversationById = React.useMemo(() => {
+    return new Map(conversations.map((conv) => [conv.id, conv]));
+  }, [conversations]);
 
   const filteredSegments = segments?.filter(s => 
     s.content.toLowerCase().includes(searchTerm.toLowerCase()) || 
@@ -46,6 +50,9 @@ export function AllSegmentsView({ onSelectConversation }: AllSegmentsViewProps) 
 
       <div className="space-y-4">
         {filteredSegments?.map((segment) => (
+          (() => {
+            const parentConv = conversationById.get(segment.conversationId);
+            return (
           <div 
             key={segment.id} 
             onClick={() => onSelectConversation(segment.conversationId)}
@@ -74,9 +81,14 @@ export function AllSegmentsView({ onSelectConversation }: AllSegmentsViewProps) 
                     <ChevronRight className="w-3 h-3" />
                   </div>
                 </div>
+                <div className="pt-3 mt-2 border-t border-dashed border-natural-sand text-[10px] text-natural-stone uppercase tracking-wider font-semibold">
+                  {parentConv ? `Conversation: ${parentConv.title}` : `Conversation: ${segment.conversationId.slice(0, 8)}`}
+                </div>
               </div>
             </div>
           </div>
+            );
+          })()
         ))}
         {filteredSegments?.length === 0 && (
           <div className="text-center py-24 bg-white rounded-[40px] border border-dashed border-natural-border">

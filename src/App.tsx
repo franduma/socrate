@@ -62,6 +62,47 @@ async function loadGeminiService() {
   return import('./services/geminiService');
 }
 
+type GranularityProfile = {
+  id: string;
+  name: string;
+  instruction: string;
+  targetSegments: string;
+  example: string;
+  readOnly: boolean;
+};
+
+const DEFAULT_GRANULARITY_PROFILES: GranularityProfile[] = [
+  {
+    id: 'intact',
+    name: 'Intact (blocs longs)',
+    instruction: 'Segmentation=INTACT: conserve de grands blocs cohérents. Vise 1 à 4 segments maximum.',
+    targetSegments: '1-4',
+    example: 'Conserve les paragraphes complets tant que la cohérence argumentative reste stable.',
+    readOnly: true,
+  },
+  {
+    id: 'balanced',
+    name: 'Équilibrée',
+    instruction: 'Segmentation=BALANCED: découpe équilibrée par intention/question/réponse. Vise 4 à 10 segments selon la longueur.',
+    targetSegments: '4-10',
+    example: 'Nouveau segment quand on change de question, de posture, ou de réponse.',
+    readOnly: true,
+  },
+  {
+    id: 'fine',
+    name: 'Fine (micro-segments)',
+    instruction: 'Segmentation=FINE: découpe en micro-unités sémantiques (1 à 3 idées clés par segment). Vise 8 à 18 segments selon la longueur.',
+    targetSegments: '8-18',
+    example: 'Découpe chaque pivot conceptuel pour faciliter le graphe et la navigation.',
+    readOnly: true,
+  },
+];
+
+function getCoreGranularity(id: string): 'intact' | 'balanced' | 'fine' {
+  if (id === 'intact' || id === 'fine' || id === 'balanced') return id;
+  return 'balanced';
+}
+
 export default function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [activeTab, setActiveTab] = useState<'conv' | 'files' | 'search' | 'segments' | 'settings' | 'chat'>('conv');
@@ -118,9 +159,46 @@ export default function App() {
   const [openRouterKey, setOpenRouterKey] = useState(localStorage.getItem('OPENROUTER_API_KEY') || '');
   const [codexKey, setCodexKey] = useState(localStorage.getItem('CODEX_API_KEY') || '');
   
-  const [selectedModel, setSelectedModel] = useState<'gemini' | 'openai' | 'claude' | 'openrouter' | 'codex'>(
+  const [selectedModel, setSelectedModel] = useState<'gemini' | 'hardwired_gemini' | 'openai' | 'claude' | 'openrouter' | 'codex'>(
     (localStorage.getItem('SELECTED_MODEL') as any) || 'gemini'
   );
+  const [selectedGranularityId, setSelectedGranularityId] = useState<string>(
+    localStorage.getItem('SEGMENT_GRANULARITY_PROFILE_ID') ||
+    localStorage.getItem('SEGMENT_GRANULARITY') ||
+    'balanced'
+  );
+  const [customGranularityProfiles, setCustomGranularityProfiles] = useState<GranularityProfile[]>(() => {
+    const raw = localStorage.getItem('CUSTOM_SEGMENT_GRANULARITIES');
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter((p: any) => p && typeof p.id === 'string')
+        .map((p: any) => ({
+          id: p.id,
+          name: p.name || 'Granularité personnalisée',
+          instruction: p.instruction || '',
+          targetSegments: p.targetSegments || '',
+          example: p.example || '',
+          readOnly: false,
+        }));
+    } catch {
+      return [];
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem('SELECTED_MODEL', selectedModel);
+  }, [selectedModel]);
+
+  useEffect(() => {
+    localStorage.setItem('SEGMENT_GRANULARITY_PROFILE_ID', selectedGranularityId);
+  }, [selectedGranularityId]);
+
+  useEffect(() => {
+    localStorage.setItem('CUSTOM_SEGMENT_GRANULARITIES', JSON.stringify(customGranularityProfiles));
+  }, [customGranularityProfiles]);
 
   const defaultReactions: CustomReaction[] = [
     { id: '1', label: 'Précise', prompt: 'Peux-tu apporter plus de précisions sur ce point spécifique ?' },
@@ -146,15 +224,20 @@ export default function App() {
   const handleTestConnection = async () => {
     setIsTestingConnection(true);
     try {
-      const { testGeminiConnection } = await loadGeminiService();
-      const ok = await testGeminiConnection();
-      if (ok) {
-        alert("✅ Connexion à l'IA réussie ! Socrate est prêt.");
+      const { testProviderConnection } = await loadGeminiService();
+      const result = await testProviderConnection(selectedModel);
+      if (result.ok) {
+        const providerLabel = result.provider;
+        const modelLabel = result.model ? `\nModele: ${result.model}` : "";
+        alert(`Connexion a l'IA reussie.\nProvider: ${providerLabel}${modelLabel}`);
       } else {
-        alert("❌ Échec de la connexion. Vérifiez votre clé API ou votre modèle.");
+        const providerLabel = result.provider;
+        const modelLabel = result.model ? `\nModele teste: ${result.model}` : "";
+        const details = result.details ? `\nDetail: ${result.details}` : "";
+        alert(`Echec de la connexion.\nProvider: ${providerLabel}${modelLabel}${details}`);
       }
     } catch (e) {
-      alert("❌ Erreur de test : " + e);
+      alert("Erreur de test : " + e);
     } finally {
       setIsTestingConnection(false);
     }
@@ -197,6 +280,15 @@ export default function App() {
   const [newFacetteName, setNewFacetteName] = useState('');
   const [newCollectionName, setNewCollectionName] = useState('');
   const [selectedFacetsForCollection, setSelectedFacetsForCollection] = useState<string[]>([]);
+  const granularityProfiles = [...DEFAULT_GRANULARITY_PROFILES, ...customGranularityProfiles];
+  const selectedGranularityProfile =
+    granularityProfiles.find((p) => p.id === selectedGranularityId) || DEFAULT_GRANULARITY_PROFILES[1];
+
+  useEffect(() => {
+    if (!granularityProfiles.some((p) => p.id === selectedGranularityId)) {
+      setSelectedGranularityId('balanced');
+    }
+  }, [granularityProfiles, selectedGranularityId]);
 
   const handleCapture = async () => {
     if (!inputText.trim()) return;
@@ -204,7 +296,10 @@ export default function App() {
     setIsAnalyzing(true);
     try {
       const { analyzeAndSegmentConversation } = await loadGeminiService();
-      const result = await analyzeAndSegmentConversation(inputText);
+      const result = await analyzeAndSegmentConversation(inputText, {
+        granularity: getCoreGranularity(selectedGranularityProfile.id),
+        customSegmentationInstruction: selectedGranularityProfile.instruction,
+      });
       setPotentialCapture(result);
       setWizardTitle(result.title);
       setIsWizardOpen(true);
@@ -523,7 +618,10 @@ export default function App() {
     try {
       const fullText = chatMessages.map(m => `[${m.role.toUpperCase()}]: ${m.content}`).join('\n\n');
       const { analyzeAndSegmentConversation } = await loadGeminiService();
-      const result = await analyzeAndSegmentConversation(fullText);
+      const result = await analyzeAndSegmentConversation(fullText, {
+        granularity: getCoreGranularity(selectedGranularityProfile.id),
+        customSegmentationInstruction: selectedGranularityProfile.instruction,
+      });
       
       // Update potentialCapture
       setPotentialCapture(result);
@@ -717,28 +815,174 @@ export default function App() {
                         <div className="p-2 bg-natural-sand rounded-xl text-natural-accent"><Layers className="w-5 h-5" /></div>
                         <h3 className="font-serif text-xl text-natural-heading">Sélecteur de puissance cognitive</h3>
                       </div>
-                      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-                        {(['gemini', 'openai', 'claude', 'openrouter', 'codex'] as const).map((m) => (
+                      <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
+                        {([
+                          { value: 'gemini', label: 'Gemini' },
+                          { value: 'hardwired_gemini', label: 'Hard wired Gemini' },
+                          { value: 'openai', label: 'OpenAI' },
+                          { value: 'claude', label: 'Claude' },
+                          { value: 'openrouter', label: 'OpenRouter' },
+                          { value: 'codex', label: 'Codex' }
+                        ] as const).map((m) => (
                           <button
-                            key={m}
-                            onClick={() => setSelectedModel(m)}
+                            key={m.value}
+                            onClick={() => setSelectedModel(m.value)}
                             className={cn(
                               "flex flex-col items-center gap-3 p-4 rounded-2xl border-2 transition-all group",
-                              selectedModel === m 
+                              selectedModel === m.value 
                                 ? "border-natural-accent bg-natural-sand/30" 
                                 : "border-natural-sand hover:border-natural-beige"
                             )}
                           >
                             <div className={cn(
                               "w-8 h-8 rounded-full flex items-center justify-center transition-colors",
-                              selectedModel === m ? "bg-natural-accent text-white" : "bg-natural-sand text-natural-muted group-hover:bg-natural-beige"
+                              selectedModel === m.value ? "bg-natural-accent text-white" : "bg-natural-sand text-natural-muted group-hover:bg-natural-beige"
                             )}>
-                              {m === 'gemini' ? <BrainCircuit className="w-4 h-4" /> : <Zap className="w-4 h-4" />}
+                              {m.value === 'gemini' || m.value === 'hardwired_gemini' ? <BrainCircuit className="w-4 h-4" /> : <Zap className="w-4 h-4" />}
                             </div>
-                            <span className="text-[10px] font-black uppercase tracking-widest">{m}</span>
+                            <span className="text-[10px] font-black uppercase tracking-widest text-center">{m.label}</span>
                           </button>
                         ))}
                       </div>
+                    </div>
+
+                    <div className="bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm space-y-6">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 bg-natural-sand rounded-xl text-natural-accent"><Layers className="w-5 h-5" /></div>
+                        <h3 className="font-serif text-xl text-natural-heading">Granularité de segmentation</h3>
+                      </div>
+                      <p className="text-sm text-natural-muted italic">
+                        Profils imposés en lecture seule (modèle de référence) + profils personnalisés éditables.
+                      </p>
+
+                      <div className="space-y-4">
+                        {granularityProfiles.map((profile) => {
+                          const isReadOnly = profile.readOnly;
+                          return (
+                            <div key={profile.id} className={cn(
+                              "rounded-2xl border p-4 space-y-3",
+                              selectedGranularityId === profile.id ? "border-natural-accent bg-natural-sand/20" : "border-natural-sand bg-natural-bg/40"
+                            )}>
+                              <div className="flex items-center justify-between gap-3">
+                                <button
+                                  onClick={() => setSelectedGranularityId(profile.id)}
+                                  className="text-left flex-1"
+                                >
+                                  <p className="text-xs font-black uppercase tracking-wider text-natural-heading">{profile.name}</p>
+                                  <p className="text-[10px] text-natural-stone uppercase tracking-widest mt-1">
+                                    Cible segments: {profile.targetSegments || 'n/a'} {isReadOnly ? '• lecture seule' : '• personnalisé'}
+                                  </p>
+                                </button>
+                                {!isReadOnly && (
+                                  <button
+                                    onClick={() => {
+                                      setCustomGranularityProfiles((prev) => prev.filter((p) => p.id !== profile.id));
+                                      if (selectedGranularityId === profile.id) setSelectedGranularityId('balanced');
+                                    }}
+                                    className="p-2 text-natural-stone hover:text-red-500 transition-colors"
+                                    title="Supprimer ce profil"
+                                  >
+                                    <Trash2 className="w-4 h-4" />
+                                  </button>
+                                )}
+                              </div>
+
+                              <div className="space-y-2">
+                                <label className="text-[9px] font-black uppercase tracking-widest text-natural-muted">Instruction envoyée au moteur</label>
+                                {isReadOnly ? (
+                                  <pre className="text-[11px] whitespace-pre-wrap bg-white border border-natural-sand rounded-xl p-3 text-natural-muted">{profile.instruction}</pre>
+                                ) : (
+                                  <textarea
+                                    value={profile.instruction}
+                                    onChange={(e) => {
+                                      const value = e.target.value;
+                                      setCustomGranularityProfiles((prev) =>
+                                        prev.map((p) => p.id === profile.id ? { ...p, instruction: value } : p)
+                                      );
+                                    }}
+                                    className="w-full min-h-[74px] bg-white border border-natural-sand rounded-xl p-3 text-xs outline-none focus:border-natural-accent"
+                                  />
+                                )}
+                              </div>
+
+                              <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                                <div className="space-y-1">
+                                  <label className="text-[9px] font-black uppercase tracking-widest text-natural-muted">Nom</label>
+                                  {isReadOnly ? (
+                                    <div className="text-xs bg-white border border-natural-sand rounded-xl p-2.5 text-natural-muted">{profile.name}</div>
+                                  ) : (
+                                    <input
+                                      value={profile.name}
+                                      onChange={(e) => {
+                                        const value = e.target.value;
+                                        setCustomGranularityProfiles((prev) =>
+                                          prev.map((p) => p.id === profile.id ? { ...p, name: value } : p)
+                                        );
+                                      }}
+                                      className="w-full bg-white border border-natural-sand rounded-xl p-2.5 text-xs outline-none focus:border-natural-accent"
+                                    />
+                                  )}
+                                </div>
+                                <div className="space-y-1">
+                                  <label className="text-[9px] font-black uppercase tracking-widest text-natural-muted">Cible segments</label>
+                                  {isReadOnly ? (
+                                    <div className="text-xs bg-white border border-natural-sand rounded-xl p-2.5 text-natural-muted">{profile.targetSegments}</div>
+                                  ) : (
+                                    <input
+                                      value={profile.targetSegments}
+                                      onChange={(e) => {
+                                        const value = e.target.value;
+                                        setCustomGranularityProfiles((prev) =>
+                                          prev.map((p) => p.id === profile.id ? { ...p, targetSegments: value } : p)
+                                        );
+                                      }}
+                                      placeholder="ex: 6-12"
+                                      className="w-full bg-white border border-natural-sand rounded-xl p-2.5 text-xs outline-none focus:border-natural-accent"
+                                    />
+                                  )}
+                                </div>
+                                <div className="space-y-1">
+                                  <label className="text-[9px] font-black uppercase tracking-widest text-natural-muted">Exemple</label>
+                                  {isReadOnly ? (
+                                    <div className="text-xs bg-white border border-natural-sand rounded-xl p-2.5 text-natural-muted">{profile.example}</div>
+                                  ) : (
+                                    <input
+                                      value={profile.example}
+                                      onChange={(e) => {
+                                        const value = e.target.value;
+                                        setCustomGranularityProfiles((prev) =>
+                                          prev.map((p) => p.id === profile.id ? { ...p, example: value } : p)
+                                        );
+                                      }}
+                                      placeholder="règle pratique"
+                                      className="w-full bg-white border border-natural-sand rounded-xl p-2.5 text-xs outline-none focus:border-natural-accent"
+                                    />
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      <button
+                        onClick={() => {
+                          const newProfile: GranularityProfile = {
+                            id: uuidv4(),
+                            name: 'Granularité personnalisée',
+                            instruction: 'Découpe en unités sémantiques cohérentes. Crée un nouveau segment à chaque changement d’intention argumentative.',
+                            targetSegments: '5-9',
+                            example: 'Conserver la continuité question->réponse sans sur-fragmenter.',
+                            readOnly: false,
+                          };
+                          setCustomGranularityProfiles((prev) => [...prev, newProfile]);
+                          setSelectedGranularityId(newProfile.id);
+                        }}
+                        className="w-full py-3 border-2 border-dashed border-natural-sand rounded-2xl text-natural-muted hover:border-natural-accent hover:text-natural-accent transition-all flex items-center justify-center gap-2 font-bold text-xs uppercase tracking-widest"
+                      >
+                        <Plus className="w-4 h-4" />
+                        Ajouter une granularité personnalisée
+                      </button>
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
@@ -761,6 +1005,10 @@ export default function App() {
                                 <option value="gemini-pro">Pro (v1)</option>
                               </select>
                             </div>
+                          </div>
+                          <div className="space-y-2">
+                            <label className="text-[10px] font-black text-natural-muted uppercase tracking-widest pl-2">OpenAI</label>
+                            <input type="password" value={openaiKey} onChange={(e) => setOpenaiKey(e.target.value)} placeholder="Clé API OpenAI..." className="w-full p-4 bg-natural-bg rounded-2xl border border-natural-sand focus:border-natural-accent/30 outline-none transition-all text-sm" />
                           </div>
                           <div className="space-y-2">
                             <label className="text-[10px] font-black text-natural-muted uppercase tracking-widest pl-2">Anthropic (Claude)</label>
@@ -850,6 +1098,18 @@ export default function App() {
                       <h2 className="font-serif text-lg text-natural-heading">Dialogue Actif</h2>
                     </div>
                     <div className="flex items-center gap-3">
+                      <select
+                        value={selectedGranularityId}
+                        onChange={(e) => setSelectedGranularityId(e.target.value)}
+                        className="px-3 py-2 bg-white border border-natural-sand rounded-xl text-[10px] font-black uppercase tracking-wider text-natural-muted max-w-[220px]"
+                        title="Granularité de segmentation du dialogue"
+                      >
+                        {granularityProfiles.map((profile) => (
+                          <option key={profile.id} value={profile.id}>
+                            {profile.name}
+                          </option>
+                        ))}
+                      </select>
                       <button 
                         onClick={() => {
                           setChatMessages([]);
@@ -1079,6 +1339,22 @@ export default function App() {
                         </label>
                       </div>
                       <div className="flex flex-col items-center gap-4">
+                        <div className="flex flex-col items-center gap-2">
+                          <label className="text-[10px] font-black text-natural-muted uppercase tracking-[0.2em]">
+                            Granularité de segmentation
+                          </label>
+                          <select
+                            value={selectedGranularityId}
+                            onChange={(e) => setSelectedGranularityId(e.target.value)}
+                            className="px-4 py-2.5 bg-white border border-natural-sand rounded-xl text-[11px] font-bold uppercase tracking-wider text-natural-muted"
+                          >
+                            {granularityProfiles.map((profile) => (
+                              <option key={profile.id} value={profile.id}>
+                                {profile.name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
                         <button onClick={handleCapture} disabled={isAnalyzing || !inputText.trim()} className={cn("px-8 py-4 bg-natural-accent text-white rounded-2xl font-bold tracking-wide hover:bg-natural-accent/90 transition-all shadow-lg flex items-center gap-3", isAnalyzing || !inputText.trim() ? "bg-natural-sand text-natural-stone cursor-not-allowed shadow-none" : "shadow-natural-accent/20")}>
                           {isAnalyzing ? (
                             <>
