@@ -490,6 +490,42 @@ function reconcileSocraticRoles(segments: any[]): any[] {
   return normalized;
 }
 
+function looksLikeStructuredDialog(text: string): boolean {
+  const t = String(text || "").toLowerCase();
+  if (/\[(user|assistant|system)\]/.test(t)) return true;
+  if (/\b(question|reponse|réponse|q:|r:|user:|assistant:)\b/.test(t)) return true;
+  return false;
+}
+
+function forceIntactFreeTextShape(parsed: any, originalText: string, options?: AnalyzeOptions) {
+  if (options?.granularity !== "intact") return;
+  if (looksLikeStructuredDialog(originalText)) return;
+
+  const inferredQuestion = inferQuestionFromAnalysis(originalText);
+  const fullText = String(originalText || "").trim() || "Texte indisponible.";
+
+  parsed.segments = [
+    {
+      content: inferredQuestion,
+      originalText: inferredQuestion,
+      role: "user",
+      semanticSignature: `intact-q-${uuidv4().substring(0, 8)}`,
+      tags: ["question-inferree", "intact"],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: { reason: "Question inférée pour texte libre (mode blocs longs)." },
+    },
+    {
+      content: fullText,
+      originalText: fullText,
+      role: "assistant",
+      semanticSignature: `intact-a-${uuidv4().substring(0, 8)}`,
+      tags: ["analyse-socratique-detectee", "intact"],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: { reason: "Texte source complet conservé (mode blocs longs)." },
+    },
+  ];
+}
+
 function getSelectedProvider(): Provider {
   return (localStorage.getItem("SELECTED_MODEL") as Provider) || "gemini";
 }
@@ -518,13 +554,14 @@ function getAI(apiKey: string) {
   return new GoogleGenerativeAI(apiKey);
 }
 
-function normalizeAnalysisPayload(parsed: any, originalText: string): AnalysisResult {
+function normalizeAnalysisPayload(parsed: any, originalText: string, options?: AnalyzeOptions): AnalysisResult {
   const safeParsed = parsed || {};
+  forceIntactFreeTextShape(safeParsed, originalText, options);
 
   if (!safeParsed.segments || safeParsed.segments.length === 0) {
     safeParsed.segments = [
       {
-        content: originalText.length > 1000 ? `${originalText.substring(0, 1000)}...` : originalText,
+        content: originalText,
         originalText,
         role: "user",
         semanticSignature: `fallback-${uuidv4().substring(0, 8)}`,
@@ -721,7 +758,7 @@ TEXTE: ${JSON.stringify(text)}
     const jsonMatch = rawText.match(/\{[\s\S]*\}/);
     const jsonStr = jsonMatch ? jsonMatch[0] : rawText;
     const parsed = JSON.parse(jsonStr);
-    return normalizeAnalysisPayload(parsed, text);
+    return normalizeAnalysisPayload(parsed, text, options);
   }
 
   const apiKey = provider === "hardwired_gemini" ? getHardwiredGeminiApiKey() : getGeminiApiKey();
@@ -800,7 +837,7 @@ TEXTE: ${JSON.stringify(text)}
         const jsonMatch = rawText.match(/\{[\s\S]*\}/);
         const jsonStr = jsonMatch ? jsonMatch[0] : rawText;
         const parsed = JSON.parse(jsonStr);
-        return normalizeAnalysisPayload(parsed, text);
+        return normalizeAnalysisPayload(parsed, text, options);
       } catch (err: any) {
         lastError = err;
         if (String(err?.message || "").includes("404") || String(err?.message || "").includes("not found")) {

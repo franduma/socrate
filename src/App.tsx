@@ -191,6 +191,7 @@ export default function App() {
   } | null>(null);
   const [isWizardOpen, setIsWizardOpen] = useState(false);
   const [wizardTitle, setWizardTitle] = useState('');
+  const [isFinalizingCapture, setIsFinalizingCapture] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
   // Chat State
@@ -654,7 +655,8 @@ export default function App() {
   };
 
   const finalizeCapture = async () => {
-    if (!potentialCapture) return;
+    if (!potentialCapture || isFinalizingCapture) return;
+    setIsFinalizingCapture(true);
 
     try {
       if (!potentialCapture.segments || potentialCapture.segments.length === 0) {
@@ -740,6 +742,8 @@ export default function App() {
       setTimeout(() => setLastCapturedId(null), 3000);
     } catch (error) {
       alert("Erreur lors de la sauvegarde finale.");
+    } finally {
+      setIsFinalizingCapture(false);
     }
   };
 
@@ -2054,7 +2058,7 @@ export default function App() {
                 <h2 className="font-serif text-4xl text-natural-heading mb-10">Validation Socratique</h2>
                 <div className="space-y-8">
                   <input value={wizardTitle} onChange={(e) => setWizardTitle(e.target.value)} className="w-full p-6 bg-natural-bg rounded-2xl border-2 border-natural-sand focus:border-natural-accent/50 outline-none transition-all font-serif text-2xl text-natural-heading" />
-                  <div className="flex gap-4 pt-4"><button onClick={finalizeCapture} className="flex-1 py-5 bg-natural-accent text-white rounded-2xl font-bold text-sm shadow-xl shadow-natural-accent/20 hover:bg-natural-accent/90 transition-all flex items-center justify-center gap-3"><Save className="w-5 h-5" />Confirmer</button><button onClick={() => setIsWizardOpen(false)} className="px-8 py-5 bg-natural-sand text-natural-muted rounded-2xl font-bold text-sm hover:bg-natural-peach transition-all">Annuler</button></div>
+                  <div className="flex gap-4 pt-4"><button disabled={isFinalizingCapture} onClick={finalizeCapture} className="flex-1 py-5 bg-natural-accent text-white rounded-2xl font-bold text-sm shadow-xl shadow-natural-accent/20 hover:bg-natural-accent/90 transition-all flex items-center justify-center gap-3 disabled:opacity-60 disabled:cursor-not-allowed"><Save className="w-5 h-5" />{isFinalizingCapture ? 'Enregistrement...' : 'Confirmer'}</button><button disabled={isFinalizingCapture} onClick={() => setIsWizardOpen(false)} className="px-8 py-5 bg-natural-sand text-natural-muted rounded-2xl font-bold text-sm hover:bg-natural-peach transition-all disabled:opacity-60 disabled:cursor-not-allowed">Annuler</button></div>
                 </div>
               </motion.div>
             </motion.div>
