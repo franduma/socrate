@@ -7,6 +7,7 @@ export interface SegmentationTrace {
   runId: string;
   timestamp: number;
   provider: string;
+  vectorEngineMode?: 'local' | 'provider';
   granularityId: string;
   granularityName: string;
   granularityInstruction?: string;

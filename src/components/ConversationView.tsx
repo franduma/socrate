@@ -29,7 +29,7 @@ import { formatDate, cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from '../lib/db';
-import { Suspense, lazy, useState } from 'react';
+import { Suspense, lazy, useEffect, useState } from 'react';
 import { Segment, SegmentationTrace } from '../types';
 
 const ConceptualMap = lazy(() =>
@@ -61,6 +61,9 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
   const [isGraphFullscreen, setIsGraphFullscreen] = useState(false);
   const [activeSemanticDetail, setActiveSemanticDetail] = useState<{ id: string, type: 'vector' | 'interpretation' } | null>(null);
   const [semanticLoadingBySegment, setSemanticLoadingBySegment] = useState<Record<string, boolean>>({});
+  const [vectorEngineMode, setVectorEngineMode] = useState<'local' | 'provider'>(
+    (localStorage.getItem('VECTOR_ENGINE_MODE') as any) || 'local'
+  );
   const latestConversationTrace: SegmentationTrace | undefined = conversation?.analysisTrace
     || (conversation?.segmentationTraces && conversation.segmentationTraces.length > 0
       ? conversation.segmentationTraces[conversation.segmentationTraces.length - 1]
@@ -68,8 +71,21 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
   const formatTrace = (trace?: SegmentationTrace) => {
     if (!trace) return '';
     const collection = trace.semanticCollectionName || 'Aucune collection';
-    return `Granularite: ${trace.granularityName} | Collection: ${collection} | Similarite: ${trace.similarityThreshold.toFixed(2)} | Provider: ${trace.provider}`;
+    const vectorMode = trace.vectorEngineMode || vectorEngineMode;
+    return `Granularite: ${trace.granularityName} | Collection: ${collection} | Similarite: ${trace.similarityThreshold.toFixed(2)} | Provider: ${trace.provider} | Vecteur: ${vectorMode}`;
   };
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (detail?.mode === 'local' || detail?.mode === 'provider') {
+        setVectorEngineMode(detail.mode);
+      } else {
+        setVectorEngineMode(((localStorage.getItem('VECTOR_ENGINE_MODE') as any) || 'local'));
+      }
+    };
+    window.addEventListener('vector-engine-mode-changed', handler as EventListener);
+    return () => window.removeEventListener('vector-engine-mode-changed', handler as EventListener);
+  }, []);
 
   const renderDeferredPanel = (node: React.ReactNode, minHeightClass = 'min-h-[300px]') => (
     <Suspense
@@ -113,6 +129,24 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
     }
   };
 
+  const buildLocalVectorDescription = (text: string) => {
+    const tokens = String(text || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length > 2);
+    const freq = new Map<string, number>();
+    tokens.forEach((t) => freq.set(t, (freq.get(t) || 0) + 1));
+    const topTerms = [...freq.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([term, weight]) => `${term}:${weight}`);
+    if (!topTerms.length) return 'Vecteur local indisponible (segment trop court).';
+    return `Vecteur lexical local (top dimensions): ${topTerms.join(' | ')}`;
+  };
+
   const handleSegmentSemanticAction = async (
     segment: Segment,
     type: 'vector' | 'interpretation'
@@ -124,6 +158,15 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
           ? null
           : { id: segment.id, type }
       );
+      return;
+    }
+
+    if (type === 'vector' && vectorEngineMode === 'local') {
+      const localVectorDescription = buildLocalVectorDescription(segment.originalText || segment.content);
+      await db.segments.update(segment.id, {
+        semanticVectorDescription: localVectorDescription,
+      });
+      setActiveSemanticDetail({ id: segment.id, type });
       return;
     }
 

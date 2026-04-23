@@ -232,6 +232,9 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState<'gemini' | 'hardwired_gemini' | 'openai' | 'claude' | 'openrouter' | 'codex'>(
     (localStorage.getItem('SELECTED_MODEL') as any) || 'gemini'
   );
+  const [vectorEngineMode, setVectorEngineMode] = useState<'local' | 'provider'>(
+    (localStorage.getItem('VECTOR_ENGINE_MODE') as any) || 'local'
+  );
   const [selectedGranularityId, setSelectedGranularityId] = useState<string>(
     localStorage.getItem('SEGMENT_GRANULARITY_PROFILE_ID') ||
     localStorage.getItem('SEGMENT_GRANULARITY') ||
@@ -279,6 +282,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('SELECTED_MODEL', selectedModel);
   }, [selectedModel]);
+  useEffect(() => {
+    localStorage.setItem('VECTOR_ENGINE_MODE', vectorEngineMode);
+    window.dispatchEvent(new CustomEvent('vector-engine-mode-changed', { detail: { mode: vectorEngineMode } }));
+  }, [vectorEngineMode]);
 
   useEffect(() => {
     localStorage.setItem('SEGMENT_GRANULARITY_PROFILE_ID', selectedGranularityId);
@@ -427,6 +434,7 @@ export default function App() {
     runId: uuidv4(),
     timestamp: Date.now(),
     provider: selectedModel,
+    vectorEngineMode,
     granularityId: selectedGranularityProfile.id,
     granularityName: selectedGranularityProfile.name,
     granularityInstruction: selectedGranularityProfile.instruction,
@@ -450,6 +458,7 @@ export default function App() {
 
   const applyAdherenceToGraph = (graph: any) => {
     if (!graph || !Array.isArray(graph.nodes)) return graph;
+    if (vectorEngineMode === 'provider') return graph;
     if (!selectedSemanticAttributes.length) return graph;
     const referenceVectors = selectedSemanticAttributes.map((attr) => ({
       attr,
@@ -618,6 +627,7 @@ export default function App() {
         semanticCollectionName: selectedSemanticCollection?.name,
         semanticAttributeLabels: selectedSemanticAttributes.map((a) => a.label),
         similarityThreshold: selectedSemanticSimilarity,
+        vectorEngineMode,
       });
       const enrichedResult = {
         ...result,
@@ -975,6 +985,7 @@ export default function App() {
         semanticCollectionName: selectedSemanticCollection?.name,
         semanticAttributeLabels: selectedSemanticAttributes.map((a) => a.label),
         similarityThreshold: selectedSemanticSimilarity,
+        vectorEngineMode,
       });
       const enrichedResult = {
         ...result,
@@ -1209,6 +1220,38 @@ export default function App() {
                             <span className="text-[10px] font-black uppercase tracking-widest text-center">{m.label}</span>
                           </button>
                         ))}
+                      </div>
+                      <div className="rounded-2xl border border-natural-sand p-4 bg-natural-bg/40 space-y-3">
+                        <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">Couche vectorielle</p>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          <button
+                            onClick={() => setVectorEngineMode('local')}
+                            className={cn(
+                              "p-4 rounded-2xl border text-left transition-all",
+                              vectorEngineMode === 'local'
+                                ? "border-natural-accent bg-natural-sand/30"
+                                : "border-natural-sand bg-white hover:border-natural-beige"
+                            )}
+                          >
+                            <p className="text-xs font-black uppercase tracking-wider text-natural-heading">Local Vector (PC)</p>
+                            <p className="text-[11px] text-natural-muted mt-1">Scores et vecteurs calculÃ©s localement sur cet ordinateur.</p>
+                          </button>
+                          <button
+                            onClick={() => setVectorEngineMode('provider')}
+                            className={cn(
+                              "p-4 rounded-2xl border text-left transition-all",
+                              vectorEngineMode === 'provider'
+                                ? "border-natural-accent bg-natural-sand/30"
+                                : "border-natural-sand bg-white hover:border-natural-beige"
+                            )}
+                          >
+                            <p className="text-xs font-black uppercase tracking-wider text-natural-heading">Provider Vector (API)</p>
+                            <p className="text-[11px] text-natural-muted mt-1">S'appuie sur les scores vecteurs renvoyÃ©s par le fournisseur IA.</p>
+                          </button>
+                        </div>
+                        <p className="text-[10px] text-natural-stone uppercase tracking-wider">
+                          Mode actif: {vectorEngineMode === 'local' ? 'Local Vector (PC)' : 'Provider Vector (API)'}
+                        </p>
                       </div>
                     </div>
 

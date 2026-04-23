@@ -34,6 +34,7 @@ type AnalyzeOptions = {
   semanticCollectionName?: string;
   semanticAttributeLabels?: string[];
   similarityThreshold?: number;
+  vectorEngineMode?: "local" | "provider";
 };
 
 const GEMINI_MODELS_TO_TRY = [
@@ -94,6 +95,13 @@ function getSegmentationInstruction(granularity: SegmentGranularity) {
 function getSemanticComparisonInstruction(options?: AnalyzeOptions) {
   const labels = (options?.semanticAttributeLabels || []).filter(Boolean);
   if (!labels.length) return "";
+  if (options?.vectorEngineMode === "local") {
+    return `
+Comparaison semantique:
+- Le scoring vectoriel est gere localement par l'application.
+- Retourne des noeuds/relations riches, mais n'invente pas de properties.adherenceRate.
+`;
+  }
   const threshold = typeof options?.similarityThreshold === "number" ? options.similarityThreshold : 0.35;
   const collectionName = options?.semanticCollectionName || "Collection personnalisée";
   return `
