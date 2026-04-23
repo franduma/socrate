@@ -89,7 +89,7 @@ export interface FacetCollection {
 export interface SemanticAttribute {
   id: string;
   label: string;
-  kind: 'position' | 'node_type' | 'node_label' | 'edge_label' | 'tag';
+  kind: 'position' | 'node_type' | 'node_label' | 'edge_label' | 'tag' | 'abstraction_level';
   semanticPosition: string;
   color?: string;
   usageCount: number;

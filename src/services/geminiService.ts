@@ -46,6 +46,12 @@ const GEMINI_MODELS_TO_TRY = [
 ];
 
 const OPENAI_MODELS_TO_TRY = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"];
+const ABSTRACTION_SCORE_BY_LEVEL: Record<string, number> = {
+  concret: 0.2,
+  intermediaire: 0.45,
+  conceptuel: 0.72,
+  meta: 0.9,
+};
 
 const SEMANTIC_POSITION_BY_TYPE: Record<string, string> = {
   question: "position_initiale",
@@ -97,6 +103,32 @@ Comparaison sémantique guidée:
 - Seuil de similarité cible: ${threshold}
 Pour chaque noeud du graphe, renseigne properties.adherenceRate (0..1) et properties.matchedAttributes (array) selon cette base.
 `;
+}
+
+function normalizeAbstractionLevel(value: string) {
+  const raw = String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z]/g, "");
+  if (raw.includes("meta")) return "meta";
+  if (raw.includes("concept")) return "conceptuel";
+  if (raw.includes("inter") || raw.includes("median")) return "intermediaire";
+  if (raw.includes("concret") || raw.includes("fact")) return "concret";
+  return "intermediaire";
+}
+
+function inferAbstractionLevel(text: string, type: string) {
+  const t = `${text || ""} ${type || ""}`.toLowerCase();
+  let score = 0;
+  if (/\b(date|heure|lieu|personne|acteur|nom|chiffre|mesure|preuve|source|exemple)\b/.test(t)) score -= 2;
+  if (/\b(concept|principe|modele|categorie|structure|hypothese|cadre|abstraction)\b/.test(t)) score += 2;
+  if (/\b(methode|epistemologie|meta|critere|cadre d'analyse|strategie)\b/.test(t)) score += 3;
+  if (String(text || "").length > 180) score += 1;
+  if (score >= 3) return "meta";
+  if (score >= 1) return "conceptuel";
+  if (score <= -2) return "concret";
+  return "intermediaire";
 }
 
 function normalizeTypeKey(type: string) {
@@ -200,18 +232,32 @@ function buildFallbackSegmentGraph(segment: any, index = 0) {
   const sourceText = String(segment.originalText || segment.content || "");
   const topTokens = tokenizeSemantic(sourceText).slice(0, 4);
   const centerId = `seg-core-${index}`;
+  const centerAbstraction = segment.role === "assistant" ? "conceptuel" : "concret";
   const nodes: Array<{ id: string; label: string; type: string; properties?: Record<string, any> }> = [
     {
       id: centerId,
       label: segment.role === "assistant" ? `Analyse ${index + 1}` : `Position ${index + 1}`,
       type: segment.role === "assistant" ? "Analysis" : "Question",
-      properties: { semanticPosition: segment.role === "assistant" ? "analyse_socratique" : "position_initiale" },
+      properties: {
+        semanticPosition: segment.role === "assistant" ? "analyse_socratique" : "position_initiale",
+        abstractionLevel: centerAbstraction,
+        abstractionScore: ABSTRACTION_SCORE_BY_LEVEL[centerAbstraction],
+      },
     },
   ];
   const edges: Array<{ id: string; source: string; target: string; label: string }> = [];
   topTokens.forEach((token, i) => {
     const tokenId = `seg-${index}-kw-${i}`;
-    nodes.push({ id: tokenId, label: token, type: "Keyword", properties: { semanticPosition: "concept" } });
+    nodes.push({
+      id: tokenId,
+      label: token,
+      type: "Keyword",
+      properties: {
+        semanticPosition: "concept",
+        abstractionLevel: "intermediaire",
+        abstractionScore: ABSTRACTION_SCORE_BY_LEVEL.intermediaire,
+      },
+    });
     edges.push({
       id: `seg-${index}-edge-${i}`,
       source: centerId,
@@ -229,7 +275,16 @@ function buildFallbackConversationGraph(parsed: any): {
   const rootId = `conv-${uuidv4().substring(0, 8)}`;
   const rootLabel = parsed?.title || "Conversation";
   const nodes: { id: string; label: string; type: string; properties?: Record<string, any> }[] = [
-    { id: rootId, label: rootLabel, type: "Conversation", properties: { semanticPosition: "meta" } },
+    {
+      id: rootId,
+      label: rootLabel,
+      type: "Conversation",
+      properties: {
+        semanticPosition: "meta",
+        abstractionLevel: "meta",
+        abstractionScore: ABSTRACTION_SCORE_BY_LEVEL.meta,
+      },
+    },
   ];
   const edges: { id: string; source: string; target: string; label: string }[] = [];
 
@@ -247,7 +302,12 @@ function buildFallbackConversationGraph(parsed: any): {
       id: sid,
       label: truncateText(rawLabel, 62),
       type: seg?.role === "assistant" ? "SocraticAnalysis" : "InitialPosition",
-      properties: { index: i, semanticPosition: seg?.role === "assistant" ? "analyse_socratique" : "position_initiale" },
+      properties: {
+        index: i,
+        semanticPosition: seg?.role === "assistant" ? "analyse_socratique" : "position_initiale",
+        abstractionLevel: seg?.role === "assistant" ? "conceptuel" : "concret",
+        abstractionScore: seg?.role === "assistant" ? ABSTRACTION_SCORE_BY_LEVEL.conceptuel : ABSTRACTION_SCORE_BY_LEVEL.concret,
+      },
     });
     edges.push({
       id: `edge-root-${i}`,
@@ -263,7 +323,16 @@ function buildFallbackConversationGraph(parsed: any): {
       if (!tagNodeId) {
         tagNodeId = `tag-${tagNodeMap.size}`;
         tagNodeMap.set(tag, tagNodeId);
-        nodes.push({ id: tagNodeId, label: tag, type: "Tag", properties: { semanticPosition: "meta" } });
+        nodes.push({
+          id: tagNodeId,
+          label: tag,
+          type: "Tag",
+          properties: {
+            semanticPosition: "meta",
+            abstractionLevel: "intermediaire",
+            abstractionScore: ABSTRACTION_SCORE_BY_LEVEL.intermediaire,
+          },
+        });
       }
       edges.push({
         id: `edge-tag-${i}-${tagNodeId}`,
@@ -329,7 +398,11 @@ function enrichGraphRichness(parsed: any) {
           id: nid,
           label,
           type: "Theme",
-          properties: { semanticPosition: "concept" },
+          properties: {
+            semanticPosition: "concept",
+            abstractionLevel: "conceptuel",
+            abstractionScore: ABSTRACTION_SCORE_BY_LEVEL.conceptuel,
+          },
         });
         existingIds.add(nid);
       }
@@ -465,15 +538,25 @@ function normalizeAnalysisPayload(parsed: any, originalText: string): AnalysisRe
   }
 
   const globalKg = safeParsed.analysis.knowledgeGraph || { nodes: [], edges: [] };
-  globalKg.nodes = (globalKg.nodes || []).map((n: any) => ({
-    id: n.id || uuidv4(),
-    label: n.label || n.id || "Unit",
-    type: n.type || "Concept",
-    properties: {
-      ...(n.properties || {}),
-      semanticPosition: (n.properties && n.properties.semanticPosition) || inferSemanticPosition(n.type || "Concept"),
-    },
-  }));
+  globalKg.nodes = (globalKg.nodes || []).map((n: any) => {
+    const level = normalizeAbstractionLevel(
+      (n.properties && (n.properties.abstractionLevel || n.properties.abstraction_level)) ||
+      inferAbstractionLevel(String(n.label || n.id || ""), String(n.type || "Concept"))
+    );
+    const scoreRaw = Number((n.properties && (n.properties.abstractionScore ?? n.properties.abstraction_score)) ?? ABSTRACTION_SCORE_BY_LEVEL[level]);
+    const score = Number.isFinite(scoreRaw) ? Math.max(0, Math.min(1, scoreRaw)) : ABSTRACTION_SCORE_BY_LEVEL[level];
+    return {
+      id: n.id || uuidv4(),
+      label: n.label || n.id || "Unit",
+      type: n.type || "Concept",
+      properties: {
+        ...(n.properties || {}),
+        semanticPosition: (n.properties && n.properties.semanticPosition) || inferSemanticPosition(n.type || "Concept"),
+        abstractionLevel: level,
+        abstractionScore: score,
+      },
+    };
+  });
   globalKg.edges = (globalKg.edges || []).map((e: any) => ({
     id: e.id || uuidv4(),
     source: e.source || "",
@@ -484,15 +567,25 @@ function normalizeAnalysisPayload(parsed: any, originalText: string): AnalysisRe
 
   safeParsed.segments = safeParsed.segments.map((seg: any) => {
     const localKg = seg.knowledgeGraph || { nodes: [], edges: [] };
-    localKg.nodes = (localKg.nodes || []).map((n: any) => ({
-      id: n.id || uuidv4(),
-      label: n.label || n.id || "Unit",
-      type: n.type || "Concept",
-      properties: {
-        ...(n.properties || {}),
-        semanticPosition: (n.properties && n.properties.semanticPosition) || inferSemanticPosition(n.type || "Concept"),
-      },
-    }));
+    localKg.nodes = (localKg.nodes || []).map((n: any) => {
+      const level = normalizeAbstractionLevel(
+        (n.properties && (n.properties.abstractionLevel || n.properties.abstraction_level)) ||
+        inferAbstractionLevel(String(n.label || n.id || ""), String(n.type || "Concept"))
+      );
+      const scoreRaw = Number((n.properties && (n.properties.abstractionScore ?? n.properties.abstraction_score)) ?? ABSTRACTION_SCORE_BY_LEVEL[level]);
+      const score = Number.isFinite(scoreRaw) ? Math.max(0, Math.min(1, scoreRaw)) : ABSTRACTION_SCORE_BY_LEVEL[level];
+      return {
+        id: n.id || uuidv4(),
+        label: n.label || n.id || "Unit",
+        type: n.type || "Concept",
+        properties: {
+          ...(n.properties || {}),
+          semanticPosition: (n.properties && n.properties.semanticPosition) || inferSemanticPosition(n.type || "Concept"),
+          abstractionLevel: level,
+          abstractionScore: score,
+        },
+      };
+    });
     localKg.edges = (localKg.edges || []).map((e: any) => ({
       id: e.id || uuidv4(),
       source: e.source || "",
@@ -583,6 +676,8 @@ export async function analyzeAndSegmentConversation(text: string, options?: Anal
  Regle de role: si le segment est une question/probleme initial -> role="user"; si c'est une explication/raisonnement/reponse -> role="assistant".
  Produis un graphe riche et varié: noeuds de types différents (Conversation, Question, SocraticAnalysis, Concept, Theme, Evidence, Actor, Deviation).
  Chaque noeud doit inclure properties.semanticPosition parmi: position_initiale, analyse_socratique, concept, preuve, acteur, deviation, meta.
+ Chaque noeud doit inclure properties.abstractionLevel parmi: concret, intermediaire, conceptuel, meta.
+ Chaque noeud doit inclure properties.abstractionScore (0..1) cohérent avec abstractionLevel.
  Utilise des labels de relations explicites (ex: soutient, oppose, clarifie, illustre, dérive_de, contextualise).
 
 Retourne STRICTEMENT un objet JSON avec cette structure:
@@ -673,6 +768,8 @@ TEXTE: ${JSON.stringify(text)}
  Regle de role: si le segment est une question/probleme initial -> role="user"; si c'est une explication/raisonnement/reponse -> role="assistant".
  Produis un graphe riche et varié: noeuds de types différents (Conversation, Question, SocraticAnalysis, Concept, Theme, Evidence, Actor, Deviation).
  Chaque noeud doit inclure properties.semanticPosition parmi: position_initiale, analyse_socratique, concept, preuve, acteur, deviation, meta.
+ Chaque noeud doit inclure properties.abstractionLevel parmi: concret, intermediaire, conceptuel, meta.
+ Chaque noeud doit inclure properties.abstractionScore (0..1) cohérent avec abstractionLevel.
  Utilise des labels de relations explicites (ex: soutient, oppose, clarifie, illustre, dérive_de, contextualise).
 
 STRUCTURE (JSON STRICT):

@@ -34,20 +34,39 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
       return defaults;
     }
   });
+  const [abstractionLevelColors, setAbstractionLevelColors] = useState<Record<string, string>>(() => {
+    const defaults: Record<string, string> = {
+      concret: '#0ea5e9',
+      intermediaire: '#10b981',
+      conceptuel: '#f59e0b',
+      meta: '#a855f7',
+    };
+    try {
+      const raw = localStorage.getItem('ABSTRACTION_LEVEL_COLORS');
+      if (!raw) return defaults;
+      return { ...defaults, ...JSON.parse(raw) };
+    } catch {
+      return defaults;
+    }
+  });
 
   useEffect(() => {
     const syncColors = () => {
       try {
         const raw = localStorage.getItem('SEMANTIC_POSITION_COLORS');
         if (raw) setSemanticPositionColors((prev) => ({ ...prev, ...JSON.parse(raw) }));
+        const rawAbstraction = localStorage.getItem('ABSTRACTION_LEVEL_COLORS');
+        if (rawAbstraction) setAbstractionLevelColors((prev) => ({ ...prev, ...JSON.parse(rawAbstraction) }));
       } catch {
         // ignore parse failures
       }
     };
     const handler = () => syncColors();
     window.addEventListener('semantic-position-colors-changed', handler as EventListener);
+    window.addEventListener('semantic-style-changed', handler as EventListener);
     return () => {
       window.removeEventListener('semantic-position-colors-changed', handler as EventListener);
+      window.removeEventListener('semantic-style-changed', handler as EventListener);
     };
   }, []);
   const safeGraph = useMemo(() => {
@@ -204,8 +223,11 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
           }
           return baseColor;
         })
-        .attr("stroke", "#fff")
-        .attr("stroke-width", 2)
+        .attr("stroke", (d: any) => {
+          const level = String(d?.properties?.abstractionLevel || '').toLowerCase();
+          return abstractionLevelColors[level] || abstractionLevelColors.intermediaire || '#ffffff';
+        })
+        .attr("stroke-width", 3)
         .style("filter", "drop-shadow(0 4px 6px rgba(0,0,0,0.1))");
 
       node.append("text")
@@ -306,7 +328,7 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
       if (simulation) simulation.stop();
       resizeObserver.disconnect();
     };
-  }, [safeGraph, markerId]);
+  }, [safeGraph, markerId, semanticPositionColors, abstractionLevelColors]);
 
   const exportToCypher = () => {
     const nodes = safeGraph.nodes.map(n => `CREATE (n${n.id.replace(/-/g, '')}:${n.type.replace(/\s+/g, '')} {id: "${n.id}", label: "${n.label}"})`).join('\n');

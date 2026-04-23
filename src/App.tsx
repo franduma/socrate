@@ -108,6 +108,13 @@ const DEFAULT_SEMANTIC_POSITION_COLORS: Record<string, string> = {
   meta: '#64748b',
 };
 
+const DEFAULT_ABSTRACTION_LEVEL_COLORS: Record<string, string> = {
+  concret: '#0ea5e9',
+  intermediaire: '#10b981',
+  conceptuel: '#f59e0b',
+  meta: '#a855f7',
+};
+
 function slugify(value: string) {
   return value
     .toLowerCase()
@@ -258,6 +265,15 @@ export default function App() {
       return DEFAULT_SEMANTIC_POSITION_COLORS;
     }
   });
+  const [abstractionLevelColors, setAbstractionLevelColors] = useState<Record<string, string>>(() => {
+    const raw = localStorage.getItem('ABSTRACTION_LEVEL_COLORS');
+    if (!raw) return DEFAULT_ABSTRACTION_LEVEL_COLORS;
+    try {
+      return { ...DEFAULT_ABSTRACTION_LEVEL_COLORS, ...JSON.parse(raw) };
+    } catch {
+      return DEFAULT_ABSTRACTION_LEVEL_COLORS;
+    }
+  });
 
   useEffect(() => {
     localStorage.setItem('SELECTED_MODEL', selectedModel);
@@ -274,6 +290,9 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('SEMANTIC_POSITION_COLORS', JSON.stringify(semanticPositionColors));
   }, [semanticPositionColors]);
+  useEffect(() => {
+    localStorage.setItem('ABSTRACTION_LEVEL_COLORS', JSON.stringify(abstractionLevelColors));
+  }, [abstractionLevelColors]);
 
   const defaultReactions: CustomReaction[] = [
     { id: '1', label: 'Précise', prompt: 'Peux-tu apporter plus de précisions sur ce point spécifique ?' },
@@ -391,6 +410,14 @@ export default function App() {
       .map((a) => a.semanticPosition)
       .filter(Boolean),
     ]));
+  const configuredAbstractionLevels = Array.from(new Set([
+    ...Object.keys(DEFAULT_ABSTRACTION_LEVEL_COLORS),
+    ...Object.keys(abstractionLevelColors),
+    ...semanticAttributes
+      .filter((a) => a.kind === 'abstraction_level')
+      .map((a) => slugify(a.label))
+      .filter(Boolean),
+  ]));
   const selectedSemanticCollection = semanticAttributeCollections.find((c) => c.id === selectedSemanticCollectionId) || null;
   const selectedSemanticAttributes = selectedSemanticCollection
     ? semanticAttributes.filter((a) => selectedSemanticCollection.attributeIds.includes(a.id))
@@ -437,6 +464,10 @@ export default function App() {
     });
     return { ...graph, nodes };
   };
+  const notifyGraphStyleChanged = () => {
+    window.dispatchEvent(new CustomEvent('semantic-position-colors-changed'));
+    window.dispatchEvent(new CustomEvent('semantic-style-changed'));
+  };
 
   const registerSemanticAttributesFromAnalysis = async (analysisPayload: any, segmentPayloads: any[]) => {
     const map = new Map<string, SemanticAttribute>();
@@ -460,6 +491,8 @@ export default function App() {
         semanticPosition,
         color: kind === 'position'
           ? (semanticPositionColors[semanticPosition] || DEFAULT_SEMANTIC_POSITION_COLORS[semanticPosition] || '#64748b')
+          : kind === 'abstraction_level'
+            ? (abstractionLevelColors[slugify(label)] || DEFAULT_ABSTRACTION_LEVEL_COLORS[slugify(label)] || '#64748b')
           : undefined,
         usageCount: 1,
         createdAt: now,
@@ -474,9 +507,11 @@ export default function App() {
       nodes.forEach((n: any) => {
         const type = String(n?.type || 'Concept');
         const position = String(n?.properties?.semanticPosition || inferSemanticPositionFromType(type));
+        const abstractionLevel = slugify(String(n?.properties?.abstractionLevel || 'intermediaire'));
         register('node_type', type, position);
         register('node_label', String(n?.label || n?.id || ''), position);
         register('position', position, position);
+        register('abstraction_level', abstractionLevel, position);
       });
 
       edges.forEach((e: any) => {
@@ -1398,7 +1433,7 @@ export default function App() {
                                 onChange={(e) => {
                                   const color = e.target.value;
                                   setSemanticPositionColors((prev) => ({ ...prev, [position]: color }));
-                                  window.dispatchEvent(new CustomEvent('semantic-position-colors-changed'));
+                                  notifyGraphStyleChanged();
                                   db.semanticAttributes.put({
                                     id: `position:${slugify(position)}:${slugify(position)}`,
                                     label: position,
@@ -1425,6 +1460,45 @@ export default function App() {
                         </div>
                       </div>
 
+                      <div className="rounded-2xl border border-natural-sand p-4 bg-natural-bg/40 space-y-3">
+                        <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">Niveaux d'abstraction & couleurs</p>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          {configuredAbstractionLevels.map((level) => (
+                            <div key={level} className="flex items-center justify-between bg-white border border-natural-sand rounded-xl p-2.5">
+                              <span className="text-[11px] font-bold text-natural-heading uppercase tracking-wide">{level.replace(/_/g, ' ')}</span>
+                              <input
+                                type="color"
+                                value={abstractionLevelColors[level] || DEFAULT_ABSTRACTION_LEVEL_COLORS[level] || '#64748b'}
+                                onChange={(e) => {
+                                  const color = e.target.value;
+                                  setAbstractionLevelColors((prev) => ({ ...prev, [level]: color }));
+                                  notifyGraphStyleChanged();
+                                  db.semanticAttributes.put({
+                                    id: `abstraction_level:${slugify(level)}:meta`,
+                                    label: level,
+                                    kind: 'abstraction_level',
+                                    semanticPosition: 'meta',
+                                    color,
+                                    usageCount: 1,
+                                    createdAt: Date.now(),
+                                    updatedAt: Date.now(),
+                                  });
+                                  db.semanticAttributes
+                                    .where('kind')
+                                    .equals('abstraction_level')
+                                    .and((attr) => slugify(attr.label) === slugify(level))
+                                    .toArray()
+                                    .then((attrs) => Promise.all(attrs.map((attr) => db.semanticAttributes.update(attr.id, { color, updatedAt: Date.now() }))))
+                                    .catch(() => {});
+                                }}
+                                className="w-10 h-8 rounded border border-natural-sand bg-transparent cursor-pointer"
+                                title={`Couleur pour ${level}`}
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
                       <div className="rounded-2xl border border-natural-sand overflow-hidden">
                         <div className="px-4 py-3 bg-natural-bg/50 border-b border-natural-sand flex items-center justify-between">
                           <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">Attributs collectés</p>
@@ -1444,7 +1518,11 @@ export default function App() {
                               </div>
                               <span
                                 className="w-4 h-4 rounded-full border border-natural-sand shrink-0"
-                                style={{ backgroundColor: attr.color || semanticPositionColors[attr.semanticPosition] || DEFAULT_SEMANTIC_POSITION_COLORS[attr.semanticPosition] || '#64748b' }}
+                                style={{
+                                  backgroundColor: attr.color || (attr.kind === 'abstraction_level'
+                                    ? (abstractionLevelColors[slugify(attr.label)] || DEFAULT_ABSTRACTION_LEVEL_COLORS[slugify(attr.label)] || '#64748b')
+                                    : (semanticPositionColors[attr.semanticPosition] || DEFAULT_SEMANTIC_POSITION_COLORS[attr.semanticPosition] || '#64748b')),
+                                }}
                                 title={attr.semanticPosition}
                               />
                             </div>
