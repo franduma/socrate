@@ -86,6 +86,25 @@ export interface FacetCollection {
   createdAt: number;
 }
 
+export interface SemanticAttribute {
+  id: string;
+  label: string;
+  kind: 'position' | 'node_type' | 'node_label' | 'edge_label' | 'tag';
+  semanticPosition: string;
+  color?: string;
+  usageCount: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface SemanticAttributeCollection {
+  id: string;
+  name: string;
+  attributeIds: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface CustomReaction {
   id: string;
   label: string;

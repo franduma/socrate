@@ -31,6 +31,9 @@ export type ConnectionTestResult = {
 type AnalyzeOptions = {
   granularity?: SegmentGranularity;
   customSegmentationInstruction?: string;
+  semanticCollectionName?: string;
+  semanticAttributeLabels?: string[];
+  similarityThreshold?: number;
 };
 
 const GEMINI_MODELS_TO_TRY = [
@@ -43,6 +46,25 @@ const GEMINI_MODELS_TO_TRY = [
 ];
 
 const OPENAI_MODELS_TO_TRY = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"];
+
+const SEMANTIC_POSITION_BY_TYPE: Record<string, string> = {
+  question: "position_initiale",
+  initialposition: "position_initiale",
+  socraticanalysis: "analyse_socratique",
+  analysis: "analyse_socratique",
+  concept: "concept",
+  theme: "concept",
+  keyword: "concept",
+  evidence: "preuve",
+  source: "preuve",
+  actor: "acteur",
+  person: "acteur",
+  personne: "acteur",
+  deviation: "deviation",
+  objection: "deviation",
+  conversation: "meta",
+  tag: "meta",
+};
 
 const SEMANTIC_STOP_WORDS = new Set([
   "le", "la", "les", "un", "une", "des", "du", "de", "d", "et", "ou", "mais", "donc", "or", "ni", "car",
@@ -61,6 +83,29 @@ function getSegmentationInstruction(granularity: SegmentGranularity) {
     return "Segmentation=FINE: découpe en micro-unités sémantiques (1 à 3 idées clés par segment). Vise 8 à 18 segments selon la longueur.";
   }
   return "Segmentation=BALANCED: découpe équilibrée par intention/question/réponse. Vise 4 à 10 segments selon la longueur.";
+}
+
+function getSemanticComparisonInstruction(options?: AnalyzeOptions) {
+  const labels = (options?.semanticAttributeLabels || []).filter(Boolean);
+  if (!labels.length) return "";
+  const threshold = typeof options?.similarityThreshold === "number" ? options.similarityThreshold : 0.35;
+  const collectionName = options?.semanticCollectionName || "Collection personnalisée";
+  return `
+Comparaison sémantique guidée:
+- Collection active: ${collectionName}
+- Attributs de référence: ${labels.join(", ")}
+- Seuil de similarité cible: ${threshold}
+Pour chaque noeud du graphe, renseigne properties.adherenceRate (0..1) et properties.matchedAttributes (array) selon cette base.
+`;
+}
+
+function normalizeTypeKey(type: string) {
+  return String(type || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function inferSemanticPosition(type: string) {
+  const key = normalizeTypeKey(type);
+  return SEMANTIC_POSITION_BY_TYPE[key] || "concept";
 }
 
 function tokenizeSemantic(text: string): string[] {
@@ -160,13 +205,13 @@ function buildFallbackSegmentGraph(segment: any, index = 0) {
       id: centerId,
       label: segment.role === "assistant" ? `Analyse ${index + 1}` : `Position ${index + 1}`,
       type: segment.role === "assistant" ? "Analysis" : "Question",
-      properties: {},
+      properties: { semanticPosition: segment.role === "assistant" ? "analyse_socratique" : "position_initiale" },
     },
   ];
   const edges: Array<{ id: string; source: string; target: string; label: string }> = [];
   topTokens.forEach((token, i) => {
     const tokenId = `seg-${index}-kw-${i}`;
-    nodes.push({ id: tokenId, label: token, type: "Keyword", properties: {} });
+    nodes.push({ id: tokenId, label: token, type: "Keyword", properties: { semanticPosition: "concept" } });
     edges.push({
       id: `seg-${index}-edge-${i}`,
       source: centerId,
@@ -184,7 +229,7 @@ function buildFallbackConversationGraph(parsed: any): {
   const rootId = `conv-${uuidv4().substring(0, 8)}`;
   const rootLabel = parsed?.title || "Conversation";
   const nodes: { id: string; label: string; type: string; properties?: Record<string, any> }[] = [
-    { id: rootId, label: rootLabel, type: "Conversation", properties: {} },
+    { id: rootId, label: rootLabel, type: "Conversation", properties: { semanticPosition: "meta" } },
   ];
   const edges: { id: string; source: string; target: string; label: string }[] = [];
 
@@ -202,7 +247,7 @@ function buildFallbackConversationGraph(parsed: any): {
       id: sid,
       label: truncateText(rawLabel, 62),
       type: seg?.role === "assistant" ? "SocraticAnalysis" : "InitialPosition",
-      properties: { index: i },
+      properties: { index: i, semanticPosition: seg?.role === "assistant" ? "analyse_socratique" : "position_initiale" },
     });
     edges.push({
       id: `edge-root-${i}`,
@@ -218,7 +263,7 @@ function buildFallbackConversationGraph(parsed: any): {
       if (!tagNodeId) {
         tagNodeId = `tag-${tagNodeMap.size}`;
         tagNodeMap.set(tag, tagNodeId);
-        nodes.push({ id: tagNodeId, label: tag, type: "Tag", properties: {} });
+        nodes.push({ id: tagNodeId, label: tag, type: "Tag", properties: { semanticPosition: "meta" } });
       }
       edges.push({
         id: `edge-tag-${i}-${tagNodeId}`,
@@ -261,6 +306,46 @@ function ensureGraphCompleteness(parsed: any) {
     }
     return seg;
   });
+}
+
+function enrichGraphRichness(parsed: any) {
+  if (!parsed?.analysis?.knowledgeGraph) return;
+  const kg = parsed.analysis.knowledgeGraph;
+  const nodes: any[] = Array.isArray(kg.nodes) ? kg.nodes : [];
+  const edges: any[] = Array.isArray(kg.edges) ? kg.edges : [];
+  const existingIds = new Set(nodes.map((n: any) => n.id));
+  const root = nodes.find((n: any) => normalizeTypeKey(n.type) === "conversation") || nodes[0];
+
+  const suggested = [
+    ...(parsed?.analysis?.themes || []),
+    ...(parsed?.analysis?.suggestedTags || []),
+  ].filter((x: any) => typeof x === "string" && x.trim().length > 0);
+
+  if (suggested.length > 0) {
+    suggested.slice(0, 8).forEach((label: string, i: number) => {
+      const nid = `theme-${i}-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+      if (!existingIds.has(nid)) {
+        nodes.push({
+          id: nid,
+          label,
+          type: "Theme",
+          properties: { semanticPosition: "concept" },
+        });
+        existingIds.add(nid);
+      }
+      if (root) {
+        edges.push({
+          id: `edge-theme-${i}-${root.id}`,
+          source: root.id,
+          target: nid,
+          label: "thématise",
+        });
+      }
+    });
+  }
+
+  kg.nodes = nodes;
+  kg.edges = edges;
 }
 
 function reconcileSocraticRoles(segments: any[]): any[] {
@@ -384,7 +469,10 @@ function normalizeAnalysisPayload(parsed: any, originalText: string): AnalysisRe
     id: n.id || uuidv4(),
     label: n.label || n.id || "Unit",
     type: n.type || "Concept",
-    properties: n.properties || {},
+    properties: {
+      ...(n.properties || {}),
+      semanticPosition: (n.properties && n.properties.semanticPosition) || inferSemanticPosition(n.type || "Concept"),
+    },
   }));
   globalKg.edges = (globalKg.edges || []).map((e: any) => ({
     id: e.id || uuidv4(),
@@ -400,7 +488,10 @@ function normalizeAnalysisPayload(parsed: any, originalText: string): AnalysisRe
       id: n.id || uuidv4(),
       label: n.label || n.id || "Unit",
       type: n.type || "Concept",
-      properties: n.properties || {},
+      properties: {
+        ...(n.properties || {}),
+        semanticPosition: (n.properties && n.properties.semanticPosition) || inferSemanticPosition(n.type || "Concept"),
+      },
     }));
     localKg.edges = (localKg.edges || []).map((e: any) => ({
       id: e.id || uuidv4(),
@@ -421,6 +512,7 @@ function normalizeAnalysisPayload(parsed: any, originalText: string): AnalysisRe
 
   safeParsed.segments = reconcileSocraticRoles(safeParsed.segments);
   ensureGraphCompleteness(safeParsed);
+  enrichGraphRichness(safeParsed);
 
   return safeParsed as AnalysisResult;
 }
@@ -481,12 +573,17 @@ export async function analyzeAndSegmentConversation(text: string, options?: Anal
   const segmentationInstruction =
     options?.customSegmentationInstruction?.trim() ||
     getSegmentationInstruction(options?.granularity || "balanced");
+  const semanticComparisonInstruction = getSemanticComparisonInstruction(options);
 
   if (provider === "openai") {
     const prompt = `
  Tu es Socrate, expert en maieutique. Deconstruis cet echange.
  ${segmentationInstruction}
+ ${semanticComparisonInstruction}
  Regle de role: si le segment est une question/probleme initial -> role="user"; si c'est une explication/raisonnement/reponse -> role="assistant".
+ Produis un graphe riche et varié: noeuds de types différents (Conversation, Question, SocraticAnalysis, Concept, Theme, Evidence, Actor, Deviation).
+ Chaque noeud doit inclure properties.semanticPosition parmi: position_initiale, analyse_socratique, concept, preuve, acteur, deviation, meta.
+ Utilise des labels de relations explicites (ex: soutient, oppose, clarifie, illustre, dérive_de, contextualise).
 
 Retourne STRICTEMENT un objet JSON avec cette structure:
 {
@@ -572,7 +669,11 @@ TEXTE: ${JSON.stringify(text)}
                   text: `
  Tu es Socrate, expert en maieutique. Deconstruis cet echange.
  ${segmentationInstruction}
+ ${semanticComparisonInstruction}
  Regle de role: si le segment est une question/probleme initial -> role="user"; si c'est une explication/raisonnement/reponse -> role="assistant".
+ Produis un graphe riche et varié: noeuds de types différents (Conversation, Question, SocraticAnalysis, Concept, Theme, Evidence, Actor, Deviation).
+ Chaque noeud doit inclure properties.semanticPosition parmi: position_initiale, analyse_socratique, concept, preuve, acteur, deviation, meta.
+ Utilise des labels de relations explicites (ex: soutient, oppose, clarifie, illustre, dérive_de, contextualise).
 
 STRUCTURE (JSON STRICT):
 {

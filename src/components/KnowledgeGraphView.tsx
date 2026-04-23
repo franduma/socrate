@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useMemo, useRef } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import * as d3 from 'd3';
 import { KnowledgeGraph } from '../types';
 import { Share2, Info, Maximize2, Download } from 'lucide-react';
@@ -16,6 +16,40 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
   const arrowOffset = 14;
   const rawMarkerId = useId();
   const markerId = useMemo(() => `arrowhead-${rawMarkerId.replace(/[^a-zA-Z0-9_-]/g, '')}`, [rawMarkerId]);
+  const [semanticPositionColors, setSemanticPositionColors] = useState<Record<string, string>>(() => {
+    const defaults: Record<string, string> = {
+      position_initiale: '#3b82f6',
+      analyse_socratique: '#f97316',
+      concept: '#22c55e',
+      preuve: '#8b5cf6',
+      acteur: '#14b8a6',
+      deviation: '#ef4444',
+      meta: '#64748b',
+    };
+    try {
+      const raw = localStorage.getItem('SEMANTIC_POSITION_COLORS');
+      if (!raw) return defaults;
+      return { ...defaults, ...JSON.parse(raw) };
+    } catch {
+      return defaults;
+    }
+  });
+
+  useEffect(() => {
+    const syncColors = () => {
+      try {
+        const raw = localStorage.getItem('SEMANTIC_POSITION_COLORS');
+        if (raw) setSemanticPositionColors((prev) => ({ ...prev, ...JSON.parse(raw) }));
+      } catch {
+        // ignore parse failures
+      }
+    };
+    const handler = () => syncColors();
+    window.addEventListener('semantic-position-colors-changed', handler as EventListener);
+    return () => {
+      window.removeEventListener('semantic-position-colors-changed', handler as EventListener);
+    };
+  }, []);
   const safeGraph = useMemo(() => {
     const rawNodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
     const nodes = rawNodes
@@ -75,6 +109,8 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
           const currentScale = event.transform.k;
           g.selectAll(".node-label")
             .style("font-size", `${11 / currentScale}px`);
+          g.selectAll(".node-adherence")
+            .style("font-size", `${9 / currentScale}px`);
           g.selectAll(".edge-label")
             .style("font-size", `${9 / currentScale}px`);
         });
@@ -149,10 +185,24 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
       node.append("circle")
         .attr("r", 50) // Increased radius for better readability
         .attr("fill", d => {
+          const semanticPosition = String(d?.properties?.semanticPosition || '').trim();
+          let baseColor = semanticPosition && semanticPositionColors[semanticPosition]
+            ? semanticPositionColors[semanticPosition]
+            : '';
           const type = d.type?.toLowerCase() || "";
-          if (type.includes('personne') || type.includes('acteur')) return "#4a4e40";
-          if (type.includes('idée') || type.includes('concept')) return "#bc6c25";
-          return "#b08968";
+          if (!baseColor && type.includes('question')) baseColor = semanticPositionColors.position_initiale || "#3b82f6";
+          if (!baseColor && (type.includes('analysis') || type.includes('socratic'))) baseColor = semanticPositionColors.analyse_socratique || "#f97316";
+          if (!baseColor && (type.includes('evidence') || type.includes('source'))) baseColor = semanticPositionColors.preuve || "#8b5cf6";
+          if (!baseColor && (type.includes('personne') || type.includes('acteur') || type.includes('actor'))) baseColor = semanticPositionColors.acteur || "#14b8a6";
+          if (!baseColor && type.includes('concept')) baseColor = semanticPositionColors.concept || "#22c55e";
+          if (!baseColor && (type.includes('idée') || type.includes('concept'))) baseColor = semanticPositionColors.concept || "#22c55e";
+          if (!baseColor) baseColor = semanticPositionColors.concept || "#22c55e";
+          const adherenceRate = Number(d?.properties?.adherenceRate);
+          if (Number.isFinite(adherenceRate)) {
+            const normalized = Math.max(0, Math.min(1, adherenceRate));
+            return d3.interpolateRgb("#e5e7eb", baseColor)(normalized);
+          }
+          return baseColor;
         })
         .attr("stroke", "#fff")
         .attr("stroke-width", 2)
@@ -167,6 +217,32 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
         .attr("font-weight", "bold")
         .style("pointer-events", "none")
         .text(d => d.label);
+
+      node.append("text")
+        .attr("class", "node-adherence")
+        .attr("dy", "1.9em")
+        .attr("text-anchor", "middle")
+        .attr("fill", "#111827")
+        .attr("font-size", "9px")
+        .attr("font-weight", "bold")
+        .style("pointer-events", "none")
+        .text((d: any) => {
+          const score = Number(d?.properties?.adherenceRate);
+          if (!Number.isFinite(score)) return "";
+          return `${Math.round(Math.max(0, Math.min(1, score)) * 100)}%`;
+        });
+
+      node.append("title")
+        .text((d: any) => {
+          const score = Number(d?.properties?.adherenceRate);
+          const matched = Array.isArray(d?.properties?.matchedAttributes) ? d.properties.matchedAttributes : [];
+          if (!Number.isFinite(score)) {
+            return `${d.label}\nAdhésion: non calculée`;
+          }
+          const pct = Math.round(Math.max(0, Math.min(1, score)) * 100);
+          const matches = matched.length ? matched.slice(0, 6).join(", ") : "Aucun attribut au-dessus du seuil";
+          return `${d.label}\nAdhésion: ${pct}%\nAttributs: ${matches}`;
+        });
 
       simulation.on("tick", () => {
         link

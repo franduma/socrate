@@ -42,7 +42,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './lib/db';
-import { CustomReaction, ChatMessage, DictionaryEntry } from './types';
+import { CustomReaction, ChatMessage, DictionaryEntry, SemanticAttribute, SemanticAttributeCollection } from './types';
 import { v4 as uuidv4 } from 'uuid';
 
 /**
@@ -97,6 +97,68 @@ const DEFAULT_GRANULARITY_PROFILES: GranularityProfile[] = [
     readOnly: true,
   },
 ];
+
+const DEFAULT_SEMANTIC_POSITION_COLORS: Record<string, string> = {
+  position_initiale: '#3b82f6',
+  analyse_socratique: '#f97316',
+  concept: '#22c55e',
+  preuve: '#8b5cf6',
+  acteur: '#14b8a6',
+  deviation: '#ef4444',
+  meta: '#64748b',
+};
+
+function slugify(value: string) {
+  return value
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '');
+}
+
+function inferSemanticPositionFromType(type: string) {
+  const key = slugify(type).replace(/-/g, '');
+  if (key.includes('question') || key.includes('initialposition')) return 'position_initiale';
+  if (key.includes('analysis') || key.includes('socraticanalysis')) return 'analyse_socratique';
+  if (key.includes('evidence') || key.includes('source')) return 'preuve';
+  if (key.includes('actor') || key.includes('person') || key.includes('personne')) return 'acteur';
+  if (key.includes('deviation') || key.includes('objection')) return 'deviation';
+  if (key.includes('conversation') || key.includes('tag')) return 'meta';
+  return 'concept';
+}
+
+function tokenizeSemanticLocal(text: string): string[] {
+  return String(text || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 2);
+}
+
+function vectorizeText(text: string): Map<string, number> {
+  const map = new Map<string, number>();
+  tokenizeSemanticLocal(text).forEach((t) => map.set(t, (map.get(t) || 0) + 1));
+  return map;
+}
+
+function cosineLocal(a: Map<string, number>, b: Map<string, number>) {
+  if (!a.size || !b.size) return 0;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  a.forEach((va, k) => {
+    na += va * va;
+    dot += va * (b.get(k) || 0);
+  });
+  b.forEach((vb) => {
+    nb += vb * vb;
+  });
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom ? dot / denom : 0;
+}
 
 function getCoreGranularity(id: string): 'intact' | 'balanced' | 'fine' {
   if (id === 'intact' || id === 'fine' || id === 'balanced') return id;
@@ -187,6 +249,15 @@ export default function App() {
       return [];
     }
   });
+  const [semanticPositionColors, setSemanticPositionColors] = useState<Record<string, string>>(() => {
+    const raw = localStorage.getItem('SEMANTIC_POSITION_COLORS');
+    if (!raw) return DEFAULT_SEMANTIC_POSITION_COLORS;
+    try {
+      return { ...DEFAULT_SEMANTIC_POSITION_COLORS, ...JSON.parse(raw) };
+    } catch {
+      return DEFAULT_SEMANTIC_POSITION_COLORS;
+    }
+  });
 
   useEffect(() => {
     localStorage.setItem('SELECTED_MODEL', selectedModel);
@@ -199,6 +270,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('CUSTOM_SEGMENT_GRANULARITIES', JSON.stringify(customGranularityProfiles));
   }, [customGranularityProfiles]);
+
+  useEffect(() => {
+    localStorage.setItem('SEMANTIC_POSITION_COLORS', JSON.stringify(semanticPositionColors));
+  }, [semanticPositionColors]);
 
   const defaultReactions: CustomReaction[] = [
     { id: '1', label: 'Précise', prompt: 'Peux-tu apporter plus de précisions sur ce point spécifique ?' },
@@ -220,6 +295,8 @@ export default function App() {
 
   const [isSavingKey, setIsSavingKey] = useState(false);
   const [isTestingConnection, setIsTestingConnection] = useState(false);
+  const [isSavingGranularity, setIsSavingGranularity] = useState(false);
+  const [granularitySaveStamp, setGranularitySaveStamp] = useState<number | null>(null);
 
   const handleTestConnection = async () => {
     setIsTestingConnection(true);
@@ -275,6 +352,29 @@ export default function App() {
   const segments = useLiveQuery(() => db.segments.toArray()) || [];
   const facettesList = useLiveQuery(() => db.facettes.toArray()) || [];
   const facetCollections = useLiveQuery(() => db.facetCollections.toArray()) || [];
+  const semanticAttributes = useLiveQuery(() => db.semanticAttributes.orderBy('updatedAt').reverse().toArray()) || [];
+  const semanticAttributeCollections = useLiveQuery(() => db.semanticAttributeCollections.orderBy('updatedAt').reverse().toArray()) || [];
+
+  const [selectedSemanticCollectionId, setSelectedSemanticCollectionId] = useState<string>(() =>
+    localStorage.getItem('SELECTED_SEMANTIC_COLLECTION_ID') || ''
+  );
+  const [selectedSemanticSimilarity, setSelectedSemanticSimilarity] = useState<number>(() => {
+    const raw = localStorage.getItem('SEMANTIC_SIMILARITY_THRESHOLD');
+    const parsed = raw ? parseFloat(raw) : 0.35;
+    return Number.isFinite(parsed) ? parsed : 0.35;
+  });
+  const [semanticCollectionNameDraft, setSemanticCollectionNameDraft] = useState('');
+  const [semanticCollectionAttributeDraftIds, setSemanticCollectionAttributeDraftIds] = useState<string[]>([]);
+  const [isRecalculatingSemanticBank, setIsRecalculatingSemanticBank] = useState(false);
+
+  useEffect(() => {
+    if (selectedSemanticCollectionId) localStorage.setItem('SELECTED_SEMANTIC_COLLECTION_ID', selectedSemanticCollectionId);
+    else localStorage.removeItem('SELECTED_SEMANTIC_COLLECTION_ID');
+  }, [selectedSemanticCollectionId]);
+
+  useEffect(() => {
+    localStorage.setItem('SEMANTIC_SIMILARITY_THRESHOLD', String(selectedSemanticSimilarity));
+  }, [selectedSemanticSimilarity]);
 
   const [dictTab, setDictTab] = useState<'semantic' | 'facets'>('semantic');
   const [newFacetteName, setNewFacetteName] = useState('');
@@ -283,12 +383,179 @@ export default function App() {
   const granularityProfiles = [...DEFAULT_GRANULARITY_PROFILES, ...customGranularityProfiles];
   const selectedGranularityProfile =
     granularityProfiles.find((p) => p.id === selectedGranularityId) || DEFAULT_GRANULARITY_PROFILES[1];
+  const configuredSemanticPositions = Array.from(new Set([
+    ...Object.keys(DEFAULT_SEMANTIC_POSITION_COLORS),
+    ...Object.keys(semanticPositionColors),
+    ...semanticAttributes
+      .filter((a) => a.kind === 'position')
+      .map((a) => a.semanticPosition)
+      .filter(Boolean),
+    ]));
+  const selectedSemanticCollection = semanticAttributeCollections.find((c) => c.id === selectedSemanticCollectionId) || null;
+  const selectedSemanticAttributes = selectedSemanticCollection
+    ? semanticAttributes.filter((a) => selectedSemanticCollection.attributeIds.includes(a.id))
+    : [];
 
   useEffect(() => {
     if (!granularityProfiles.some((p) => p.id === selectedGranularityId)) {
       setSelectedGranularityId('balanced');
     }
   }, [granularityProfiles, selectedGranularityId]);
+
+  useEffect(() => {
+    if (selectedSemanticCollectionId && !semanticAttributeCollections.some((c) => c.id === selectedSemanticCollectionId)) {
+      setSelectedSemanticCollectionId('');
+    }
+  }, [semanticAttributeCollections, selectedSemanticCollectionId]);
+
+  const applyAdherenceToGraph = (graph: any) => {
+    if (!graph || !Array.isArray(graph.nodes)) return graph;
+    if (!selectedSemanticAttributes.length) return graph;
+    const referenceVectors = selectedSemanticAttributes.map((attr) => ({
+      attr,
+      vec: vectorizeText(`${attr.label} ${attr.semanticPosition}`),
+    }));
+    const threshold = selectedSemanticSimilarity;
+    const nodes = graph.nodes.map((node: any) => {
+      const nodeVec = vectorizeText(`${node?.label || ''} ${node?.type || ''} ${node?.properties?.semanticPosition || ''}`);
+      let best = 0;
+      const matched: string[] = [];
+      for (const ref of referenceVectors) {
+        const score = cosineLocal(nodeVec, ref.vec);
+        if (score > best) best = score;
+        if (score >= threshold) matched.push(ref.attr.label);
+      }
+      const adherenceRate = Math.max(0, Math.min(1, best));
+      return {
+        ...node,
+        properties: {
+          ...(node.properties || {}),
+          adherenceRate,
+          matchedAttributes: matched,
+        },
+      };
+    });
+    return { ...graph, nodes };
+  };
+
+  const registerSemanticAttributesFromAnalysis = async (analysisPayload: any, segmentPayloads: any[]) => {
+    const map = new Map<string, SemanticAttribute>();
+    const now = Date.now();
+
+    const register = (kind: SemanticAttribute['kind'], labelRaw: string, semanticPositionRaw?: string) => {
+      const label = String(labelRaw || '').trim();
+      if (!label) return;
+      const semanticPosition = String(semanticPositionRaw || 'concept').trim() || 'concept';
+      const key = `${kind}:${slugify(label)}:${slugify(semanticPosition)}`;
+      const existing = map.get(key);
+      if (existing) {
+        existing.usageCount += 1;
+        existing.updatedAt = now;
+        return;
+      }
+      map.set(key, {
+        id: key,
+        label,
+        kind,
+        semanticPosition,
+        color: kind === 'position'
+          ? (semanticPositionColors[semanticPosition] || DEFAULT_SEMANTIC_POSITION_COLORS[semanticPosition] || '#64748b')
+          : undefined,
+        usageCount: 1,
+        createdAt: now,
+        updatedAt: now,
+      });
+    };
+
+    const registerGraph = (graph: any) => {
+      const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+      const edges = Array.isArray(graph?.edges) ? graph.edges : [];
+
+      nodes.forEach((n: any) => {
+        const type = String(n?.type || 'Concept');
+        const position = String(n?.properties?.semanticPosition || inferSemanticPositionFromType(type));
+        register('node_type', type, position);
+        register('node_label', String(n?.label || n?.id || ''), position);
+        register('position', position, position);
+      });
+
+      edges.forEach((e: any) => {
+        register('edge_label', String(e?.label || 'related'), 'meta');
+      });
+    };
+
+    registerGraph(analysisPayload?.knowledgeGraph);
+    (segmentPayloads || []).forEach((seg) => {
+      registerGraph(seg?.knowledgeGraph);
+      (seg?.tags || []).forEach((tag: string) => register('tag', tag, 'concept'));
+    });
+    (analysisPayload?.themes || []).forEach((theme: string) => register('tag', theme, 'concept'));
+    (analysisPayload?.suggestedTags || []).forEach((tag: string) => register('tag', tag, 'concept'));
+
+    for (const attr of map.values()) {
+      const existing = await db.semanticAttributes.get(attr.id);
+      if (existing) {
+        await db.semanticAttributes.put({
+          ...existing,
+          label: attr.label,
+          semanticPosition: attr.semanticPosition,
+          color: existing.color || attr.color,
+          usageCount: (existing.usageCount || 0) + attr.usageCount,
+          updatedAt: now,
+        });
+      } else {
+        await db.semanticAttributes.put(attr);
+      }
+    }
+  };
+
+  const handleRecalculateSemanticBankFromHistory = async () => {
+    setIsRecalculatingSemanticBank(true);
+    try {
+      const allConversations = await db.conversations.toArray();
+      for (const conv of allConversations) {
+        const convSegments = await db.segments.where('conversationId').equals(conv.id).toArray();
+        await registerSemanticAttributesFromAnalysis(
+          {
+            knowledgeGraph: conv.knowledgeGraph,
+            themes: conv.semanticAnalysis?.themes || [],
+            suggestedTags: conv.semanticAnalysis?.suggestedTags || [],
+          },
+          convSegments
+        );
+      }
+      alert(`Recalcul terminé: ${allConversations.length} conversations traitées.`);
+    } catch (error: any) {
+      console.error(error);
+      alert(`Erreur pendant le recalcul: ${error?.message || 'inconnue'}`);
+    } finally {
+      setIsRecalculatingSemanticBank(false);
+    }
+  };
+
+  const handleCreateSemanticCollection = async () => {
+    const name = semanticCollectionNameDraft.trim();
+    if (!name) {
+      alert("Nom de collection requis.");
+      return;
+    }
+    if (semanticCollectionAttributeDraftIds.length === 0) {
+      alert("Sélectionnez au moins un attribut.");
+      return;
+    }
+    const now = Date.now();
+    const id = `scoll-${slugify(name)}-${uuidv4().slice(0, 6)}`;
+    await db.semanticAttributeCollections.put({
+      id,
+      name,
+      attributeIds: [...new Set(semanticCollectionAttributeDraftIds)],
+      createdAt: now,
+      updatedAt: now,
+    });
+    setSemanticCollectionNameDraft('');
+    setSemanticCollectionAttributeDraftIds([]);
+    setSelectedSemanticCollectionId(id);
+  };
 
   const handleCapture = async () => {
     if (!inputText.trim()) return;
@@ -299,9 +566,23 @@ export default function App() {
       const result = await analyzeAndSegmentConversation(inputText, {
         granularity: getCoreGranularity(selectedGranularityProfile.id),
         customSegmentationInstruction: selectedGranularityProfile.instruction,
+        semanticCollectionName: selectedSemanticCollection?.name,
+        semanticAttributeLabels: selectedSemanticAttributes.map((a) => a.label),
+        similarityThreshold: selectedSemanticSimilarity,
       });
-      setPotentialCapture(result);
-      setWizardTitle(result.title);
+      const enrichedResult = {
+        ...result,
+        analysis: {
+          ...result.analysis,
+          knowledgeGraph: applyAdherenceToGraph(result.analysis?.knowledgeGraph),
+        },
+        segments: (result.segments || []).map((seg: any) => ({
+          ...seg,
+          knowledgeGraph: applyAdherenceToGraph(seg.knowledgeGraph),
+        })),
+      };
+      setPotentialCapture(enrichedResult);
+      setWizardTitle(enrichedResult.title);
       setIsWizardOpen(true);
     } catch (error: any) {
       console.error("Capture failed:", error);
@@ -376,6 +657,8 @@ export default function App() {
         });
         prevId = segId;
       }
+
+      await registerSemanticAttributesFromAnalysis(potentialCapture.analysis, potentialCapture.segments);
 
       if (activeTab === 'chat') {
         setCurrentChatConvId(convId);
@@ -469,6 +752,16 @@ export default function App() {
       setIsSavingKey(false);
       alert("Configuration sauvegardée.");
     }, 500);
+  };
+
+  const handleSaveGranularityProfiles = () => {
+    setIsSavingGranularity(true);
+    localStorage.setItem('CUSTOM_SEGMENT_GRANULARITIES', JSON.stringify(customGranularityProfiles));
+    localStorage.setItem('SEGMENT_GRANULARITY_PROFILE_ID', selectedGranularityId);
+    setTimeout(() => {
+      setIsSavingGranularity(false);
+      setGranularitySaveStamp(Date.now());
+    }, 300);
   };
 
   const handleContextMenu = (e: React.MouseEvent, targetMessageId?: string) => {
@@ -621,27 +914,41 @@ export default function App() {
       const result = await analyzeAndSegmentConversation(fullText, {
         granularity: getCoreGranularity(selectedGranularityProfile.id),
         customSegmentationInstruction: selectedGranularityProfile.instruction,
+        semanticCollectionName: selectedSemanticCollection?.name,
+        semanticAttributeLabels: selectedSemanticAttributes.map((a) => a.label),
+        similarityThreshold: selectedSemanticSimilarity,
       });
+      const enrichedResult = {
+        ...result,
+        analysis: {
+          ...result.analysis,
+          knowledgeGraph: applyAdherenceToGraph(result.analysis?.knowledgeGraph),
+        },
+        segments: (result.segments || []).map((seg: any) => ({
+          ...seg,
+          knowledgeGraph: applyAdherenceToGraph(seg.knowledgeGraph),
+        })),
+      };
       
       // Update potentialCapture
-      setPotentialCapture(result);
+      setPotentialCapture(enrichedResult);
       
       // Update or create conversation metadata
       if (currentChatConvId) {
           await db.conversations.update(currentChatConvId, {
-              knowledgeGraph: result.analysis.knowledgeGraph,
-              semanticSignature: result.analysis.semanticSignature,
+              knowledgeGraph: enrichedResult.analysis.knowledgeGraph,
+              semanticSignature: enrichedResult.analysis.semanticSignature,
               semanticAnalysis: {
-                summary: result.analysis.summary,
-                themes: result.analysis.themes,
-                suggestedTags: result.analysis.suggestedTags,
-                deviations: result.analysis.deviations
+                summary: enrichedResult.analysis.summary,
+                themes: enrichedResult.analysis.themes,
+                suggestedTags: enrichedResult.analysis.suggestedTags,
+                deviations: enrichedResult.analysis.deviations
               }
           });
       }
 
       // Nouveau format de titre : [Attr1, Attr2] - Socrate Chat - YYMMDD_HHMM
-      const attrs = (result.analysis.suggestedTags || []).slice(0, 2).join(', ');
+      const attrs = (enrichedResult.analysis.suggestedTags || []).slice(0, 2).join(', ');
       const now = new Date();
       const datePart = now.toISOString().slice(2, 10).replace(/-/g, ''); // YYMMDD
       const timePart = now.getHours().toString().padStart(2, '0') + now.getMinutes().toString().padStart(2, '0'); // HHMM
@@ -983,6 +1290,167 @@ export default function App() {
                         <Plus className="w-4 h-4" />
                         Ajouter une granularité personnalisée
                       </button>
+
+                      <div className="flex flex-col md:flex-row gap-3">
+                        <button
+                          onClick={handleSaveGranularityProfiles}
+                          className="flex-1 py-3 bg-natural-accent text-white rounded-2xl font-bold text-xs uppercase tracking-widest flex items-center justify-center gap-2 hover:bg-natural-accent/90 transition-all shadow-lg shadow-natural-accent/10"
+                        >
+                          {isSavingGranularity ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                          Sauvegarder les granularités
+                        </button>
+                        <div className="flex-1 py-3 px-4 rounded-2xl border border-natural-sand bg-natural-bg/40 text-[10px] font-bold uppercase tracking-widest text-natural-muted flex items-center justify-center">
+                          {granularitySaveStamp ? 'Granularités sauvegardées' : 'Sauvegarde auto active'}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm space-y-6">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 bg-natural-sand rounded-xl text-natural-accent"><Brain className="w-5 h-5" /></div>
+                        <h3 className="font-serif text-xl text-natural-heading">Banque d'attributs sémantiques</h3>
+                      </div>
+                      <p className="text-sm text-natural-muted italic">
+                        Cette banque se nourrit automatiquement à chaque analyse sémantique et sert de base aux graphes.
+                      </p>
+
+                      <div className="flex flex-col md:flex-row gap-3">
+                        <button
+                          onClick={handleRecalculateSemanticBankFromHistory}
+                          disabled={isRecalculatingSemanticBank}
+                          className="flex-1 py-3 bg-natural-heading text-white rounded-2xl font-bold text-xs uppercase tracking-widest flex items-center justify-center gap-2 disabled:opacity-50"
+                        >
+                          {isRecalculatingSemanticBank ? <Loader2 className="w-4 h-4 animate-spin" /> : <History className="w-4 h-4" />}
+                          Recalculer depuis l'historique
+                        </button>
+                      </div>
+
+                      <div className="rounded-2xl border border-natural-sand p-4 bg-natural-bg/40 space-y-3">
+                        <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">Collections d'attributs (pour comparer les textes)</p>
+                        <div className="flex flex-col md:flex-row gap-2">
+                          <select
+                            value={selectedSemanticCollectionId}
+                            onChange={(e) => setSelectedSemanticCollectionId(e.target.value)}
+                            className="flex-1 p-2.5 bg-white border border-natural-sand rounded-xl text-xs font-semibold"
+                          >
+                            <option value="">Aucune collection (mode libre)</option>
+                            {semanticAttributeCollections.map((c) => (
+                              <option key={c.id} value={c.id}>
+                                {c.name} ({c.attributeIds.length})
+                              </option>
+                            ))}
+                          </select>
+                          <select
+                            value={String(selectedSemanticSimilarity)}
+                            onChange={(e) => setSelectedSemanticSimilarity(parseFloat(e.target.value))}
+                            className="w-full md:w-[220px] p-2.5 bg-white border border-natural-sand rounded-xl text-xs font-semibold"
+                            title="Seuil de similarité"
+                          >
+                            <option value="0.2">Similarité souple (0.20)</option>
+                            <option value="0.35">Similarité équilibrée (0.35)</option>
+                            <option value="0.5">Similarité stricte (0.50)</option>
+                            <option value="0.7">Similarité très stricte (0.70)</option>
+                          </select>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-[170px] overflow-y-auto custom-scrollbar">
+                          {semanticAttributes.slice(0, 120).map((attr) => {
+                            const checked = semanticCollectionAttributeDraftIds.includes(attr.id);
+                            return (
+                              <label key={attr.id} className="flex items-center gap-2 bg-white border border-natural-sand rounded-lg p-2 text-xs">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={(e) => {
+                                    if (e.target.checked) setSemanticCollectionAttributeDraftIds((prev) => [...prev, attr.id]);
+                                    else setSemanticCollectionAttributeDraftIds((prev) => prev.filter((id) => id !== attr.id));
+                                  }}
+                                />
+                                <span className="truncate">{attr.label}</span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                        <div className="flex flex-col md:flex-row gap-2">
+                          <input
+                            value={semanticCollectionNameDraft}
+                            onChange={(e) => setSemanticCollectionNameDraft(e.target.value)}
+                            placeholder="Nom de la collection"
+                            className="flex-1 p-2.5 bg-white border border-natural-sand rounded-xl text-xs"
+                          />
+                          <button
+                            onClick={handleCreateSemanticCollection}
+                            className="px-4 py-2.5 bg-natural-accent text-white rounded-xl text-xs font-black uppercase tracking-widest"
+                          >
+                            Créer collection
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="rounded-2xl border border-natural-sand p-4 bg-natural-bg/40 space-y-3">
+                        <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">Positionnements sémantiques & couleurs</p>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          {configuredSemanticPositions.map((position) => (
+                            <div key={position} className="flex items-center justify-between bg-white border border-natural-sand rounded-xl p-2.5">
+                              <span className="text-[11px] font-bold text-natural-heading uppercase tracking-wide">{position.replace(/_/g, ' ')}</span>
+                              <input
+                                type="color"
+                                value={semanticPositionColors[position] || DEFAULT_SEMANTIC_POSITION_COLORS[position] || '#64748b'}
+                                onChange={(e) => {
+                                  const color = e.target.value;
+                                  setSemanticPositionColors((prev) => ({ ...prev, [position]: color }));
+                                  window.dispatchEvent(new CustomEvent('semantic-position-colors-changed'));
+                                  db.semanticAttributes.put({
+                                    id: `position:${slugify(position)}:${slugify(position)}`,
+                                    label: position,
+                                    kind: 'position',
+                                    semanticPosition: position,
+                                    color,
+                                    usageCount: 1,
+                                    createdAt: Date.now(),
+                                    updatedAt: Date.now(),
+                                  });
+                                  db.semanticAttributes
+                                    .where('kind')
+                                    .equals('position')
+                                    .and((attr) => attr.semanticPosition === position)
+                                    .toArray()
+                                    .then((attrs) => Promise.all(attrs.map((attr) => db.semanticAttributes.update(attr.id, { color, updatedAt: Date.now() }))))
+                                    .catch(() => {});
+                                }}
+                                className="w-10 h-8 rounded border border-natural-sand bg-transparent cursor-pointer"
+                                title={`Couleur pour ${position}`}
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="rounded-2xl border border-natural-sand overflow-hidden">
+                        <div className="px-4 py-3 bg-natural-bg/50 border-b border-natural-sand flex items-center justify-between">
+                          <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">Attributs collectés</p>
+                          <span className="text-[10px] font-bold uppercase tracking-widest text-natural-stone">{semanticAttributes.length} entrées</span>
+                        </div>
+                        <div className="max-h-[280px] overflow-y-auto custom-scrollbar divide-y divide-natural-sand/70">
+                          {semanticAttributes.length === 0 && (
+                            <div className="p-4 text-xs text-natural-muted italic">Aucun attribut collecté pour l'instant.</div>
+                          )}
+                          {semanticAttributes.slice(0, 180).map((attr) => (
+                            <div key={attr.id} className="p-3 bg-white flex items-center justify-between gap-3">
+                              <div className="min-w-0">
+                                <p className="text-xs font-semibold text-natural-heading truncate">{attr.label}</p>
+                                <p className="text-[10px] text-natural-muted uppercase tracking-wider">
+                                  {attr.kind} • position: {attr.semanticPosition} • usages: {attr.usageCount}
+                                </p>
+                              </div>
+                              <span
+                                className="w-4 h-4 rounded-full border border-natural-sand shrink-0"
+                                style={{ backgroundColor: attr.color || semanticPositionColors[attr.semanticPosition] || DEFAULT_SEMANTIC_POSITION_COLORS[attr.semanticPosition] || '#64748b' }}
+                                title={attr.semanticPosition}
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      </div>
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
@@ -1109,6 +1577,30 @@ export default function App() {
                             {profile.name}
                           </option>
                         ))}
+                      </select>
+                      <select
+                        value={selectedSemanticCollectionId}
+                        onChange={(e) => setSelectedSemanticCollectionId(e.target.value)}
+                        className="px-3 py-2 bg-white border border-natural-sand rounded-xl text-[10px] font-black uppercase tracking-wider text-natural-muted max-w-[220px]"
+                        title="Collection d'attributs sémantiques"
+                      >
+                        <option value="">Aucune collection</option>
+                        {semanticAttributeCollections.map((collection) => (
+                          <option key={collection.id} value={collection.id}>
+                            {collection.name}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        value={String(selectedSemanticSimilarity)}
+                        onChange={(e) => setSelectedSemanticSimilarity(parseFloat(e.target.value))}
+                        className="px-3 py-2 bg-white border border-natural-sand rounded-xl text-[10px] font-black uppercase tracking-wider text-natural-muted max-w-[190px]"
+                        title="Seuil de similarité"
+                      >
+                        <option value="0.2">Souple 0.20</option>
+                        <option value="0.35">Équilibrée 0.35</option>
+                        <option value="0.5">Stricte 0.50</option>
+                        <option value="0.7">Très stricte 0.70</option>
                       </select>
                       <button 
                         onClick={() => {
@@ -1353,6 +1845,38 @@ export default function App() {
                                 {profile.name}
                               </option>
                             ))}
+                          </select>
+                        </div>
+                        <div className="flex flex-col items-center gap-2">
+                          <label className="text-[10px] font-black text-natural-muted uppercase tracking-[0.2em]">
+                            Collection attributs
+                          </label>
+                          <select
+                            value={selectedSemanticCollectionId}
+                            onChange={(e) => setSelectedSemanticCollectionId(e.target.value)}
+                            className="px-4 py-2.5 bg-white border border-natural-sand rounded-xl text-[11px] font-bold uppercase tracking-wider text-natural-muted"
+                          >
+                            <option value="">Aucune collection</option>
+                            {semanticAttributeCollections.map((collection) => (
+                              <option key={collection.id} value={collection.id}>
+                                {collection.name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div className="flex flex-col items-center gap-2">
+                          <label className="text-[10px] font-black text-natural-muted uppercase tracking-[0.2em]">
+                            Similarité
+                          </label>
+                          <select
+                            value={String(selectedSemanticSimilarity)}
+                            onChange={(e) => setSelectedSemanticSimilarity(parseFloat(e.target.value))}
+                            className="px-4 py-2.5 bg-white border border-natural-sand rounded-xl text-[11px] font-bold uppercase tracking-wider text-natural-muted"
+                          >
+                            <option value="0.2">Souple 0.20</option>
+                            <option value="0.35">Équilibrée 0.35</option>
+                            <option value="0.5">Stricte 0.50</option>
+                            <option value="0.7">Très stricte 0.70</option>
                           </select>
                         </div>
                         <button onClick={handleCapture} disabled={isAnalyzing || !inputText.trim()} className={cn("px-8 py-4 bg-natural-accent text-white rounded-2xl font-bold tracking-wide hover:bg-natural-accent/90 transition-all shadow-lg flex items-center gap-3", isAnalyzing || !inputText.trim() ? "bg-natural-sand text-natural-stone cursor-not-allowed shadow-none" : "shadow-natural-accent/20")}>
