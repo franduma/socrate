@@ -27,12 +27,41 @@ export default defineConfig(({mode}) => {
           manualChunks(id) {
             if (!id.includes('node_modules')) return undefined;
             if (id.includes('/d3')) return 'viz-d3';
-            if (id.includes('mammoth')) return 'docx';
+            if (
+              id.includes('mammoth') ||
+              id.includes('bluebird') ||
+              id.includes('@xmldom/xmldom') ||
+              id.includes('dingbat-to-unicode') ||
+              id.includes('jszip') ||
+              id.includes('xmlbuilder') ||
+              id.includes('underscore') ||
+              id.includes('lop') ||
+              id.includes('base64-js') ||
+              id.includes('path-is-absolute') ||
+              id.includes('argparse')
+            ) {
+              return 'docx';
+            }
             if (id.includes('@google/generative-ai') || id.includes('@google/genai')) return 'ai-sdk';
             if (id.includes('react-dom')) return 'react-dom';
             if (id.includes('/react/')) return 'react-core';
             if (id.includes('lucide-react')) return 'icons';
-            if (id.includes('react-markdown') || id.includes('remark-gfm')) return 'markdown';
+            if (
+              id.includes('react-markdown') ||
+              id.includes('remark-gfm') ||
+              id.includes('remark-rehype') ||
+              id.includes('unified') ||
+              id.includes('micromark') ||
+              id.includes('mdast-util-') ||
+              id.includes('hast-util-') ||
+              id.includes('unist-util-') ||
+              id.includes('vfile') ||
+              id.includes('property-information') ||
+              id.includes('markdown-table') ||
+              id.includes('trough')
+            ) {
+              return 'markdown';
+            }
             if (id.includes('dexie')) return 'storage';
             if (id.includes('motion') || id.includes('framer-motion')) return 'motion';
             if (id.includes('uuid')) return 'utils';
