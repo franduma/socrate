@@ -1,20 +1,55 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Socrate
 
-# Run and deploy your AI Studio app
+Socrate is a Vite + React + TypeScript application for capturing conversations, segmenting them with Gemini, and exploring the results through semantic views, knowledge graphs, and threaded chat.
 
-This contains everything you need to run your app locally.
+## Stack
 
-View your app in AI Studio: https://ai.studio/apps/13e60f57-64bb-47ac-9915-007e5f96c2c0
+- React 19
+- TypeScript
+- Vite
+- Dexie / IndexedDB
+- Gemini API
 
-## Run Locally
+## Getting Started
 
-**Prerequisites:**  Node.js
+Prerequisites:
 
+- Node.js 20+
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+Install dependencies:
+
+```bash
+npm install
+```
+
+Create a local environment file and provide your Gemini key:
+
+```bash
+copy .env.example .env.local
+```
+
+Then set `GEMINI_API_KEY` in `.env.local`.
+
+Start the development server:
+
+```bash
+npm run dev
+```
+
+Run the TypeScript check:
+
+```bash
+npm run lint
+```
+
+Create a production build:
+
+```bash
+npm run build
+```
+
+## Notes
+
+- Conversation data is stored locally in IndexedDB through Dexie.
+- API keys can also be overridden from the app settings and are persisted in local storage.
+- `.env*` files are ignored by git except for `.env.example`.
