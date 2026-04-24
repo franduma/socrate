@@ -34,7 +34,9 @@ import {
   Brain,
   BookOpenText,
   Hourglass,
-  StopCircle
+  StopCircle,
+  Globe,
+  Rss
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -44,6 +46,7 @@ import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './lib/db';
 import { CustomReaction, ChatMessage, DictionaryEntry, SemanticAttribute, SemanticAttributeCollection, SegmentationTrace } from './types';
 import { v4 as uuidv4 } from 'uuid';
+import { collectFromWebSource, WebSourceDefinition, WebSourceMode } from './services/webIngestionService';
 
 /**
  * @license
@@ -69,6 +72,12 @@ type GranularityProfile = {
   targetSegments: string;
   example: string;
   readOnly: boolean;
+};
+
+type WebSourceDraft = {
+  name: string;
+  url: string;
+  mode: WebSourceMode;
 };
 
 const DEFAULT_GRANULARITY_PROFILES: GranularityProfile[] = [
@@ -279,6 +288,27 @@ export default function App() {
       return DEFAULT_ABSTRACTION_LEVEL_COLORS;
     }
   });
+  const [webSources, setWebSources] = useState<WebSourceDefinition[]>(() => {
+    const raw = localStorage.getItem('WEB_INGEST_SOURCES');
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter((s: any) => s && typeof s.id === 'string' && typeof s.url === 'string')
+        .map((s: any) => ({
+          id: s.id,
+          name: String(s.name || s.url),
+          url: String(s.url || '').trim(),
+          mode: s.mode === 'scrape' ? 'scrape' : 'rss',
+          enabled: s.enabled !== false,
+        }));
+    } catch {
+      return [];
+    }
+  });
+  const [webSourceDraft, setWebSourceDraft] = useState<WebSourceDraft>({ name: '', url: '', mode: 'rss' });
+  const [isCollectingWeb, setIsCollectingWeb] = useState(false);
 
   useEffect(() => {
     localStorage.setItem('SELECTED_MODEL', selectedModel);
@@ -302,6 +332,9 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('ABSTRACTION_LEVEL_COLORS', JSON.stringify(abstractionLevelColors));
   }, [abstractionLevelColors]);
+  useEffect(() => {
+    localStorage.setItem('WEB_INGEST_SOURCES', JSON.stringify(webSources));
+  }, [webSources]);
 
   const defaultReactions: CustomReaction[] = [
     { id: '1', label: 'Précise', prompt: 'Peux-tu apporter plus de précisions sur ce point spécifique ?' },
@@ -613,6 +646,147 @@ export default function App() {
     setSemanticCollectionNameDraft('');
     setSemanticCollectionAttributeDraftIds([]);
     setSelectedSemanticCollectionId(id);
+  };
+
+  const persistAnalyzedConversation = async (
+    enrichedResult: any,
+    options?: { title?: string; source?: 'copy-paste' | 'file' | 'session' }
+  ) => {
+    if (!enrichedResult?.segments || enrichedResult.segments.length === 0) {
+      throw new Error("Aucun segment généré.");
+    }
+    const convId = uuidv4();
+    const now = Date.now();
+    const captureTrace: SegmentationTrace = enrichedResult.analysisTrace || buildSegmentationTrace();
+    const convData: any = {
+      id: convId,
+      title: options?.title || enrichedResult.title || "Conversation sans titre",
+      createdAt: now,
+      updatedAt: now,
+      source: options?.source || 'file',
+      segmentsCount: enrichedResult.segments.length,
+      semanticAnalysis: {
+        summary: enrichedResult.analysis?.summary || "",
+        themes: enrichedResult.analysis?.themes || [],
+        suggestedTags: enrichedResult.analysis?.suggestedTags || [],
+        deviations: enrichedResult.analysis?.deviations || []
+      },
+      semanticSignature: enrichedResult.analysis?.semanticSignature || uuidv4(),
+      knowledgeGraph: enrichedResult.analysis?.knowledgeGraph || { nodes: [], edges: [] },
+      analysisTrace: captureTrace,
+      segmentationTraces: [captureTrace],
+    };
+    await db.conversations.add(convData);
+
+    let prevId: string | undefined = undefined;
+    for (let i = 0; i < enrichedResult.segments.length; i++) {
+      const seg = enrichedResult.segments[i];
+      const segId = uuidv4();
+      await db.segments.add({
+        id: segId,
+        conversationId: convId,
+        content: seg.content || '',
+        originalText: seg.originalText || seg.content || '',
+        role: seg.role as any || 'user',
+        timestamp: now + i,
+        semanticSignature: seg.semanticSignature,
+        semanticVectorDescription: seg.semanticVectorDescription,
+        semanticInterpretation: seg.semanticInterpretation,
+        tags: seg.tags || [],
+        previousSegmentId: prevId,
+        parentLabel: seg.metadata?.reason,
+        knowledgeGraph: seg.knowledgeGraph,
+        metadata: seg.metadata || {},
+        analysisTrace: captureTrace,
+      });
+      prevId = segId;
+    }
+    await registerSemanticAttributesFromAnalysis(enrichedResult.analysis, enrichedResult.segments);
+    return convId;
+  };
+
+  const handleAddWebSource = () => {
+    const url = webSourceDraft.url.trim();
+    if (!url) {
+      alert("URL requise.");
+      return;
+    }
+    const normalized = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+    const name = webSourceDraft.name.trim() || normalized;
+    const source: WebSourceDefinition = {
+      id: uuidv4(),
+      name,
+      url: normalized,
+      mode: webSourceDraft.mode,
+      enabled: true,
+    };
+    setWebSources((prev) => [source, ...prev]);
+    setWebSourceDraft({ name: '', url: '', mode: webSourceDraft.mode });
+  };
+
+  const handleCollectWebSources = async () => {
+    const activeSources = webSources.filter((s) => s.enabled && s.url.trim().length > 0);
+    if (!activeSources.length) {
+      alert("Ajoutez et activez au moins une source web.");
+      return;
+    }
+    setIsCollectingWeb(true);
+    try {
+      const { analyzeAndSegmentConversation } = await loadGeminiService();
+      let savedCount = 0;
+      let failedCount = 0;
+
+      for (const source of activeSources) {
+        try {
+          const docs = await collectFromWebSource(source, 5);
+          for (const doc of docs) {
+            try {
+              const analysisTrace = buildSegmentationTrace();
+              const result = await analyzeAndSegmentConversation(doc.text, {
+                granularity: getCoreGranularity(selectedGranularityProfile.id),
+                customSegmentationInstruction: selectedGranularityProfile.instruction,
+                semanticCollectionName: selectedSemanticCollection?.name,
+                semanticAttributeLabels: selectedSemanticAttributes.map((a) => a.label),
+                similarityThreshold: selectedSemanticSimilarity,
+                vectorEngineMode,
+              });
+              const enrichedResult = {
+                ...result,
+                analysisTrace,
+                analysis: {
+                  ...result.analysis,
+                  knowledgeGraph: applyAdherenceToGraph(result.analysis?.knowledgeGraph),
+                },
+                segments: (result.segments || []).map((seg: any) => ({
+                  ...seg,
+                  knowledgeGraph: applyAdherenceToGraph(seg.knowledgeGraph),
+                })),
+              };
+              const host = (() => {
+                try { return new URL(doc.url || source.url).hostname; } catch { return source.url; }
+              })();
+              const title = `[WEB:${source.mode.toUpperCase()}] ${doc.title} - ${host}`;
+              const convId = await persistAnalyzedConversation(enrichedResult, { title, source: 'file' });
+              savedCount += 1;
+              setLastCapturedId(convId);
+            } catch (docError) {
+              console.error("Web ingest doc failed:", docError);
+              failedCount += 1;
+            }
+          }
+        } catch (sourceError) {
+          console.error("Web ingest source failed:", sourceError);
+          failedCount += 1;
+        }
+      }
+
+      alert(`Collecte terminée. Sauvegardés: ${savedCount}. Échecs: ${failedCount}.`);
+      if (savedCount > 0) {
+        setActiveTab('conv');
+      }
+    } finally {
+      setIsCollectingWeb(false);
+    }
   };
 
   const handleCapture = async () => {
@@ -1256,6 +1430,87 @@ export default function App() {
                         <p className="text-[10px] text-natural-stone uppercase tracking-wider">
                           Mode actif: {vectorEngineMode === 'local' ? 'Local Vector (PC)' : 'Provider Vector (API)'}
                         </p>
+                      </div>
+                    </div>
+
+                    <div className="bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm space-y-6">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 bg-natural-sand rounded-xl text-natural-accent"><Globe className="w-5 h-5" /></div>
+                        <h3 className="font-serif text-xl text-natural-heading">Veille Web (RSS / Scrape)</h3>
+                      </div>
+                      <p className="text-sm text-natural-muted italic">
+                        Chaque adresse web peut être définie en mode RSS ou Scrape, puis collectée automatiquement.
+                      </p>
+                      <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
+                        <input
+                          value={webSourceDraft.name}
+                          onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, name: e.target.value }))}
+                          placeholder="Nom source"
+                          className="md:col-span-1 p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
+                        />
+                        <input
+                          value={webSourceDraft.url}
+                          onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, url: e.target.value }))}
+                          placeholder="https://exemple.com/feed.xml ou article"
+                          className="md:col-span-2 p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
+                        />
+                        <select
+                          value={webSourceDraft.mode}
+                          onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, mode: e.target.value as WebSourceMode }))}
+                          className="md:col-span-1 p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs font-semibold"
+                        >
+                          <option value="rss">RSS</option>
+                          <option value="scrape">Scrape</option>
+                        </select>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={handleAddWebSource}
+                          className="px-4 py-2.5 bg-natural-accent text-white rounded-xl text-xs font-black uppercase tracking-widest"
+                        >
+                          Ajouter la source
+                        </button>
+                        <button
+                          onClick={handleCollectWebSources}
+                          disabled={isCollectingWeb}
+                          className="px-4 py-2.5 bg-natural-heading text-white rounded-xl text-xs font-black uppercase tracking-widest disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-2"
+                        >
+                          {isCollectingWeb ? <Loader2 className="w-4 h-4 animate-spin" /> : <Rss className="w-4 h-4" />}
+                          Lancer la collecte
+                        </button>
+                      </div>
+                      <div className="space-y-2 max-h-[260px] overflow-y-auto custom-scrollbar">
+                        {webSources.length === 0 && (
+                          <div className="p-3 text-xs text-natural-muted italic border border-natural-sand rounded-xl bg-natural-bg/30">
+                            Aucune source configurée.
+                          </div>
+                        )}
+                        {webSources.map((source) => (
+                          <div key={source.id} className="p-3 border border-natural-sand rounded-xl bg-natural-bg/20 flex items-center gap-3">
+                            <input
+                              type="checkbox"
+                              checked={source.enabled}
+                              onChange={(e) => setWebSources((prev) => prev.map((s) => s.id === source.id ? { ...s, enabled: e.target.checked } : s))}
+                            />
+                            <div className="min-w-0 flex-1">
+                              <p className="text-xs font-bold text-natural-heading truncate">{source.name}</p>
+                              <p className="text-[10px] text-natural-muted truncate">{source.url}</p>
+                            </div>
+                            <span className={cn(
+                              "text-[9px] uppercase tracking-widest font-black px-2 py-1 rounded-full",
+                              source.mode === 'rss' ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"
+                            )}>
+                              {source.mode}
+                            </span>
+                            <button
+                              onClick={() => setWebSources((prev) => prev.filter((s) => s.id !== source.id))}
+                              className="p-2 text-natural-stone hover:text-red-500"
+                              title="Supprimer source"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        ))}
                       </div>
                     </div>
 
