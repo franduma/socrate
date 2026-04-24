@@ -80,6 +80,16 @@ type WebSourceDraft = {
   mode: WebSourceMode;
 };
 
+type WebCollectProgress = {
+  phase: string;
+  sourceName?: string;
+  docTitle?: string;
+  current: number;
+  total: number;
+  saved: number;
+  failed: number;
+};
+
 const DEFAULT_GRANULARITY_PROFILES: GranularityProfile[] = [
   {
     id: 'intact',
@@ -318,6 +328,7 @@ export default function App() {
   const [webSourceDraft, setWebSourceDraft] = useState<WebSourceDraft>({ name: '', url: '', mode: 'rss' });
   const [editingWebSourceId, setEditingWebSourceId] = useState<string | null>(null);
   const [isCollectingWeb, setIsCollectingWeb] = useState(false);
+  const [webCollectProgress, setWebCollectProgress] = useState<WebCollectProgress | null>(null);
 
   useEffect(() => {
     localStorage.setItem('SELECTED_MODEL', selectedModel);
@@ -837,20 +848,57 @@ export default function App() {
       return;
     }
     setIsCollectingWeb(true);
+    setWebCollectProgress({
+      phase: 'Initialisation de la collecte...',
+      current: 0,
+      total: 0,
+      saved: 0,
+      failed: 0,
+    });
     try {
       const { analyzeAndSegmentConversation } = await loadGeminiService();
       const granularityCore = getCoreGranularity(selectedGranularityProfile.id);
       let savedCount = 0;
       let failedCount = 0;
+      let processedCount = 0;
+      let totalPlanned = 0;
 
       for (const source of activeSources) {
         try {
+          setWebCollectProgress((prev) => ({
+            phase: `Collecte source: ${source.name}`,
+            sourceName: source.name,
+            docTitle: undefined,
+            current: prev?.current || processedCount,
+            total: prev?.total || totalPlanned,
+            saved: savedCount,
+            failed: failedCount,
+          }));
           const docs = await collectFromWebSource(source, 5);
+          totalPlanned += docs.length;
+          setWebCollectProgress((prev) => ({
+            phase: `Analyse des documents: ${source.name}`,
+            sourceName: source.name,
+            docTitle: undefined,
+            current: prev?.current || processedCount,
+            total: totalPlanned,
+            saved: savedCount,
+            failed: failedCount,
+          }));
           for (const doc of docs) {
+            setWebCollectProgress({
+              phase: `Analyse: ${source.name}`,
+              sourceName: source.name,
+              docTitle: doc.title,
+              current: processedCount,
+              total: totalPlanned,
+              saved: savedCount,
+              failed: failedCount,
+            });
             try {
               const analysisTrace = buildSegmentationTrace();
               let analysisInput = doc.text;
-              if (granularityCore === 'markup') {
+              if (granularityCore === 'markup' && source.mode === 'scrape') {
                 const targetUrl = doc.url || source.url;
                 try {
                   const rawMarkup = await fetchRawWebContent(targetUrl);
@@ -887,19 +935,49 @@ export default function App() {
               const title = `[WEB:${source.mode.toUpperCase()}] ${doc.title} - ${host}`;
               const convId = await persistAnalyzedConversation(enrichedResult, { title, source: 'file' });
               savedCount += 1;
+              processedCount += 1;
               setLastCapturedId(convId);
             } catch (docError) {
               console.error("Web ingest doc failed:", docError);
               failedCount += 1;
+              processedCount += 1;
+            } finally {
+              setWebCollectProgress({
+                phase: `Analyse: ${source.name}`,
+                sourceName: source.name,
+                docTitle: doc.title,
+                current: processedCount,
+                total: totalPlanned,
+                saved: savedCount,
+                failed: failedCount,
+              });
             }
           }
         } catch (sourceError) {
           console.error("Web ingest source failed:", sourceError);
           failedCount += 1;
+          setWebCollectProgress({
+            phase: `Erreur source: ${source.name}`,
+            sourceName: source.name,
+            docTitle: undefined,
+            current: processedCount,
+            total: totalPlanned,
+            saved: savedCount,
+            failed: failedCount,
+          });
         }
       }
 
       alert(`Collecte terminée. Sauvegardés: ${savedCount}. Échecs: ${failedCount}.`);
+      setWebCollectProgress({
+        phase: 'Collecte terminee',
+        sourceName: undefined,
+        docTitle: undefined,
+        current: processedCount,
+        total: totalPlanned,
+        saved: savedCount,
+        failed: failedCount,
+      });
       if (savedCount > 0) {
         setActiveTab('conv');
       }
@@ -1583,6 +1661,26 @@ export default function App() {
                           Lancer la collecte
                         </button>
                       </div>
+                      {webCollectProgress && (
+                        <div className="rounded-2xl border border-natural-sand bg-natural-bg/40 p-3 space-y-1.5">
+                          <p className="text-[10px] uppercase tracking-widest font-black text-natural-muted">
+                            {webCollectProgress.phase}
+                          </p>
+                          <p className="text-xs text-natural-heading">
+                            Progression: {webCollectProgress.current}/{webCollectProgress.total || '?'} • Sauvegardes: {webCollectProgress.saved} • Echecs: {webCollectProgress.failed}
+                          </p>
+                          {webCollectProgress.sourceName && (
+                            <p className="text-[11px] text-natural-stone truncate">
+                              Source: {webCollectProgress.sourceName}
+                            </p>
+                          )}
+                          {webCollectProgress.docTitle && (
+                            <p className="text-[11px] text-natural-stone truncate">
+                              Document: {webCollectProgress.docTitle}
+                            </p>
+                          )}
+                        </div>
+                      )}
                       <div className="space-y-2 max-h-[260px] overflow-y-auto custom-scrollbar">
                         {webSources.length === 0 && (
                           <div className="p-3 text-xs text-natural-muted italic border border-natural-sand rounded-xl bg-natural-bg/30">

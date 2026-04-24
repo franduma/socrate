@@ -33,6 +33,29 @@ function normalizeToken(value: string) {
     .trim();
 }
 
+function decodeEntities(text: string) {
+  return String(text || '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>');
+}
+
+function toHumanReadableChunk(text: string) {
+  const raw = String(text || '');
+  const withoutMarkup = raw
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<[^>]+>/g, ' ');
+  return decodeEntities(withoutMarkup)
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function splitIntoSentences(text: string) {
   return String(text || '')
     .replace(/[ \t]+/g, ' ')
@@ -60,14 +83,16 @@ function buildNodeInsight(label: string, corpus: string[]): NodeInsight {
   const seenTimeline = new Set<string>();
 
   corpus.forEach((chunk) => {
-    splitIntoReadableLines(chunk).forEach((line) => {
+    const cleanChunk = toHumanReadableChunk(chunk);
+    if (!cleanChunk) return;
+    splitIntoReadableLines(cleanChunk).forEach((line) => {
       if (!isRelativeTimeLine(line)) return;
       const normalized = normalizeToken(line);
       if (seenTimeline.has(normalized)) return;
       seenTimeline.add(normalized);
       timelineRefs.push(line);
     });
-    splitIntoSentences(chunk).forEach((sentence) => {
+    splitIntoSentences(cleanChunk).forEach((sentence) => {
       const normalized = normalizeToken(sentence);
       if (!normalizedLabel || !normalized.includes(normalizedLabel)) return;
       if (seen.has(normalized)) return;
