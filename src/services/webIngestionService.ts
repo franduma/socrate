@@ -37,6 +37,14 @@ function truncate(value: string, max = 12000) {
   return `${text.slice(0, max)}...`;
 }
 
+function getLongestTextCandidate(texts: Array<string | undefined | null>) {
+  const normalized = texts
+    .map((t) => String(t || '').trim())
+    .filter((t) => t.length > 0);
+  if (!normalized.length) return '';
+  return normalized.sort((a, b) => b.length - a.length)[0];
+}
+
 async function fetchTextWithFallbacks(url: string) {
   const candidates = [
     url,
@@ -93,7 +101,24 @@ function parseRssDocuments(xmlRaw: string, source: WebSourceDefinition, maxItems
 async function collectFromRss(source: WebSourceDefinition, maxItems = 5): Promise<IngestedDocument[]> {
   const xmlRaw = await fetchTextWithFallbacks(source.url);
   const docs = parseRssDocuments(xmlRaw, source, maxItems);
-  return docs;
+  const enriched = await Promise.all(
+    docs.map(async (doc) => {
+      if (!doc.url) return doc;
+      try {
+        const html = await fetchTextWithFallbacks(doc.url);
+        const articleText = truncate(stripHtml(html), 22000);
+        const bestText = getLongestTextCandidate([articleText, doc.text]);
+        if (!bestText) return doc;
+        return {
+          ...doc,
+          text: bestText,
+        };
+      } catch {
+        return doc;
+      }
+    })
+  );
+  return enriched;
 }
 
 async function collectFromScrape(source: WebSourceDefinition): Promise<IngestedDocument[]> {
