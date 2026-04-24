@@ -105,6 +105,14 @@ const DEFAULT_GRANULARITY_PROFILES: GranularityProfile[] = [
     example: 'Découpe chaque pivot conceptuel pour faciliter le graphe et la navigation.',
     readOnly: true,
   },
+  {
+    id: 'markup',
+    name: 'Markup (HTML/XML)',
+    instruction: 'Segmentation=MARKUP: si le texte est du HTML/XML, sépare explicitement le code source du contenu lisible humain. Crée au minimum deux segments: 1) code/structure, 2) contenu interprété.',
+    targetSegments: '2-6',
+    example: 'Segment 1: balises + structure; Segment 2: texte utile extrait; segments suivants: commentaires analytiques si besoin.',
+    readOnly: true,
+  },
 ];
 
 const DEFAULT_SEMANTIC_POSITION_COLORS: Record<string, string> = {
@@ -176,8 +184,8 @@ function cosineLocal(a: Map<string, number>, b: Map<string, number>) {
   return denom ? dot / denom : 0;
 }
 
-function getCoreGranularity(id: string): 'intact' | 'balanced' | 'fine' {
-  if (id === 'intact' || id === 'fine' || id === 'balanced') return id;
+function getCoreGranularity(id: string): 'intact' | 'balanced' | 'fine' | 'markup' {
+  if (id === 'intact' || id === 'fine' || id === 'balanced' || id === 'markup') return id;
   return 'balanced';
 }
 

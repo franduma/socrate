@@ -3,7 +3,7 @@ import { Segment } from "../types";
 import { v4 as uuidv4 } from "uuid";
 
 type Provider = "gemini" | "hardwired_gemini" | "openai" | "claude" | "openrouter" | "codex";
-export type SegmentGranularity = "intact" | "balanced" | "fine";
+export type SegmentGranularity = "intact" | "balanced" | "fine" | "markup";
 
 type AnalysisResult = {
   title: string;
@@ -88,6 +88,9 @@ function getSegmentationInstruction(granularity: SegmentGranularity) {
   }
   if (granularity === "fine") {
     return "Segmentation=FINE: découpe en micro-unités sémantiques (1 à 3 idées clés par segment). Vise 8 à 18 segments selon la longueur.";
+  }
+  if (granularity === "markup") {
+    return "Segmentation=MARKUP: si l'entrée est du HTML/XML, sépare le code source du contenu lisible humain. Crée au minimum 2 segments: CODE_MARKUP puis CONTENU_EXTRAT. Conserve le texte complet.";
   }
   return "Segmentation=BALANCED: découpe équilibrée par intention/question/réponse. Vise 4 à 10 segments selon la longueur.";
 }
@@ -556,6 +559,89 @@ function forceIntactFreeTextShape(parsed: any, originalText: string, options?: A
   ];
 }
 
+function isMarkupMode(options?: AnalyzeOptions): boolean {
+  if (options?.granularity === "markup") return true;
+  const instruction = String(options?.customSegmentationInstruction || "").toLowerCase();
+  if (!instruction) return false;
+  return (
+    instruction.includes("segmentation=markup") ||
+    instruction.includes("html") ||
+    instruction.includes("xml") ||
+    instruction.includes("code source")
+  );
+}
+
+function looksLikeMarkup(text: string): boolean {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  if (/^\s*<\?xml[\s\S]*\?>/i.test(t)) return true;
+  if (/<[a-zA-Z][\w:-]*[\s>]/.test(t) && /<\/?[a-zA-Z][\w:-]*>/.test(t)) return true;
+  return false;
+}
+
+function decodeEntities(text: string): string {
+  return String(text || "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+function extractMarkupReadableText(text: string): string {
+  return decodeEntities(
+    String(text || "")
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function forceMarkupSplitShape(parsed: any, originalText: string, options?: AnalyzeOptions) {
+  if (!isMarkupMode(options)) return;
+  if (!looksLikeMarkup(originalText)) return;
+
+  const sourceCode = String(originalText || "").trim();
+  const readable = extractMarkupReadableText(sourceCode);
+  const existingSegments = Array.isArray(parsed?.segments) ? parsed.segments : [];
+  const maxSegmentTextLen = existingSegments.reduce((max: number, s: any) => {
+    const len = String(s?.originalText || s?.content || "").trim().length;
+    return Math.max(max, len);
+  }, 0);
+  const coverage = sourceCode.length ? maxSegmentTextLen / sourceCode.length : 0;
+  const hasReadableSegment = existingSegments.some((s: any) => {
+    const role = String(s?.role || "").toLowerCase();
+    const t = String(s?.originalText || s?.content || "");
+    return (role === "assistant" || role === "system") && t.length >= Math.min(200, readable.length);
+  });
+
+  if (coverage >= 0.85 && hasReadableSegment) return;
+
+  parsed.segments = [
+    {
+      content: "CODE_MARKUP_SOURCE",
+      originalText: sourceCode,
+      role: "user",
+      semanticSignature: `markup-code-${uuidv4().substring(0, 8)}`,
+      tags: ["markup", "code-source"],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: { reason: "Code source HTML/XML isolé pour lecture technique." },
+    },
+    {
+      content: readable || "Contenu lisible non détecté dans ce markup.",
+      originalText: readable || "Contenu lisible non détecté dans ce markup.",
+      role: "assistant",
+      semanticSignature: `markup-content-${uuidv4().substring(0, 8)}`,
+      tags: ["markup", "contenu-extrait"],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: { reason: "Contenu texte extrait du markup pour lecture humaine." },
+    },
+  ];
+}
+
 function getSelectedProvider(): Provider {
   return (localStorage.getItem("SELECTED_MODEL") as Provider) || "gemini";
 }
@@ -587,6 +673,7 @@ function getAI(apiKey: string) {
 function normalizeAnalysisPayload(parsed: any, originalText: string, options?: AnalyzeOptions): AnalysisResult {
   const safeParsed = parsed || {};
   forceIntactFreeTextShape(safeParsed, originalText, options);
+  forceMarkupSplitShape(safeParsed, originalText, options);
 
   if (!safeParsed.segments || safeParsed.segments.length === 0) {
     safeParsed.segments = [
