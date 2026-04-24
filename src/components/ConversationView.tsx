@@ -402,6 +402,7 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
               {renderDeferredPanel(
                 <KnowledgeGraphView 
                   graph={conversation.knowledgeGraph || { nodes: [], edges: [] }} 
+                  contextCorpus={(segments || []).map((s) => s.originalText || s.content)}
                   onFullscreen={() => setIsGraphFullscreen(true)}
                 />,
                 'min-h-[600px]'
@@ -567,7 +568,14 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
 
                   {inspectedSegment.knowledgeGraph && inspectedSegment.knowledgeGraph.nodes?.length > 0 && (
                     <div className="h-[300px] border border-natural-sand rounded-3xl overflow-hidden shadow-sm mt-4">
-                      {renderDeferredPanel(<KnowledgeGraphView graph={inspectedSegment.knowledgeGraph} standalone={true} />, 'min-h-[300px]')}
+                      {renderDeferredPanel(
+                        <KnowledgeGraphView
+                          graph={inspectedSegment.knowledgeGraph}
+                          standalone={true}
+                          contextCorpus={[inspectedSegment.originalText || inspectedSegment.content]}
+                        />,
+                        'min-h-[300px]'
+                      )}
                     </div>
                   )}
                   </div>
@@ -794,6 +802,7 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
             {renderDeferredPanel(
               <KnowledgeGraphView 
                 graph={conversation.knowledgeGraph || { nodes: [], edges: [] }} 
+                contextCorpus={(segments || []).map((s) => s.originalText || s.content)}
                 standalone={true}
               />,
               'min-h-[500px]'

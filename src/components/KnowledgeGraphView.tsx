@@ -1,21 +1,90 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import * as d3 from 'd3';
 import { KnowledgeGraph } from '../types';
-import { Share2, Info, Maximize2, Download } from 'lucide-react';
+import { Share2, Info, Maximize2, Download, X } from 'lucide-react';
 
 interface KnowledgeGraphViewProps {
   graph: KnowledgeGraph;
   onFullscreen?: () => void;
   standalone?: boolean;
+  contextCorpus?: string[];
 }
 
-export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: KnowledgeGraphViewProps) {
+type NodeInsight = {
+  label: string;
+  references: string[];
+  themeSummary: string;
+};
+
+const LOCAL_STOP_WORDS = new Set([
+  'le', 'la', 'les', 'de', 'des', 'du', 'un', 'une', 'et', 'ou', 'en', 'dans', 'sur', 'avec', 'pour', 'par',
+  'que', 'qui', 'quoi', 'dont', 'est', 'sont', 'etre', 'avoir', 'this', 'that', 'with', 'from', 'into', 'about',
+  'the', 'and', 'for', 'you', 'your', 'their', 'our', 'mais', 'donc', 'car', 'plus', 'moins', 'pas', 'comme',
+  'nous', 'vous', 'ils', 'elles', 'elle', 'lui', 'eux', 'aux', 'au', 'ce', 'cet', 'cette', 'ces'
+]);
+
+function normalizeToken(value: string) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function splitIntoSentences(text: string) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function buildNodeInsight(label: string, corpus: string[]): NodeInsight {
+  const normalizedLabel = normalizeToken(label);
+  const refs: string[] = [];
+  const seen = new Set<string>();
+
+  corpus.forEach((chunk) => {
+    splitIntoSentences(chunk).forEach((sentence) => {
+      const normalized = normalizeToken(sentence);
+      if (!normalizedLabel || !normalized.includes(normalizedLabel)) return;
+      if (seen.has(normalized)) return;
+      seen.add(normalized);
+      refs.push(sentence);
+    });
+  });
+
+  const limitedRefs = refs.slice(0, 80);
+  const freq = new Map<string, number>();
+  limitedRefs.forEach((ref) => {
+    normalizeToken(ref).split(' ').forEach((token) => {
+      if (token.length < 4 || LOCAL_STOP_WORDS.has(token)) return;
+      if (token === normalizedLabel) return;
+      freq.set(token, (freq.get(token) || 0) + 1);
+    });
+  });
+  const topThemes = [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([token]) => token);
+  const themeSummary = topThemes.length
+    ? `Themes associes: ${topThemes.join(', ')}`
+    : `Themes associes: corpus trop court ou peu d'occurrences autour de "${label}".`;
+
+  return {
+    label,
+    references: limitedRefs,
+    themeSummary,
+  };
+}
+
+export function KnowledgeGraphView({ graph, onFullscreen, standalone = false, contextCorpus = [] }: KnowledgeGraphViewProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const nodeRadius = 50;
   const arrowOffset = 14;
   const rawMarkerId = useId();
   const markerId = useMemo(() => `arrowhead-${rawMarkerId.replace(/[^a-zA-Z0-9_-]/g, '')}`, [rawMarkerId]);
+  const [selectedNodeInsight, setSelectedNodeInsight] = useState<NodeInsight | null>(null);
   const [semanticPositionColors, setSemanticPositionColors] = useState<Record<string, string>>(() => {
     const defaults: Record<string, string> = {
       position_initiale: '#3b82f6',
@@ -199,7 +268,11 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
             if (!event.active) simulation.alphaTarget(0);
             event.subject.fx = null;
             event.subject.fy = null;
-          }) as any);
+          }) as any)
+        .on("click", (_event: any, d: any) => {
+          const insight = buildNodeInsight(d.label || d.id || "Node", contextCorpus || []);
+          setSelectedNodeInsight(insight);
+        });
 
       node.append("circle")
         .attr("r", 50) // Increased radius for better readability
@@ -328,7 +401,7 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
       if (simulation) simulation.stop();
       resizeObserver.disconnect();
     };
-  }, [safeGraph, markerId, semanticPositionColors, abstractionLevelColors]);
+  }, [safeGraph, markerId, semanticPositionColors, abstractionLevelColors, contextCorpus]);
 
   const exportToCypher = () => {
     const nodes = safeGraph.nodes.map(n => `CREATE (n${n.id.replace(/-/g, '')}:${n.type.replace(/\s+/g, '')} {id: "${n.id}", label: "${n.label}"})`).join('\n');
@@ -389,6 +462,43 @@ export function KnowledgeGraphView({ graph, onFullscreen, standalone = false }: 
         )}
         <svg ref={svgRef} className="w-full h-full cursor-grab active:cursor-grabbing"></svg>
       </div>
+      {selectedNodeInsight && (
+        <div className="absolute inset-0 z-30 bg-black/30 backdrop-blur-[1px] flex items-center justify-center p-4" onClick={() => setSelectedNodeInsight(null)}>
+          <div
+            className="w-full max-w-3xl max-h-[80vh] bg-white border border-natural-sand rounded-3xl shadow-2xl overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-6 py-4 border-b border-natural-sand flex items-center justify-between">
+              <div>
+                <p className="text-[10px] uppercase tracking-widest font-black text-natural-muted">References du noeud</p>
+                <h4 className="font-serif text-2xl text-natural-heading">{selectedNodeInsight.label}</h4>
+              </div>
+              <button
+                onClick={() => setSelectedNodeInsight(null)}
+                className="p-2 rounded-xl hover:bg-natural-sand text-natural-muted"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-6 max-h-[62vh] overflow-y-auto space-y-4">
+              <div className="bg-natural-bg/40 border border-natural-sand rounded-2xl p-4 text-sm text-natural-heading">
+                {selectedNodeInsight.themeSummary}
+              </div>
+              {selectedNodeInsight.references.length === 0 ? (
+                <p className="text-sm text-natural-muted italic">Aucune reference explicite retrouvee pour ce noeud dans le corpus courant.</p>
+              ) : (
+                <div className="space-y-2">
+                  {selectedNodeInsight.references.map((ref, idx) => (
+                    <div key={`${idx}-${ref.slice(0, 20)}`} className="p-3 rounded-xl border border-natural-sand bg-white text-sm text-natural-text">
+                      {ref}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
