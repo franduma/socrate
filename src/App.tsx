@@ -46,7 +46,7 @@ import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './lib/db';
 import { CustomReaction, ChatMessage, DictionaryEntry, SemanticAttribute, SemanticAttributeCollection, SegmentationTrace } from './types';
 import { v4 as uuidv4 } from 'uuid';
-import { collectFromWebSource, WebSourceDefinition, WebSourceMode } from './services/webIngestionService';
+import { collectFromWebSource, fetchRawWebContent, WebSourceDefinition, WebSourceMode } from './services/webIngestionService';
 
 /**
  * @license
@@ -316,6 +316,7 @@ export default function App() {
     }
   });
   const [webSourceDraft, setWebSourceDraft] = useState<WebSourceDraft>({ name: '', url: '', mode: 'rss' });
+  const [editingWebSourceId, setEditingWebSourceId] = useState<string | null>(null);
   const [isCollectingWeb, setIsCollectingWeb] = useState(false);
 
   useEffect(() => {
@@ -795,6 +796,40 @@ export default function App() {
     setWebSourceDraft({ name: '', url: '', mode: webSourceDraft.mode });
   };
 
+  const handleStartEditWebSource = (source: WebSourceDefinition) => {
+    setEditingWebSourceId(source.id);
+    setWebSourceDraft({
+      name: source.name,
+      url: source.url,
+      mode: source.mode,
+    });
+  };
+
+  const handleCancelEditWebSource = () => {
+    setEditingWebSourceId(null);
+    setWebSourceDraft({ name: '', url: '', mode: 'rss' });
+  };
+
+  const handleSaveEditWebSource = () => {
+    if (!editingWebSourceId) return;
+    const url = webSourceDraft.url.trim();
+    if (!url) {
+      alert("URL requise.");
+      return;
+    }
+    const normalized = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+    const name = webSourceDraft.name.trim() || normalized;
+    setWebSources((prev) =>
+      prev.map((source) =>
+        source.id === editingWebSourceId
+          ? { ...source, name, url: normalized, mode: webSourceDraft.mode }
+          : source
+      )
+    );
+    setEditingWebSourceId(null);
+    setWebSourceDraft({ name: '', url: '', mode: webSourceDraft.mode });
+  };
+
   const handleCollectWebSources = async () => {
     const activeSources = webSources.filter((s) => s.enabled && s.url.trim().length > 0);
     if (!activeSources.length) {
@@ -804,6 +839,7 @@ export default function App() {
     setIsCollectingWeb(true);
     try {
       const { analyzeAndSegmentConversation } = await loadGeminiService();
+      const granularityCore = getCoreGranularity(selectedGranularityProfile.id);
       let savedCount = 0;
       let failedCount = 0;
 
@@ -813,7 +849,19 @@ export default function App() {
           for (const doc of docs) {
             try {
               const analysisTrace = buildSegmentationTrace();
-              const result = await analyzeAndSegmentConversation(doc.text, {
+              let analysisInput = doc.text;
+              if (granularityCore === 'markup') {
+                const targetUrl = doc.url || source.url;
+                try {
+                  const rawMarkup = await fetchRawWebContent(targetUrl);
+                  if (rawMarkup && rawMarkup.trim().length > 0) {
+                    analysisInput = rawMarkup;
+                  }
+                } catch {
+                  // fallback to already-collected text
+                }
+              }
+              const result = await analyzeAndSegmentConversation(analysisInput, {
                 granularity: getCoreGranularity(selectedGranularityProfile.id),
                 customSegmentationInstruction: selectedGranularityProfile.instruction,
                 semanticCollectionName: selectedSemanticCollection?.name,
@@ -1513,11 +1561,19 @@ export default function App() {
                       </div>
                       <div className="flex gap-2">
                         <button
-                          onClick={handleAddWebSource}
+                          onClick={editingWebSourceId ? handleSaveEditWebSource : handleAddWebSource}
                           className="px-4 py-2.5 bg-natural-accent text-white rounded-xl text-xs font-black uppercase tracking-widest"
                         >
-                          Ajouter la source
+                          {editingWebSourceId ? 'Enregistrer source' : 'Ajouter la source'}
                         </button>
+                        {editingWebSourceId && (
+                          <button
+                            onClick={handleCancelEditWebSource}
+                            className="px-4 py-2.5 bg-white border border-natural-sand text-natural-heading rounded-xl text-xs font-black uppercase tracking-widest"
+                          >
+                            Annuler edition
+                          </button>
+                        )}
                         <button
                           onClick={handleCollectWebSources}
                           disabled={isCollectingWeb}
@@ -1550,6 +1606,13 @@ export default function App() {
                             )}>
                               {source.mode}
                             </span>
+                            <button
+                              onClick={() => handleStartEditWebSource(source)}
+                              className="px-2 py-1 text-[10px] font-black uppercase tracking-wider rounded-lg border border-natural-sand text-natural-muted hover:text-natural-heading hover:border-natural-beige"
+                              title="Modifier source"
+                            >
+                              Modifier
+                            </button>
                             <button
                               onClick={() => setWebSources((prev) => prev.filter((s) => s.id !== source.id))}
                               className="p-2 text-natural-stone hover:text-red-500"

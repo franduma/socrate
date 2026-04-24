@@ -623,12 +623,22 @@ function formatRelativeTimeTimeline(readable: string): string {
     .filter(Boolean);
 
   const timeAnchoredLines = lines.filter((line) =>
-    /^\d+\s+(hours?|hrs?|minutes?|mins?|min)\s+ago\b/i.test(line)
+    /^\d+\s+(hours?|hrs?|hr|h|minutes?|mins?|min|m)\s+ago\b/i.test(line)
   );
 
   // If we found timeline-like rows, prefer those for human readability.
-  if (timeAnchoredLines.length >= 3) {
+  if (timeAnchoredLines.length >= 2) {
     return timeAnchoredLines.join("\n");
+  }
+
+  // Fallback: carve snippets around relative-time markers directly from the one-line text.
+  const compact = raw.replace(/\s+/g, " ").trim();
+  const snippets = [...compact.matchAll(/(\d+\s+(?:hours?|hrs?|hr|h|minutes?|mins?|min|m)\s+ago[\s\S]*?)(?=\d+\s+(?:hours?|hrs?|hr|h|minutes?|mins?|min|m)\s+ago|$)/gi)]
+    .map((m) => String(m[1] || "").trim())
+    .map((s) => s.length > 220 ? `${s.slice(0, 220)}...` : s)
+    .filter(Boolean);
+  if (snippets.length >= 2) {
+    return snippets.join("\n");
   }
   return lines.join("\n");
 }
@@ -654,7 +664,22 @@ function forceMarkupSplitShape(parsed: any, originalText: string, options?: Anal
     return (role === "assistant" || role === "system") && t.length >= Math.min(200, readable.length);
   });
 
-  if (coverage >= 0.85 && hasReadableSegment) return;
+  if (coverage >= 0.85 && hasReadableSegment) {
+    if (looksLikeCnbcFrontpageMarkup(sourceCode, readable)) {
+      parsed.segments = existingSegments.map((s: any) => {
+        const role = String(s?.role || "").toLowerCase();
+        if (role !== "assistant" && role !== "system") return s;
+        const current = String(s?.originalText || s?.content || "");
+        const formatted = formatRelativeTimeTimeline(current);
+        return {
+          ...s,
+          content: formatted || current,
+          originalText: formatted || current,
+        };
+      });
+    }
+    return;
+  }
 
   parsed.segments = [
     {

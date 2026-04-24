@@ -70,6 +70,10 @@ async function fetchTextWithFallbacks(url: string) {
   throw lastError || new Error(`Unable to fetch ${url}`);
 }
 
+export async function fetchRawWebContent(url: string) {
+  return fetchTextWithFallbacks(url);
+}
+
 function parseRssDocuments(xmlRaw: string, source: WebSourceDefinition, maxItems = 5): IngestedDocument[] {
   const parser = new DOMParser();
   const xml = parser.parseFromString(xmlRaw, 'text/xml');

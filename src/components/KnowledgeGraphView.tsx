@@ -35,18 +35,38 @@ function normalizeToken(value: string) {
 
 function splitIntoSentences(text: string) {
   return String(text || '')
-    .replace(/\s+/g, ' ')
+    .replace(/[ \t]+/g, ' ')
     .split(/(?<=[.!?])\s+/)
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+function splitIntoReadableLines(text: string) {
+  return String(text || '')
+    .split(/\r?\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function isRelativeTimeLine(line: string) {
+  return /^\d+\s+(hours?|hrs?|hr|h|minutes?|mins?|min|m)\s+ago\b/i.test(String(line || '').trim());
 }
 
 function buildNodeInsight(label: string, corpus: string[]): NodeInsight {
   const normalizedLabel = normalizeToken(label);
   const refs: string[] = [];
   const seen = new Set<string>();
+  const timelineRefs: string[] = [];
+  const seenTimeline = new Set<string>();
 
   corpus.forEach((chunk) => {
+    splitIntoReadableLines(chunk).forEach((line) => {
+      if (!isRelativeTimeLine(line)) return;
+      const normalized = normalizeToken(line);
+      if (seenTimeline.has(normalized)) return;
+      seenTimeline.add(normalized);
+      timelineRefs.push(line);
+    });
     splitIntoSentences(chunk).forEach((sentence) => {
       const normalized = normalizeToken(sentence);
       if (!normalizedLabel || !normalized.includes(normalizedLabel)) return;
@@ -56,7 +76,8 @@ function buildNodeInsight(label: string, corpus: string[]): NodeInsight {
     });
   });
 
-  const limitedRefs = refs.slice(0, 80);
+  const mergedRefs = [...timelineRefs, ...refs];
+  const limitedRefs = mergedRefs.slice(0, 80);
   const freq = new Map<string, number>();
   limitedRefs.forEach((ref) => {
     normalizeToken(ref).split(' ').forEach((token) => {
