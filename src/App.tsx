@@ -434,6 +434,7 @@ export default function App() {
   });
   const [semanticCollectionNameDraft, setSemanticCollectionNameDraft] = useState('');
   const [semanticCollectionAttributeDraftIds, setSemanticCollectionAttributeDraftIds] = useState<string[]>([]);
+  const [newSemanticAttributeDraft, setNewSemanticAttributeDraft] = useState('');
   const [semanticAttributeSearch, setSemanticAttributeSearch] = useState('');
   const [showOnlySelectedSemanticAttributes, setShowOnlySelectedSemanticAttributes] = useState(false);
   const [isRecalculatingSemanticBank, setIsRecalculatingSemanticBank] = useState(false);
@@ -474,6 +475,7 @@ export default function App() {
   const selectedSemanticAttributes = selectedSemanticCollection
     ? semanticAttributes.filter((a) => selectedSemanticCollection.attributeIds.includes(a.id))
     : [];
+  const draftSemanticAttributes = semanticAttributes.filter((a) => semanticCollectionAttributeDraftIds.includes(a.id));
   const semanticAttributeSelectionList = semanticAttributes
     .filter((attr) => {
       const matchesSearch = !semanticAttributeSearch.trim()
@@ -528,6 +530,7 @@ export default function App() {
     const selected = semanticAttributeCollections.find((c) => c.id === selectedSemanticCollectionId);
     if (!selected) return;
     setSemanticCollectionAttributeDraftIds(selected.attributeIds || []);
+    setSemanticCollectionNameDraft(selected.name || '');
   }, [selectedSemanticCollectionId, semanticAttributeCollections]);
 
   const applyAdherenceToGraph = (graph: any) => {
@@ -675,17 +678,45 @@ export default function App() {
       return;
     }
     const now = Date.now();
-    const id = `scoll-${slugify(name)}-${uuidv4().slice(0, 6)}`;
+    const existing = selectedSemanticCollectionId
+      ? semanticAttributeCollections.find((c) => c.id === selectedSemanticCollectionId)
+      : null;
+    const id = existing?.id || `scoll-${slugify(name)}-${uuidv4().slice(0, 6)}`;
     await db.semanticAttributeCollections.put({
       id,
       name,
       attributeIds: [...new Set(semanticCollectionAttributeDraftIds)],
-      createdAt: now,
+      createdAt: existing?.createdAt || now,
       updatedAt: now,
     });
-    setSemanticCollectionNameDraft('');
-    setSemanticCollectionAttributeDraftIds([]);
     setSelectedSemanticCollectionId(id);
+  };
+
+  const handleAddManualSemanticAttribute = async () => {
+    const label = newSemanticAttributeDraft.trim();
+    if (!label) return;
+    const now = Date.now();
+    const id = `tag:${slugify(label)}:concept`;
+    const existing = await db.semanticAttributes.get(id);
+    if (existing) {
+      await db.semanticAttributes.update(id, {
+        label,
+        usageCount: (existing.usageCount || 0) + 1,
+        updatedAt: now,
+      });
+    } else {
+      await db.semanticAttributes.put({
+        id,
+        label,
+        kind: 'tag',
+        semanticPosition: 'concept',
+        usageCount: 1,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    setSemanticCollectionAttributeDraftIds((prev) => (prev.includes(id) ? prev : [...prev, id]));
+    setNewSemanticAttributeDraft('');
   };
 
   const persistAnalyzedConversation = async (
@@ -1730,18 +1761,18 @@ export default function App() {
                             <option value="0.7">Similarité très stricte (0.70)</option>
                           </select>
                         </div>
-                        {selectedSemanticCollection && (
+                        {(selectedSemanticCollection || semanticCollectionAttributeDraftIds.length > 0) && (
                           <div className="rounded-xl border border-natural-sand bg-white p-2.5">
                             <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted mb-2">
-                              Attributs associes a "{selectedSemanticCollection.name}" ({selectedSemanticCollection.attributeIds.length})
+                              Attributs associes a "{selectedSemanticCollection?.name || semanticCollectionNameDraft || 'Collection en cours'}" ({semanticCollectionAttributeDraftIds.length})
                             </p>
                             <div className="flex flex-wrap gap-1.5 max-h-[72px] overflow-y-auto custom-scrollbar">
-                              {selectedSemanticAttributes.slice(0, 60).map((attr) => (
+                              {draftSemanticAttributes.slice(0, 80).map((attr) => (
                                 <span key={attr.id} className="px-2 py-1 text-[10px] font-bold rounded-full bg-natural-sand text-natural-heading">
                                   {attr.label}
                                 </span>
                               ))}
-                              {selectedSemanticAttributes.length === 0 && (
+                              {draftSemanticAttributes.length === 0 && (
                                 <span className="text-[10px] text-natural-muted italic">Aucun attribut lie retrouve.</span>
                               )}
                             </div>
@@ -1786,6 +1817,20 @@ export default function App() {
                         </div>
                         <div className="flex flex-col md:flex-row gap-2">
                           <input
+                            value={newSemanticAttributeDraft}
+                            onChange={(e) => setNewSemanticAttributeDraft(e.target.value)}
+                            placeholder="Nouvel attribut manuel (ex: serveur, plateforme)"
+                            className="flex-1 p-2.5 bg-white border border-natural-sand rounded-xl text-xs"
+                          />
+                          <button
+                            onClick={handleAddManualSemanticAttribute}
+                            className="px-4 py-2.5 bg-white border border-natural-sand text-natural-heading rounded-xl text-xs font-black uppercase tracking-widest"
+                          >
+                            Ajouter attribut
+                          </button>
+                        </div>
+                        <div className="flex flex-col md:flex-row gap-2">
+                          <input
                             value={semanticCollectionNameDraft}
                             onChange={(e) => setSemanticCollectionNameDraft(e.target.value)}
                             placeholder="Nom de la collection"
@@ -1795,7 +1840,7 @@ export default function App() {
                             onClick={handleCreateSemanticCollection}
                             className="px-4 py-2.5 bg-natural-accent text-white rounded-xl text-xs font-black uppercase tracking-widest"
                           >
-                            Créer collection
+                            {selectedSemanticCollectionId ? 'Mettre a jour collection' : 'Creer collection'}
                           </button>
                         </div>
                       </div>
