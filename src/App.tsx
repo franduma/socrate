@@ -477,6 +477,14 @@ export default function App() {
     semanticAttributeLabels: selectedSemanticAttributes.map((a) => a.label),
     similarityThreshold: selectedSemanticSimilarity,
   });
+  const getTraceTitleSnippet = (trace?: SegmentationTrace) => {
+    if (!trace) return '';
+    const granularity = trace.granularityName || trace.granularityId || 'n/a';
+    const collection = trace.semanticCollectionName || 'aucune-collection';
+    const sim = Number.isFinite(trace.similarityThreshold) ? trace.similarityThreshold.toFixed(2) : '0.35';
+    const vector = trace.vectorEngineMode || 'local';
+    return `[${granularity} | ${collection} | sim:${sim} | vec:${vector}]`;
+  };
 
   useEffect(() => {
     if (!granularityProfiles.some((p) => p.id === selectedGranularityId)) {
@@ -2290,6 +2298,29 @@ export default function App() {
                 <h2 className="font-serif text-4xl text-natural-heading mb-10">Validation Socratique</h2>
                 <div className="space-y-8">
                   <input value={wizardTitle} onChange={(e) => setWizardTitle(e.target.value)} className="w-full p-6 bg-natural-bg rounded-2xl border-2 border-natural-sand focus:border-natural-accent/50 outline-none transition-all font-serif text-2xl text-natural-heading" />
+                  {potentialCapture.analysisTrace && (
+                    <div className="rounded-2xl border border-natural-sand bg-natural-bg/40 p-4 space-y-3">
+                      <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">Résumé des paramètres de cette analyse</p>
+                      <p className="text-xs text-natural-heading font-semibold break-words">
+                        {getTraceTitleSnippet(potentialCapture.analysisTrace)} | provider: {potentialCapture.analysisTrace.provider}
+                      </p>
+                      <button
+                        disabled={isFinalizingCapture}
+                        onClick={() => {
+                          const snippet = getTraceTitleSnippet(potentialCapture.analysisTrace);
+                          if (!snippet) return;
+                          setWizardTitle((prev) => {
+                            const trimmed = String(prev || '').trim();
+                            if (trimmed.includes(snippet)) return trimmed;
+                            return trimmed ? `${trimmed} ${snippet}` : snippet;
+                          });
+                        }}
+                        className="px-4 py-2 bg-white border border-natural-sand rounded-xl text-[10px] font-black uppercase tracking-widest text-natural-heading hover:border-natural-accent disabled:opacity-60 disabled:cursor-not-allowed"
+                      >
+                        Insérer dans le titre
+                      </button>
+                    </div>
+                  )}
                   <div className="flex gap-4 pt-4"><button disabled={isFinalizingCapture} onClick={finalizeCapture} className="flex-1 py-5 bg-natural-accent text-white rounded-2xl font-bold text-sm shadow-xl shadow-natural-accent/20 hover:bg-natural-accent/90 transition-all flex items-center justify-center gap-3 disabled:opacity-60 disabled:cursor-not-allowed"><Save className="w-5 h-5" />{isFinalizingCapture ? 'Enregistrement...' : 'Confirmer'}</button><button disabled={isFinalizingCapture} onClick={() => setIsWizardOpen(false)} className="px-8 py-5 bg-natural-sand text-natural-muted rounded-2xl font-bold text-sm hover:bg-natural-peach transition-all disabled:opacity-60 disabled:cursor-not-allowed">Annuler</button></div>
                 </div>
               </motion.div>
