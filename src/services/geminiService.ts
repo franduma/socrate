@@ -731,6 +731,57 @@ function getAI(apiKey: string) {
   return new GoogleGenerativeAI(apiKey);
 }
 
+function extractLikelyJsonObject(raw: string) {
+  const text = String(raw || "").trim();
+  if (!text) return text;
+  const fenced = text.replace(/```json|```/gi, "").trim();
+  const first = fenced.indexOf("{");
+  const last = fenced.lastIndexOf("}");
+  if (first >= 0 && last > first) return fenced.slice(first, last + 1);
+  return fenced;
+}
+
+function parseModelJsonLoose(raw: string) {
+  const candidate = extractLikelyJsonObject(raw);
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    // Remove hard control chars that frequently break provider JSON payloads.
+    const sanitized = candidate.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, " ");
+    return JSON.parse(sanitized);
+  }
+}
+
+function buildParseFallbackResult(originalText: string, parseError: any, options?: AnalyzeOptions): AnalysisResult {
+  const reason = String(parseError?.message || "JSON invalide renvoye par le fournisseur IA.");
+  return normalizeAnalysisPayload(
+    {
+      title: "Analyse (fallback local)",
+      analysis: {
+        summary: `Fallback local applique apres echec de parsing JSON: ${reason}`,
+        themes: [],
+        suggestedTags: ["fallback-local"],
+        deviations: [],
+        semanticSignature: `fallback-${uuidv4().substring(0, 8)}`,
+        knowledgeGraph: { nodes: [], edges: [] },
+      },
+      segments: [
+        {
+          content: originalText,
+          originalText,
+          role: "user",
+          semanticSignature: `fallback-seg-${uuidv4().substring(0, 8)}`,
+          tags: ["fallback-local-json"],
+          knowledgeGraph: { nodes: [], edges: [] },
+          metadata: { reason: "Sortie JSON IA invalide; contenu preserve localement." },
+        },
+      ],
+    },
+    originalText,
+    options
+  );
+}
+
 function normalizeAnalysisPayload(parsed: any, originalText: string, options?: AnalyzeOptions): AnalysisResult {
   const safeParsed = parsed || {};
   forceIntactFreeTextShape(safeParsed, originalText, options);
@@ -933,10 +984,12 @@ TEXTE: ${JSON.stringify(text)}
       temperature: 0.1,
       responseJson: true,
     });
-    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-    const jsonStr = jsonMatch ? jsonMatch[0] : rawText;
-    const parsed = JSON.parse(jsonStr);
-    return normalizeAnalysisPayload(parsed, text, options);
+    try {
+      const parsed = parseModelJsonLoose(rawText);
+      return normalizeAnalysisPayload(parsed, text, options);
+    } catch (parseError) {
+      return buildParseFallbackResult(text, parseError, options);
+    }
   }
 
   const apiKey = provider === "hardwired_gemini" ? getHardwiredGeminiApiKey() : getGeminiApiKey();
@@ -1012,10 +1065,16 @@ TEXTE: ${JSON.stringify(text)}
 
         const response = (await Promise.race([apiPromise, timeoutPromise])) as any;
         const rawText = response.response.text();
-        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-        const jsonStr = jsonMatch ? jsonMatch[0] : rawText;
-        const parsed = JSON.parse(jsonStr);
-        return normalizeAnalysisPayload(parsed, text, options);
+        try {
+          const parsed = parseModelJsonLoose(rawText);
+          return normalizeAnalysisPayload(parsed, text, options);
+        } catch (parseError) {
+          const message = String((parseError as any)?.message || "");
+          if (message.toLowerCase().includes("json")) {
+            return buildParseFallbackResult(text, parseError, options);
+          }
+          throw parseError;
+        }
       } catch (err: any) {
         lastError = err;
         if (String(err?.message || "").includes("404") || String(err?.message || "").includes("not found")) {
