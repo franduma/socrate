@@ -52,23 +52,33 @@ function getLongestTextCandidate(texts: Array<string | undefined | null>) {
 }
 
 async function fetchTextWithFallbacks(url: string) {
-  const candidates = [
-    url,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-    `https://r.jina.ai/http://${url.replace(/^https?:\/\//i, '')}`,
+  const sanitized = String(url || '').trim();
+  const withoutProtocol = sanitized.replace(/^https?:\/\//i, '');
+  const candidates: Array<{ url: string; kind: 'text' | 'allorigins_json' }> = [
+    { url: sanitized, kind: 'text' },
+    { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(sanitized)}`, kind: 'text' },
+    { url: `https://api.allorigins.win/get?url=${encodeURIComponent(sanitized)}`, kind: 'allorigins_json' },
+    { url: `https://r.jina.ai/http://${withoutProtocol}`, kind: 'text' },
+    { url: `https://r.jina.ai/https://${withoutProtocol}`, kind: 'text' },
   ];
 
   let lastError: any;
   for (const candidate of candidates) {
     try {
-      const res = await fetch(candidate);
+      const res = await fetch(candidate.url);
       if (!res.ok) {
-        lastError = new Error(`HTTP ${res.status} on ${candidate}`);
+        lastError = new Error(`HTTP ${res.status} on ${candidate.url}`);
         continue;
       }
-      const text = await res.text();
+      let text = '';
+      if (candidate.kind === 'allorigins_json') {
+        const payload = await res.json().catch(() => null as any);
+        text = String(payload?.contents || '');
+      } else {
+        text = await res.text();
+      }
       if (text && text.trim().length > 0) return text;
-      lastError = new Error(`Empty response from ${candidate}`);
+      lastError = new Error(`Empty response from ${candidate.url}`);
     } catch (error) {
       lastError = error;
     }
@@ -159,9 +169,34 @@ async function collectFromScrape(source: WebSourceDefinition): Promise<IngestedD
   }];
 }
 
+function getYahooFallbackScrapeUrl(sourceUrl: string) {
+  try {
+    const u = new URL(sourceUrl);
+    if (!u.hostname.toLowerCase().includes('yahoo.com')) return null;
+    return 'https://finance.yahoo.com/news/';
+  } catch {
+    return null;
+  }
+}
+
 export async function collectFromWebSource(source: WebSourceDefinition, maxRssItems = 5): Promise<IngestedDocument[]> {
   if (source.mode === 'rss') {
-    return collectFromRss(source, maxRssItems);
+    try {
+      return collectFromRss(source, maxRssItems);
+    } catch (error: any) {
+      const msg = String(error?.message || error || '');
+      const is451 = msg.includes('HTTP 451');
+      const yahooFallbackUrl = getYahooFallbackScrapeUrl(source.url);
+      if (is451 && yahooFallbackUrl) {
+        return collectFromScrape({
+          ...source,
+          mode: 'scrape',
+          url: yahooFallbackUrl,
+          name: `${source.name} (fallback scrape)`,
+        });
+      }
+      throw error;
+    }
   }
   return collectFromScrape(source);
 }

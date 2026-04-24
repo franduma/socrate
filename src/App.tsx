@@ -948,6 +948,9 @@ export default function App() {
       let processedCount = 0;
       let totalPlanned = 0;
       let interrupted = false;
+      const failureReasons: string[] = [];
+      const readErrorMessage = (error: any) =>
+        String(error?.message || error?.cause?.message || error || 'Erreur inconnue');
 
       for (const source of activeSources) {
         if (webCollectStopRequestedRef.current) {
@@ -1066,6 +1069,8 @@ export default function App() {
               console.error("Web ingest doc failed:", docError);
               failedCount += 1;
               processedCount += 1;
+              const msg = readErrorMessage(docError);
+              failureReasons.push(`[${source.name} / ${doc.title}] ${msg}`);
             } finally {
               setWebCollectProgress({
                 phase: `Analyse: ${source.name}`,
@@ -1081,8 +1086,10 @@ export default function App() {
         } catch (sourceError) {
           console.error("Web ingest source failed:", sourceError);
           failedCount += 1;
+          const msg = readErrorMessage(sourceError);
+          failureReasons.push(`[${source.name}] ${msg}`);
           setWebCollectProgress({
-            phase: `Erreur source: ${source.name}`,
+            phase: `Erreur source: ${source.name} (${msg.slice(0, 80)})`,
             sourceName: source.name,
             docTitle: undefined,
             current: processedCount,
@@ -1103,11 +1110,13 @@ export default function App() {
           saved: savedCount,
           failed: failedCount,
         });
-        alert(`Collecte interrompue. Sauvegardes: ${savedCount}. Echecs: ${failedCount}.`);
+        const details = failureReasons.length ? `\nDétails: ${failureReasons.slice(0, 3).join(' | ')}` : '';
+        alert(`Collecte interrompue. Sauvegardes: ${savedCount}. Echecs: ${failedCount}.${details}`);
         return;
       }
 
-      alert(`Collecte terminée. Sauvegardés: ${savedCount}. Échecs: ${failedCount}.`);
+      const details = failureReasons.length ? `\nDétails: ${failureReasons.slice(0, 3).join(' | ')}` : '';
+      alert(`Collecte terminée. Sauvegardés: ${savedCount}. Échecs: ${failedCount}.${details}`);
       setWebCollectProgress({
         phase: 'Collecte terminee',
         sourceName: undefined,
