@@ -87,7 +87,12 @@ export function AllSegmentsView({ onSelectConversation }: AllSegmentsViewProps) 
                 {(segment.analysisTrace || parentConv?.analysisTrace) && (
                   <div className="text-[10px] text-natural-muted uppercase tracking-wider font-semibold flex items-center gap-2">
                     <Fingerprint className="w-3 h-3" />
-                    {`Granularite: ${(segment.analysisTrace || parentConv?.analysisTrace)?.granularityName || 'n/a'} | Collection: ${(segment.analysisTrace || parentConv?.analysisTrace)?.semanticCollectionName || 'Aucune'} | Similarite: ${((segment.analysisTrace || parentConv?.analysisTrace)?.similarityThreshold ?? 0.35).toFixed(2)} | Vecteur: ${(segment.analysisTrace || parentConv?.analysisTrace)?.vectorEngineMode || 'local'}`}
+                    {`${(() => {
+                      const trace = (segment.analysisTrace || parentConv?.analysisTrace);
+                      const origin = trace?.webDocumentUrl || trace?.webSourceUrl;
+                      const originPart = origin ? ` | Origine: ${origin}` : '';
+                      return `Granularite: ${trace?.granularityName || 'n/a'} | Collection: ${trace?.semanticCollectionName || 'Aucune'} | Similarite: ${(trace?.similarityThreshold ?? 0.35).toFixed(2)} | Vecteur: ${trace?.vectorEngineMode || 'local'}${originPart}`;
+                    })()}`}
                   </div>
                 )}
               </div>

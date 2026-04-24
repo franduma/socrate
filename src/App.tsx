@@ -78,6 +78,12 @@ type WebSourceDraft = {
   name: string;
   url: string;
   mode: WebSourceMode;
+  titlePrefix: string;
+  granularityProfileId: string;
+  semanticCollectionId: string;
+  similarityThreshold: number;
+  vectorEngineMode: 'local' | 'provider';
+  rssMaxItems: number;
 };
 
 type WebCollectProgress = {
@@ -320,15 +326,32 @@ export default function App() {
           url: String(s.url || '').trim(),
           mode: s.mode === 'scrape' ? 'scrape' : 'rss',
           enabled: s.enabled !== false,
+          titlePrefix: String(s.titlePrefix || '[WEB]'),
+          granularityProfileId: String(s.granularityProfileId || 'balanced'),
+          semanticCollectionId: String(s.semanticCollectionId || ''),
+          similarityThreshold: Number.isFinite(Number(s.similarityThreshold)) ? Number(s.similarityThreshold) : 0.35,
+          vectorEngineMode: s.vectorEngineMode === 'provider' ? 'provider' : 'local',
+          rssMaxItems: Number.isFinite(Number(s.rssMaxItems)) ? Math.max(1, Math.min(20, Number(s.rssMaxItems))) : 5,
         }));
     } catch {
       return [];
     }
   });
-  const [webSourceDraft, setWebSourceDraft] = useState<WebSourceDraft>({ name: '', url: '', mode: 'rss' });
+  const [webSourceDraft, setWebSourceDraft] = useState<WebSourceDraft>({
+    name: '',
+    url: '',
+    mode: 'rss',
+    titlePrefix: '[WEB]',
+    granularityProfileId: 'balanced',
+    semanticCollectionId: '',
+    similarityThreshold: 0.35,
+    vectorEngineMode: 'local',
+    rssMaxItems: 5,
+  });
   const [editingWebSourceId, setEditingWebSourceId] = useState<string | null>(null);
   const [isCollectingWeb, setIsCollectingWeb] = useState(false);
   const [webCollectProgress, setWebCollectProgress] = useState<WebCollectProgress | null>(null);
+  const webCollectStopRequestedRef = useRef(false);
 
   useEffect(() => {
     localStorage.setItem('SELECTED_MODEL', selectedModel);
@@ -504,18 +527,24 @@ export default function App() {
       if (aSelected !== bSelected) return bSelected - aSelected;
       return a.label.localeCompare(b.label);
     });
-  const buildSegmentationTrace = (): SegmentationTrace => ({
-    runId: uuidv4(),
-    timestamp: Date.now(),
-    provider: selectedModel,
-    vectorEngineMode,
-    granularityId: selectedGranularityProfile.id,
-    granularityName: selectedGranularityProfile.name,
-    granularityInstruction: selectedGranularityProfile.instruction,
-    semanticCollectionId: selectedSemanticCollection?.id || undefined,
-    semanticCollectionName: selectedSemanticCollection?.name || undefined,
-    semanticAttributeLabels: selectedSemanticAttributes.map((a) => a.label),
-    similarityThreshold: selectedSemanticSimilarity,
+  const buildSegmentationTrace = (overrides?: Partial<SegmentationTrace>): SegmentationTrace => ({
+    runId: overrides?.runId || uuidv4(),
+    timestamp: overrides?.timestamp || Date.now(),
+    provider: overrides?.provider || selectedModel,
+    vectorEngineMode: overrides?.vectorEngineMode || vectorEngineMode,
+    granularityId: overrides?.granularityId || selectedGranularityProfile.id,
+    granularityName: overrides?.granularityName || selectedGranularityProfile.name,
+    granularityInstruction: overrides?.granularityInstruction || selectedGranularityProfile.instruction,
+    semanticCollectionId: overrides?.semanticCollectionId ?? (selectedSemanticCollection?.id || undefined),
+    semanticCollectionName: overrides?.semanticCollectionName ?? (selectedSemanticCollection?.name || undefined),
+    semanticAttributeLabels: overrides?.semanticAttributeLabels || selectedSemanticAttributes.map((a) => a.label),
+    similarityThreshold: Number.isFinite(overrides?.similarityThreshold as number)
+      ? (overrides?.similarityThreshold as number)
+      : selectedSemanticSimilarity,
+    webSourceName: overrides?.webSourceName,
+    webSourceUrl: overrides?.webSourceUrl,
+    webDocumentTitle: overrides?.webDocumentTitle,
+    webDocumentUrl: overrides?.webDocumentUrl,
   });
   const getTraceTitleSnippet = (trace?: SegmentationTrace) => {
     if (!trace) return '';
@@ -788,6 +817,20 @@ export default function App() {
     return convId;
   };
 
+  const clampSimilarity = (value: number) => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0.35));
+  const clampRssItems = (value: number) => Math.max(1, Math.min(20, Number.isFinite(value) ? Math.round(value) : 5));
+  const buildWebSourceDraftDefaults = (): WebSourceDraft => ({
+    name: '',
+    url: '',
+    mode: 'rss',
+    titlePrefix: '[WEB]',
+    granularityProfileId: selectedGranularityProfile.id,
+    semanticCollectionId: selectedSemanticCollectionId || '',
+    similarityThreshold: clampSimilarity(selectedSemanticSimilarity),
+    vectorEngineMode,
+    rssMaxItems: 5,
+  });
+
   const handleAddWebSource = () => {
     const url = webSourceDraft.url.trim();
     if (!url) {
@@ -802,9 +845,18 @@ export default function App() {
       url: normalized,
       mode: webSourceDraft.mode,
       enabled: true,
+      titlePrefix: webSourceDraft.titlePrefix.trim() || '[WEB]',
+      granularityProfileId: webSourceDraft.granularityProfileId || selectedGranularityProfile.id,
+      semanticCollectionId: webSourceDraft.semanticCollectionId || '',
+      similarityThreshold: clampSimilarity(webSourceDraft.similarityThreshold),
+      vectorEngineMode: webSourceDraft.vectorEngineMode || 'local',
+      rssMaxItems: clampRssItems(webSourceDraft.rssMaxItems),
     };
     setWebSources((prev) => [source, ...prev]);
-    setWebSourceDraft({ name: '', url: '', mode: webSourceDraft.mode });
+    setWebSourceDraft({
+      ...buildWebSourceDraftDefaults(),
+      mode: webSourceDraft.mode,
+    });
   };
 
   const handleStartEditWebSource = (source: WebSourceDefinition) => {
@@ -813,12 +865,18 @@ export default function App() {
       name: source.name,
       url: source.url,
       mode: source.mode,
+      titlePrefix: source.titlePrefix || '[WEB]',
+      granularityProfileId: source.granularityProfileId || selectedGranularityProfile.id,
+      semanticCollectionId: source.semanticCollectionId || '',
+      similarityThreshold: clampSimilarity(source.similarityThreshold ?? selectedSemanticSimilarity),
+      vectorEngineMode: source.vectorEngineMode === 'provider' ? 'provider' : 'local',
+      rssMaxItems: clampRssItems(source.rssMaxItems ?? 5),
     });
   };
 
   const handleCancelEditWebSource = () => {
     setEditingWebSourceId(null);
-    setWebSourceDraft({ name: '', url: '', mode: 'rss' });
+    setWebSourceDraft(buildWebSourceDraftDefaults());
   };
 
   const handleSaveEditWebSource = () => {
@@ -833,12 +891,39 @@ export default function App() {
     setWebSources((prev) =>
       prev.map((source) =>
         source.id === editingWebSourceId
-          ? { ...source, name, url: normalized, mode: webSourceDraft.mode }
+          ? {
+              ...source,
+              name,
+              url: normalized,
+              mode: webSourceDraft.mode,
+              titlePrefix: webSourceDraft.titlePrefix.trim() || '[WEB]',
+              granularityProfileId: webSourceDraft.granularityProfileId || selectedGranularityProfile.id,
+              semanticCollectionId: webSourceDraft.semanticCollectionId || '',
+              similarityThreshold: clampSimilarity(webSourceDraft.similarityThreshold),
+              vectorEngineMode: webSourceDraft.vectorEngineMode || 'local',
+              rssMaxItems: clampRssItems(webSourceDraft.rssMaxItems),
+            }
           : source
       )
     );
     setEditingWebSourceId(null);
-    setWebSourceDraft({ name: '', url: '', mode: webSourceDraft.mode });
+    setWebSourceDraft({
+      ...buildWebSourceDraftDefaults(),
+      mode: webSourceDraft.mode,
+    });
+  };
+
+  const handleStopWebCollection = () => {
+    webCollectStopRequestedRef.current = true;
+    setWebCollectProgress((prev) => ({
+      phase: 'Interruption demandee...',
+      sourceName: prev?.sourceName,
+      docTitle: prev?.docTitle,
+      current: prev?.current || 0,
+      total: prev?.total || 0,
+      saved: prev?.saved || 0,
+      failed: prev?.failed || 0,
+    }));
   };
 
   const handleCollectWebSources = async () => {
@@ -848,6 +933,7 @@ export default function App() {
       return;
     }
     setIsCollectingWeb(true);
+    webCollectStopRequestedRef.current = false;
     setWebCollectProgress({
       phase: 'Initialisation de la collecte...',
       current: 0,
@@ -857,13 +943,35 @@ export default function App() {
     });
     try {
       const { analyzeAndSegmentConversation } = await loadGeminiService();
-      const granularityCore = getCoreGranularity(selectedGranularityProfile.id);
       let savedCount = 0;
       let failedCount = 0;
       let processedCount = 0;
       let totalPlanned = 0;
+      let interrupted = false;
 
       for (const source of activeSources) {
+        if (webCollectStopRequestedRef.current) {
+          interrupted = true;
+          break;
+        }
+        const sourceGranularityProfile =
+          granularityProfiles.find((p) => p.id === source.granularityProfileId) || selectedGranularityProfile;
+        const sourceGranularityCore = getCoreGranularity(sourceGranularityProfile.id);
+        const sourceCollection =
+          (source.semanticCollectionId
+            ? semanticAttributeCollections.find((c) => c.id === source.semanticCollectionId)
+            : null) || null;
+        const sourceSemanticAttributes = sourceCollection
+          ? semanticAttributes.filter((a) => sourceCollection.attributeIds.includes(a.id))
+          : [];
+        const sourceSimilarity = clampSimilarity(source.similarityThreshold ?? selectedSemanticSimilarity);
+        const sourceVectorMode = source.vectorEngineMode === 'provider'
+          ? 'provider'
+          : source.vectorEngineMode === 'local'
+            ? 'local'
+            : vectorEngineMode;
+        const sourceRssMaxItems = clampRssItems(source.rssMaxItems ?? 5);
+        const titlePrefix = (source.titlePrefix || '[WEB]').trim();
         try {
           setWebCollectProgress((prev) => ({
             phase: `Collecte source: ${source.name}`,
@@ -874,7 +982,7 @@ export default function App() {
             saved: savedCount,
             failed: failedCount,
           }));
-          const docs = await collectFromWebSource(source, 5);
+          const docs = await collectFromWebSource(source, sourceRssMaxItems);
           totalPlanned += docs.length;
           setWebCollectProgress((prev) => ({
             phase: `Analyse des documents: ${source.name}`,
@@ -886,6 +994,10 @@ export default function App() {
             failed: failedCount,
           }));
           for (const doc of docs) {
+            if (webCollectStopRequestedRef.current) {
+              interrupted = true;
+              break;
+            }
             setWebCollectProgress({
               phase: `Analyse: ${source.name}`,
               sourceName: source.name,
@@ -896,9 +1008,22 @@ export default function App() {
               failed: failedCount,
             });
             try {
-              const analysisTrace = buildSegmentationTrace();
+              const analysisTrace = buildSegmentationTrace({
+                granularityId: sourceGranularityProfile.id,
+                granularityName: sourceGranularityProfile.name,
+                granularityInstruction: sourceGranularityProfile.instruction,
+                semanticCollectionId: sourceCollection?.id || undefined,
+                semanticCollectionName: sourceCollection?.name || undefined,
+                semanticAttributeLabels: sourceSemanticAttributes.map((a) => a.label),
+                similarityThreshold: sourceSimilarity,
+                vectorEngineMode: sourceVectorMode,
+                webSourceName: source.name,
+                webSourceUrl: source.url,
+                webDocumentTitle: doc.title,
+                webDocumentUrl: doc.url || source.url,
+              });
               let analysisInput = doc.text;
-              if (granularityCore === 'markup' && source.mode === 'scrape') {
+              if (sourceGranularityCore === 'markup' && source.mode === 'scrape') {
                 const targetUrl = doc.url || source.url;
                 try {
                   const rawMarkup = await fetchRawWebContent(targetUrl);
@@ -910,12 +1035,12 @@ export default function App() {
                 }
               }
               const result = await analyzeAndSegmentConversation(analysisInput, {
-                granularity: getCoreGranularity(selectedGranularityProfile.id),
-                customSegmentationInstruction: selectedGranularityProfile.instruction,
-                semanticCollectionName: selectedSemanticCollection?.name,
-                semanticAttributeLabels: selectedSemanticAttributes.map((a) => a.label),
-                similarityThreshold: selectedSemanticSimilarity,
-                vectorEngineMode,
+                granularity: sourceGranularityCore,
+                customSegmentationInstruction: sourceGranularityProfile.instruction,
+                semanticCollectionName: sourceCollection?.name,
+                semanticAttributeLabels: sourceSemanticAttributes.map((a) => a.label),
+                similarityThreshold: sourceSimilarity,
+                vectorEngineMode: sourceVectorMode,
               });
               const enrichedResult = {
                 ...result,
@@ -932,7 +1057,7 @@ export default function App() {
               const host = (() => {
                 try { return new URL(doc.url || source.url).hostname; } catch { return source.url; }
               })();
-              const title = `[WEB:${source.mode.toUpperCase()}] ${doc.title} - ${host}`;
+              const title = `${titlePrefix} [${source.mode.toUpperCase()}] ${doc.title} - ${host}`;
               const convId = await persistAnalyzedConversation(enrichedResult, { title, source: 'file' });
               savedCount += 1;
               processedCount += 1;
@@ -966,6 +1091,20 @@ export default function App() {
             failed: failedCount,
           });
         }
+        if (interrupted) break;
+      }
+      if (interrupted) {
+        setWebCollectProgress({
+          phase: 'Collecte interrompue par utilisateur',
+          sourceName: undefined,
+          docTitle: undefined,
+          current: processedCount,
+          total: totalPlanned,
+          saved: savedCount,
+          failed: failedCount,
+        });
+        alert(`Collecte interrompue. Sauvegardes: ${savedCount}. Echecs: ${failedCount}.`);
+        return;
       }
 
       alert(`Collecte terminée. Sauvegardés: ${savedCount}. Échecs: ${failedCount}.`);
@@ -983,6 +1122,7 @@ export default function App() {
       }
     } finally {
       setIsCollectingWeb(false);
+      webCollectStopRequestedRef.current = false;
     }
   };
 
@@ -1637,6 +1777,66 @@ export default function App() {
                           <option value="scrape">Scrape</option>
                         </select>
                       </div>
+                      <div className="grid grid-cols-1 md:grid-cols-6 gap-2">
+                        <input
+                          value={webSourceDraft.titlePrefix}
+                          onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, titlePrefix: e.target.value }))}
+                          placeholder="Prefixe titre (ex: CNBC Investing)"
+                          className="md:col-span-2 p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
+                        />
+                        <select
+                          value={webSourceDraft.granularityProfileId}
+                          onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, granularityProfileId: e.target.value }))}
+                          className="md:col-span-1 p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
+                        >
+                          {granularityProfiles.map((profile) => (
+                            <option key={profile.id} value={profile.id}>{profile.name}</option>
+                          ))}
+                        </select>
+                        <select
+                          value={webSourceDraft.semanticCollectionId}
+                          onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, semanticCollectionId: e.target.value }))}
+                          className="md:col-span-1 p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
+                        >
+                          <option value="">Aucune collection</option>
+                          {semanticAttributeCollections.map((collection) => (
+                            <option key={collection.id} value={collection.id}>{collection.name}</option>
+                          ))}
+                        </select>
+                        <input
+                          type="number"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={webSourceDraft.similarityThreshold}
+                          onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, similarityThreshold: Number(e.target.value) }))}
+                          className="md:col-span-1 p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
+                          title="Similarite"
+                        />
+                        <select
+                          value={webSourceDraft.vectorEngineMode}
+                          onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, vectorEngineMode: e.target.value as 'local' | 'provider' }))}
+                          className="md:col-span-1 p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
+                        >
+                          <option value="local">Vecteur Local</option>
+                          <option value="provider">Vecteur Provider</option>
+                        </select>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                        <input
+                          type="number"
+                          min={1}
+                          max={20}
+                          step={1}
+                          value={webSourceDraft.rssMaxItems}
+                          onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, rssMaxItems: Number(e.target.value) }))}
+                          className="p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
+                          title="Nombre max d'items RSS"
+                        />
+                        <p className="md:col-span-2 text-[11px] text-natural-muted">
+                          Parametres appliques a cette source uniquement: granularite, collection, similarite, vecteur, et nombre max d'items RSS.
+                        </p>
+                      </div>
                       <div className="flex gap-2">
                         <button
                           onClick={editingWebSourceId ? handleSaveEditWebSource : handleAddWebSource}
@@ -1660,6 +1860,14 @@ export default function App() {
                           {isCollectingWeb ? <Loader2 className="w-4 h-4 animate-spin" /> : <Rss className="w-4 h-4" />}
                           Lancer la collecte
                         </button>
+                        {isCollectingWeb && (
+                          <button
+                            onClick={handleStopWebCollection}
+                            className="px-4 py-2.5 bg-red-600 text-white rounded-xl text-xs font-black uppercase tracking-widest hover:bg-red-700"
+                          >
+                            Interrompre
+                          </button>
+                        )}
                       </div>
                       {webCollectProgress && (
                         <div className="rounded-2xl border border-natural-sand bg-natural-bg/40 p-3 space-y-1.5">
@@ -1697,6 +1905,9 @@ export default function App() {
                             <div className="min-w-0 flex-1">
                               <p className="text-xs font-bold text-natural-heading truncate">{source.name}</p>
                               <p className="text-[10px] text-natural-muted truncate">{source.url}</p>
+                              <p className="text-[10px] text-natural-stone truncate">
+                                Titre: {source.titlePrefix || '[WEB]'} | Granularite: {(granularityProfiles.find((p) => p.id === source.granularityProfileId)?.name) || source.granularityProfileId || 'balanced'} | Similarite: {Number(source.similarityThreshold ?? 0.35).toFixed(2)} | Vecteur: {source.vectorEngineMode || 'local'} | RSS max: {source.rssMaxItems ?? 5}
+                              </p>
                             </div>
                             <span className={cn(
                               "text-[9px] uppercase tracking-widest font-black px-2 py-1 rounded-full",

@@ -72,7 +72,9 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
     if (!trace) return '';
     const collection = trace.semanticCollectionName || 'Aucune collection';
     const vectorMode = trace.vectorEngineMode || vectorEngineMode;
-    return `Granularite: ${trace.granularityName} | Collection: ${collection} | Similarite: ${trace.similarityThreshold.toFixed(2)} | Provider: ${trace.provider} | Vecteur: ${vectorMode}`;
+    const origin = trace.webDocumentUrl || trace.webSourceUrl;
+    const originPart = origin ? ` | Origine: ${origin}` : '';
+    return `Granularite: ${trace.granularityName} | Collection: ${collection} | Similarite: ${trace.similarityThreshold.toFixed(2)} | Provider: ${trace.provider} | Vecteur: ${vectorMode}${originPart}`;
   };
   useEffect(() => {
     const handler = (event: Event) => {

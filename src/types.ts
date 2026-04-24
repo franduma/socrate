@@ -15,6 +15,10 @@ export interface SegmentationTrace {
   semanticCollectionName?: string;
   semanticAttributeLabels: string[];
   similarityThreshold: number;
+  webSourceName?: string;
+  webSourceUrl?: string;
+  webDocumentTitle?: string;
+  webDocumentUrl?: string;
 }
 
 export interface Segment {

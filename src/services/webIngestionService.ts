@@ -6,6 +6,12 @@ export interface WebSourceDefinition {
   url: string;
   mode: WebSourceMode;
   enabled: boolean;
+  titlePrefix?: string;
+  granularityProfileId?: string;
+  semanticCollectionId?: string;
+  similarityThreshold?: number;
+  vectorEngineMode?: 'local' | 'provider';
+  rssMaxItems?: number;
 }
 
 export interface IngestedDocument {
@@ -88,14 +94,13 @@ function parseRssDocuments(xmlRaw: string, source: WebSourceDefinition, maxItems
         '';
       const publishedAt = item.querySelector('pubDate')?.textContent?.trim() || undefined;
       const text = truncate(stripHtml(description));
-      if (!text) return null;
       return {
         sourceId: source.id,
         sourceName: source.name || source.url,
         sourceUrl: source.url,
         title,
         url: link,
-        text,
+        text: text || title,
         publishedAt,
       } as IngestedDocument;
     })
@@ -112,13 +117,28 @@ async function collectFromRss(source: WebSourceDefinition, maxItems = 5): Promis
         const html = await fetchTextWithFallbacks(doc.url);
         const articleText = truncate(stripHtml(html), 22000);
         const bestText = getLongestTextCandidate([articleText, doc.text]);
-        if (!bestText) return doc;
+        const composed = truncate(
+          [doc.publishedAt ? `Published: ${doc.publishedAt}` : '', doc.title, bestText || doc.text]
+            .filter(Boolean)
+            .join('\n\n'),
+          22000
+        );
+        if (!composed) return doc;
         return {
           ...doc,
-          text: bestText,
+          text: composed,
         };
       } catch {
-        return doc;
+        const fallbackText = truncate(
+          [doc.publishedAt ? `Published: ${doc.publishedAt}` : '', doc.title, doc.text]
+            .filter(Boolean)
+            .join('\n\n'),
+          22000
+        );
+        return {
+          ...doc,
+          text: fallbackText || doc.text,
+        };
       }
     })
   );
