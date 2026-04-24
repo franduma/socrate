@@ -434,6 +434,8 @@ export default function App() {
   });
   const [semanticCollectionNameDraft, setSemanticCollectionNameDraft] = useState('');
   const [semanticCollectionAttributeDraftIds, setSemanticCollectionAttributeDraftIds] = useState<string[]>([]);
+  const [semanticAttributeSearch, setSemanticAttributeSearch] = useState('');
+  const [showOnlySelectedSemanticAttributes, setShowOnlySelectedSemanticAttributes] = useState(false);
   const [isRecalculatingSemanticBank, setIsRecalculatingSemanticBank] = useState(false);
 
   useEffect(() => {
@@ -472,6 +474,22 @@ export default function App() {
   const selectedSemanticAttributes = selectedSemanticCollection
     ? semanticAttributes.filter((a) => selectedSemanticCollection.attributeIds.includes(a.id))
     : [];
+  const semanticAttributeSelectionList = semanticAttributes
+    .filter((attr) => {
+      const matchesSearch = !semanticAttributeSearch.trim()
+        || attr.label.toLowerCase().includes(semanticAttributeSearch.toLowerCase())
+        || attr.semanticPosition.toLowerCase().includes(semanticAttributeSearch.toLowerCase());
+      const selected = semanticCollectionAttributeDraftIds.includes(attr.id);
+      if (!matchesSearch) return false;
+      if (showOnlySelectedSemanticAttributes && !selected) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      const aSelected = semanticCollectionAttributeDraftIds.includes(a.id) ? 1 : 0;
+      const bSelected = semanticCollectionAttributeDraftIds.includes(b.id) ? 1 : 0;
+      if (aSelected !== bSelected) return bSelected - aSelected;
+      return a.label.localeCompare(b.label);
+    });
   const buildSegmentationTrace = (): SegmentationTrace => ({
     runId: uuidv4(),
     timestamp: Date.now(),
@@ -505,6 +523,12 @@ export default function App() {
       setSelectedSemanticCollectionId('');
     }
   }, [semanticAttributeCollections, selectedSemanticCollectionId]);
+  useEffect(() => {
+    if (!selectedSemanticCollectionId) return;
+    const selected = semanticAttributeCollections.find((c) => c.id === selectedSemanticCollectionId);
+    if (!selected) return;
+    setSemanticCollectionAttributeDraftIds(selected.attributeIds || []);
+  }, [selectedSemanticCollectionId, semanticAttributeCollections]);
 
   const applyAdherenceToGraph = (graph: any) => {
     if (!graph || !Array.isArray(graph.nodes)) return graph;
@@ -1706,8 +1730,44 @@ export default function App() {
                             <option value="0.7">Similarité très stricte (0.70)</option>
                           </select>
                         </div>
+                        {selectedSemanticCollection && (
+                          <div className="rounded-xl border border-natural-sand bg-white p-2.5">
+                            <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted mb-2">
+                              Attributs associes a "{selectedSemanticCollection.name}" ({selectedSemanticCollection.attributeIds.length})
+                            </p>
+                            <div className="flex flex-wrap gap-1.5 max-h-[72px] overflow-y-auto custom-scrollbar">
+                              {selectedSemanticAttributes.slice(0, 60).map((attr) => (
+                                <span key={attr.id} className="px-2 py-1 text-[10px] font-bold rounded-full bg-natural-sand text-natural-heading">
+                                  {attr.label}
+                                </span>
+                              ))}
+                              {selectedSemanticAttributes.length === 0 && (
+                                <span className="text-[10px] text-natural-muted italic">Aucun attribut lie retrouve.</span>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                        <div className="flex flex-col md:flex-row gap-2">
+                          <input
+                            value={semanticAttributeSearch}
+                            onChange={(e) => setSemanticAttributeSearch(e.target.value)}
+                            placeholder="Filtrer les attributs..."
+                            className="flex-1 p-2.5 bg-white border border-natural-sand rounded-xl text-xs"
+                          />
+                          <button
+                            onClick={() => setShowOnlySelectedSemanticAttributes((prev) => !prev)}
+                            className={cn(
+                              "px-3 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest border",
+                              showOnlySelectedSemanticAttributes
+                                ? "bg-natural-accent text-white border-natural-accent"
+                                : "bg-white text-natural-heading border-natural-sand"
+                            )}
+                          >
+                            {showOnlySelectedSemanticAttributes ? "Voir tout" : "Voir selection"}
+                          </button>
+                        </div>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-[170px] overflow-y-auto custom-scrollbar">
-                          {semanticAttributes.slice(0, 120).map((attr) => {
+                          {semanticAttributeSelectionList.slice(0, 240).map((attr) => {
                             const checked = semanticCollectionAttributeDraftIds.includes(attr.id);
                             return (
                               <label key={attr.id} className="flex items-center gap-2 bg-white border border-natural-sand rounded-lg p-2 text-xs">
