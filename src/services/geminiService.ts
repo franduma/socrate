@@ -466,7 +466,7 @@ function enrichGraphRichness(parsed: any) {
 function reconcileSocraticRoles(segments: any[]): any[] {
   const normalized = segments.map((seg) => ({
     ...seg,
-    role: seg.role === "assistant" || seg.role === "system" ? "assistant" : "user",
+    role: seg.role === "assistant" ? "assistant" : seg.role === "system" ? "system" : "user",
   }));
 
   for (const seg of normalized) {
@@ -502,7 +502,7 @@ function reconcileSocraticRoles(segments: any[]): any[] {
     .filter((s) => s.text.trim().length > 0);
 
   for (const seg of normalized) {
-    if (seg.role !== "assistant") continue;
+    if (seg.role !== "assistant" && seg.role !== "system") continue;
     const assistantText = String(seg.originalText || seg.content || "");
     const assistantVec = toSemanticVector(assistantText);
     let best: { text: string; score: number } | null = null;
@@ -652,7 +652,10 @@ function looksLikeMarkup(text: string): boolean {
   const t = String(text || "").trim();
   if (!t) return false;
   if (/^\s*<\?xml[\s\S]*\?>/i.test(t)) return true;
+  if (/<!doctype\s+html/i.test(t)) return true;
   if (/<[a-zA-Z][\w:-]*[\s>]/.test(t) && /<\/?[a-zA-Z][\w:-]*>/.test(t)) return true;
+  const tagLikeMatches = t.match(/<\s*\/?\s*[a-zA-Z][\w:-]*(?:\s[^<>]*?)?\s*\/?>/g) || [];
+  if (tagLikeMatches.length >= 6) return true;
   return false;
 }
 
@@ -667,14 +670,116 @@ function decodeEntities(text: string): string {
 }
 
 function extractMarkupReadableText(text: string): string {
-  return decodeEntities(
-    String(text || "")
-      .replace(/<script[\s\S]*?<\/script>/gi, " ")
-      .replace(/<style[\s\S]*?<\/style>/gi, " ")
-      .replace(/<[^>]+>/g, " ")
-  )
-    .replace(/\s+/g, " ")
-    .trim();
+  const withBoundaries = String(text || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<\/?(?:p|div|section|article|main|header|footer|nav|aside|h[1-6]|li|ul|ol|table|tr|td|th|blockquote|br|hr|time)\b[^>]*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ");
+
+  const decoded = decodeEntities(withBoundaries);
+  const lines = decoded
+    .split(/\n+/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+  const compactUnique: string[] = [];
+  for (const line of lines) {
+    const prev = compactUnique[compactUnique.length - 1];
+    if (prev && prev.toLowerCase() === line.toLowerCase()) continue;
+    compactUnique.push(line);
+  }
+
+  return compactUnique.join("\n").trim();
+}
+
+function formatReadableForHumans(text: string): string {
+  const raw = String(text || "").trim();
+  if (!raw) return raw;
+  const normalizedWithStructuralBreaks = raw
+    .replace(/\s+[|]\s+/g, "\n")
+    .replace(/\s+[•·]\s+/g, "\n")
+    .replace(/\s+-\s+(?=[A-Z0-9À-ÖØ-Þ])/g, "\n");
+  if (normalizedWithStructuralBreaks.includes("\n")) {
+    return normalizedWithStructuralBreaks
+      .split(/\n+/)
+      .map((l) => l.replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  const normalized = normalizedWithStructuralBreaks.replace(/\s+/g, " ").trim();
+  const sentences = normalized
+    .split(/(?<=[.!?])\s+(?=[A-Z0-9À-ÖØ-Þ])/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (sentences.length >= 4) {
+    const paragraphs: string[] = [];
+    let current = "";
+    for (const sentence of sentences) {
+      if (!current) {
+        current = sentence;
+        continue;
+      }
+      if ((current.length + 1 + sentence.length) > 320) {
+        paragraphs.push(current);
+        current = sentence;
+      } else {
+        current = `${current} ${sentence}`;
+      }
+    }
+    if (current) paragraphs.push(current);
+    return paragraphs.join("\n\n");
+  }
+
+  const words = normalized.split(/\s+/);
+  const maxWordsPerLine = words.length > 120 ? 14 : 20;
+  const chunks: string[] = [];
+  let current = "";
+  let currentWords = 0;
+  for (const word of words) {
+    if (!current) {
+      current = word;
+      currentWords = 1;
+      continue;
+    }
+    if ((current.length + 1 + word.length) > 180 || currentWords >= maxWordsPerLine) {
+      chunks.push(current);
+      current = word;
+      currentWords = 1;
+    } else {
+      current = `${current} ${word}`;
+      currentWords += 1;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks.join("\n");
+}
+
+function extractMarkedSection(source: string, marker: string): string {
+  const raw = String(source || "");
+  const idx = raw.indexOf(marker);
+  if (idx < 0) return "";
+  const after = raw.slice(idx + marker.length);
+  const nextMarker = after.search(/\n\s*\[[A-Z0-9_]+\]\s*/);
+  const body = nextMarker >= 0 ? after.slice(0, nextMarker) : after;
+  return body.trim();
+}
+
+function readMarkupPayloadSections(originalText: string) {
+  const raw = String(originalText || "");
+  const readableMarked = extractMarkedSection(raw, "[CONTENU_LISIBLE_PRIORITAIRE]");
+  const technicalMarked = extractMarkedSection(raw, "[EXTRAIT_MARKUP_TECHNIQUE]");
+  const sourceCode = technicalMarked || raw;
+  const readableFromSource = readableMarked || extractMarkupReadableText(sourceCode);
+  const hasStructuredMarkupPayload = raw.includes("[CONTENU_LISIBLE_PRIORITAIRE]") || raw.includes("[EXTRAIT_MARKUP_TECHNIQUE]");
+  return {
+    sourceCode,
+    readableFromSource,
+    hasStructuredMarkupPayload,
+    sourceLooksLikeMarkup: looksLikeMarkup(sourceCode),
+  };
 }
 
 function looksLikeCnbcFrontpageMarkup(sourceCode: string, readable: string): boolean {
@@ -722,10 +827,9 @@ function formatRelativeTimeTimeline(readable: string): string {
 
 function forceMarkupSplitShape(parsed: any, originalText: string, options?: AnalyzeOptions) {
   if (!isMarkupMode(options)) return;
-  if (!looksLikeMarkup(originalText)) return;
-
-  const sourceCode = String(originalText || "").trim();
-  let readable = extractMarkupReadableText(sourceCode);
+  const { sourceCode, readableFromSource, hasStructuredMarkupPayload, sourceLooksLikeMarkup } = readMarkupPayloadSections(originalText);
+  if (!sourceLooksLikeMarkup && !hasStructuredMarkupPayload) return;
+  let readable = formatReadableForHumans(readableFromSource);
   if (looksLikeCnbcFrontpageMarkup(sourceCode, readable)) {
     readable = formatRelativeTimeTimeline(readable);
   }
@@ -776,6 +880,67 @@ function forceMarkupSplitShape(parsed: any, originalText: string, options?: Anal
       tags: ["markup", "contenu-extrait"],
       knowledgeGraph: { nodes: [], edges: [] },
       metadata: { reason: "Contenu texte extrait du markup pour lecture humaine." },
+    },
+  ];
+}
+
+function forceMarkupReadableSocraticShape(parsed: any, originalText: string, options?: AnalyzeOptions) {
+  if (!isMarkupMode(options)) return;
+  const { sourceCode, readableFromSource, hasStructuredMarkupPayload, sourceLooksLikeMarkup } = readMarkupPayloadSections(originalText);
+  if (!sourceLooksLikeMarkup && !hasStructuredMarkupPayload) return;
+  const readableBaseline = formatReadableForHumans(String(readableFromSource || ""));
+  const existingSegments = Array.isArray(parsed?.segments) ? parsed.segments : [];
+  const nonCodeCandidates = existingSegments
+    .map((s: any) => String(s?.originalText || s?.content || "").trim())
+    .filter((t: string) => t.length > 0 && !looksLikeMarkup(t))
+    .filter((t: string) => !/\[(contenu_lisible_prioritaire|extrait_markup_technique)\]/i.test(t))
+    .sort((a: string, b: string) => b.length - a.length);
+
+  let assistantText = readableBaseline.length >= 80 ? readableBaseline : (nonCodeCandidates[0] || readableBaseline || "");
+  if (assistantText && readableBaseline.length >= 80) {
+    const assistantVec = toSemanticVector(assistantText);
+    const codeReadableVec = toSemanticVector(formatReadableForHumans(extractMarkupReadableText(sourceCode)));
+    const overlap = cosineSimilarityMap(assistantVec, codeReadableVec);
+    // If provider output collapses back to technical/code-like content, force the readable baseline.
+    if (overlap >= 0.97) {
+      assistantText = readableBaseline;
+    }
+  }
+  if (looksLikeCnbcFrontpageMarkup(sourceCode, assistantText)) {
+    assistantText = formatRelativeTimeTimeline(assistantText);
+  } else {
+    assistantText = formatReadableForHumans(assistantText);
+  }
+  if (!assistantText || assistantText.length < 80) return;
+
+  const inferredQuestion = inferQuestionFromAnalysis(assistantText);
+  parsed.segments = [
+    {
+      content: inferredQuestion,
+      originalText: inferredQuestion,
+      role: "user",
+      semanticSignature: `markup-q-${uuidv4().substring(0, 8)}`,
+      tags: ["question-inferree", "markup"],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: { reason: "Question inferee depuis le contenu lisible extrait du markup." },
+    },
+    {
+      content: assistantText,
+      originalText: assistantText,
+      role: "assistant",
+      semanticSignature: `markup-a-${uuidv4().substring(0, 8)}`,
+      tags: ["analyse-socratique-detectee", "markup", "contenu-extrait"],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: { reason: "Contenu lisible conserve pour analyse socratique." },
+    },
+    {
+      content: "CODE_MARKUP_SOURCE",
+      originalText: sourceCode,
+      role: "system",
+      semanticSignature: `markup-code-${uuidv4().substring(0, 8)}`,
+      tags: ["markup", "code-source"],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: { reason: "Code source HTML/XML conserve en segment technique." },
     },
   ];
 }
@@ -863,6 +1028,7 @@ function normalizeAnalysisPayload(parsed: any, originalText: string, options?: A
   const safeParsed = parsed || {};
   forceIntactFreeTextShape(safeParsed, originalText, options);
   forceMarkupSplitShape(safeParsed, originalText, options);
+  forceMarkupReadableSocraticShape(safeParsed, originalText, options);
   forceSingleBlockSocraticPair(safeParsed, originalText, options);
 
   if (!safeParsed.segments || safeParsed.segments.length === 0) {

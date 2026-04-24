@@ -84,6 +84,9 @@ type WebSourceDraft = {
   similarityThreshold: number;
   vectorEngineMode: 'local' | 'provider';
   rssMaxItems: number;
+  browserProxyPageUrl: string;
+  browserProxyPageTitle: string;
+  browserProxyRawContent: string;
 };
 
 type WebCollectProgress = {
@@ -215,7 +218,7 @@ export default function App() {
   const [isReactionAdminOpen, setIsReactionAdminOpen] = useState(false);
   const [isDictionaryOpen, setIsDictionaryOpen] = useState(false);
   const [dictSearch, setDictSearch] = useState('');
-  const [sourceTab, setSourceTab] = useState<'conv' | 'segments'>('conv');
+  const [sourceTab, setSourceTab] = useState<'conv' | 'files' | 'search' | 'segments' | 'settings' | 'chat'>('conv');
   const [potentialCapture, setPotentialCapture] = useState<{ 
     title: string, 
     segments: any[], 
@@ -324,7 +327,7 @@ export default function App() {
           id: s.id,
           name: String(s.name || s.url),
           url: String(s.url || '').trim(),
-          mode: s.mode === 'scrape' ? 'scrape' : 'rss',
+          mode: s.mode === 'scrape' ? 'scrape' : s.mode === 'browser_proxy' ? 'browser_proxy' : 'rss',
           enabled: s.enabled !== false,
           titlePrefix: String(s.titlePrefix || '[WEB]'),
           granularityProfileId: String(s.granularityProfileId || 'balanced'),
@@ -332,6 +335,14 @@ export default function App() {
           similarityThreshold: Number.isFinite(Number(s.similarityThreshold)) ? Number(s.similarityThreshold) : 0.35,
           vectorEngineMode: s.vectorEngineMode === 'provider' ? 'provider' : 'local',
           rssMaxItems: Number.isFinite(Number(s.rssMaxItems)) ? Math.max(1, Math.min(20, Number(s.rssMaxItems))) : 5,
+          browserProxySnapshot: s.browserProxySnapshot && typeof s.browserProxySnapshot === 'object'
+            ? {
+                pageUrl: String(s.browserProxySnapshot.pageUrl || ''),
+                pageTitle: String(s.browserProxySnapshot.pageTitle || ''),
+                rawContent: String(s.browserProxySnapshot.rawContent || ''),
+                capturedAt: Number.isFinite(Number(s.browserProxySnapshot.capturedAt)) ? Number(s.browserProxySnapshot.capturedAt) : undefined,
+              }
+            : undefined,
         }));
     } catch {
       return [];
@@ -347,6 +358,9 @@ export default function App() {
     similarityThreshold: 0.35,
     vectorEngineMode: 'local',
     rssMaxItems: 5,
+    browserProxyPageUrl: '',
+    browserProxyPageTitle: '',
+    browserProxyRawContent: '',
   });
   const [editingWebSourceId, setEditingWebSourceId] = useState<string | null>(null);
   const [isCollectingWeb, setIsCollectingWeb] = useState(false);
@@ -834,10 +848,47 @@ export default function App() {
   const clampSimilarity = (value: number) => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0.35));
   const clampRssItems = (value: number) => Math.max(1, Math.min(20, Number.isFinite(value) ? Math.round(value) : 5));
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const stripMarkupToReadableText = (value: string) =>
+    String(value || '')
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/\s+/g, ' ')
+      .trim();
   const capText = (value: string, maxChars: number) => {
     const text = String(value || '').trim();
     if (text.length <= maxChars) return text;
-    return `${text.slice(0, maxChars)}\n\n[...contenu tronque automatiquement pour respecter les limites provider...]`;
+    return text.slice(0, maxChars);
+  };
+  const buildMarkupAnalysisPayload = (
+    rawMarkup: string,
+    readableFallback: string,
+    sourceLabel: string
+  ) => {
+    const markup = String(rawMarkup || '');
+    const readableFromMarkup = stripMarkupToReadableText(markup);
+    const readableFromCollector = String(readableFallback || '').trim();
+    // Prefer the collector-readable text (Readability/heuristics) because it is usually article-focused
+    // and avoids full-page chrome noise (menus, sidebars, related headlines).
+    const readable = readableFromCollector.length >= 180
+      ? readableFromCollector
+      : (readableFromMarkup.length >= 300 ? readableFromMarkup : readableFromCollector || readableFromMarkup);
+    const technicalSample = capText(markup, 4800);
+    const humanSample = capText(readable, 16000);
+    return [
+      `SOURCE: ${sourceLabel}`,
+      '[CONTENU_LISIBLE_PRIORITAIRE]',
+      humanSample,
+      '[EXTRAIT_MARKUP_TECHNIQUE]',
+      technicalSample,
+    ]
+      .filter(Boolean)
+      .join('\n\n');
   };
   const limitInputForProvider = (
     value: string,
@@ -860,15 +911,78 @@ export default function App() {
     similarityThreshold: clampSimilarity(selectedSemanticSimilarity),
     vectorEngineMode,
     rssMaxItems: 5,
+    browserProxyPageUrl: '',
+    browserProxyPageTitle: '',
+    browserProxyRawContent: '',
   });
+  const browserProxyRelayBaseUrl = 'http://127.0.0.1:3211';
+
+  const extractTitleFromMarkup = (raw: string) => {
+    const match = String(raw || '').match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    return match ? match[1].replace(/\s+/g, ' ').trim() : '';
+  };
+
+  const handleCaptureProxyFromClipboard = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text || !text.trim()) {
+        alert("Presse-papiers vide.");
+        return;
+      }
+      setWebSourceDraft((prev) => ({
+        ...prev,
+        browserProxyRawContent: text,
+        browserProxyPageTitle: prev.browserProxyPageTitle || extractTitleFromMarkup(text),
+      }));
+    } catch (e) {
+      console.error("Clipboard read failed:", e);
+      alert("Impossible de lire le presse-papiers. Utilisez le collage manuel dans la zone de capture.");
+    }
+  };
+
+  const handleFetchProxyFromRelay = async () => {
+    try {
+      const res = await fetch(`${browserProxyRelayBaseUrl}/latest`);
+      if (!res.ok) {
+        if (res.status === 404) {
+          alert("Aucune capture relay disponible. Lancez d'abord le relay puis capturez un onglet.");
+          return;
+        }
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const payload = await res.json();
+      const snapshot = payload?.snapshot || {};
+      const raw = String(snapshot.rawContent || '');
+      if (!raw.trim()) {
+        alert("Le relay n'a pas retourné de contenu exploitable.");
+        return;
+      }
+      setWebSourceDraft((prev) => ({
+        ...prev,
+        browserProxyPageUrl: String(snapshot.pageUrl || prev.browserProxyPageUrl || prev.url || ''),
+        browserProxyPageTitle: String(snapshot.pageTitle || prev.browserProxyPageTitle || extractTitleFromMarkup(raw)),
+        browserProxyRawContent: raw,
+      }));
+      alert("Capture relay importée dans la source proxy.");
+    } catch (error) {
+      console.error("Relay fetch failed:", error);
+      alert("Impossible de joindre le relay local (http://127.0.0.1:3211). Lancez `npm run proxy-relay`.");
+    }
+  };
 
   const handleAddWebSource = () => {
     const url = webSourceDraft.url.trim();
-    if (!url) {
+    if (!url && webSourceDraft.mode !== 'browser_proxy') {
       alert("URL requise.");
       return;
     }
-    const normalized = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+    const normalized = url
+      ? (/^https?:\/\//i.test(url) ? url : `https://${url}`)
+      : (webSourceDraft.browserProxyPageUrl.trim() || `https://browser-proxy.local/${uuidv4()}`);
+    if (webSourceDraft.mode === 'browser_proxy' && !webSourceDraft.browserProxyRawContent.trim()) {
+      alert("Source proxy vide. Envoyez d'abord un onglet vers le relay puis cliquez 'Charger depuis relay'.");
+      return;
+    }
     const name = webSourceDraft.name.trim() || normalized;
     const source: WebSourceDefinition = {
       id: uuidv4(),
@@ -882,6 +996,15 @@ export default function App() {
       similarityThreshold: clampSimilarity(webSourceDraft.similarityThreshold),
       vectorEngineMode: webSourceDraft.vectorEngineMode || 'local',
       rssMaxItems: clampRssItems(webSourceDraft.rssMaxItems),
+      browserProxySnapshot:
+        webSourceDraft.mode === 'browser_proxy' && webSourceDraft.browserProxyRawContent.trim()
+          ? {
+              pageUrl: webSourceDraft.browserProxyPageUrl.trim() || normalized,
+              pageTitle: webSourceDraft.browserProxyPageTitle.trim() || name,
+              rawContent: webSourceDraft.browserProxyRawContent,
+              capturedAt: Date.now(),
+            }
+          : undefined,
     };
     setWebSources((prev) => [source, ...prev]);
     setWebSourceDraft({
@@ -902,6 +1025,9 @@ export default function App() {
       similarityThreshold: clampSimilarity(source.similarityThreshold ?? selectedSemanticSimilarity),
       vectorEngineMode: source.vectorEngineMode === 'provider' ? 'provider' : 'local',
       rssMaxItems: clampRssItems(source.rssMaxItems ?? 5),
+      browserProxyPageUrl: source.browserProxySnapshot?.pageUrl || '',
+      browserProxyPageTitle: source.browserProxySnapshot?.pageTitle || '',
+      browserProxyRawContent: source.browserProxySnapshot?.rawContent || '',
     });
   };
 
@@ -913,11 +1039,17 @@ export default function App() {
   const handleSaveEditWebSource = () => {
     if (!editingWebSourceId) return;
     const url = webSourceDraft.url.trim();
-    if (!url) {
+    if (!url && webSourceDraft.mode !== 'browser_proxy') {
       alert("URL requise.");
       return;
     }
-    const normalized = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+    const normalized = url
+      ? (/^https?:\/\//i.test(url) ? url : `https://${url}`)
+      : (webSourceDraft.browserProxyPageUrl.trim() || `https://browser-proxy.local/${editingWebSourceId}`);
+    if (webSourceDraft.mode === 'browser_proxy' && !webSourceDraft.browserProxyRawContent.trim()) {
+      alert("Source proxy vide. Envoyez d'abord un onglet vers le relay puis cliquez 'Charger depuis relay'.");
+      return;
+    }
     const name = webSourceDraft.name.trim() || normalized;
     setWebSources((prev) =>
       prev.map((source) =>
@@ -933,6 +1065,15 @@ export default function App() {
               similarityThreshold: clampSimilarity(webSourceDraft.similarityThreshold),
               vectorEngineMode: webSourceDraft.vectorEngineMode || 'local',
               rssMaxItems: clampRssItems(webSourceDraft.rssMaxItems),
+              browserProxySnapshot:
+                webSourceDraft.mode === 'browser_proxy' && webSourceDraft.browserProxyRawContent.trim()
+                  ? {
+                      pageUrl: webSourceDraft.browserProxyPageUrl.trim() || normalized,
+                      pageTitle: webSourceDraft.browserProxyPageTitle.trim() || name,
+                      rawContent: webSourceDraft.browserProxyRawContent,
+                      capturedAt: Date.now(),
+                    }
+                  : undefined,
             }
           : source
       )
@@ -982,6 +1123,15 @@ export default function App() {
       const failureReasons: string[] = [];
       const readErrorMessage = (error: any) =>
         String(error?.message || error?.cause?.message || error || 'Erreur inconnue');
+      const improveWebErrorMessage = (source: WebSourceDefinition, message: string) => {
+        const msg = String(message || '');
+        const is451 = /http 451|error 451|for legal reasons/i.test(msg);
+        const isYahoo = /yahoo\.com/i.test(source.url || '');
+        if (source.mode === 'scrape' && isYahoo && is451) {
+          return `${msg} (Conseil: utilisez la meme source en mode Proxy navigateur puis "Charger depuis relay").`;
+        }
+        return msg;
+      };
 
       for (const source of activeSources) {
         if (webCollectStopRequestedRef.current) {
@@ -1057,15 +1207,29 @@ export default function App() {
                 webDocumentUrl: doc.url || source.url,
               });
               let analysisInput = limitInputForProvider(doc.text, selectedModel, sourceGranularityCore);
-              if (sourceGranularityCore === 'markup' && source.mode === 'scrape') {
-                const targetUrl = doc.url || source.url;
-                try {
-                  const rawMarkup = await fetchRawWebContent(targetUrl);
-                  if (rawMarkup && rawMarkup.trim().length > 0) {
-                    analysisInput = limitInputForProvider(rawMarkup, selectedModel, sourceGranularityCore);
+              if (sourceGranularityCore === 'markup') {
+                if (source.mode === 'browser_proxy' && doc.rawContent && doc.rawContent.trim().length > 0) {
+                  const combinedMarkupInput = buildMarkupAnalysisPayload(
+                    doc.rawContent,
+                    doc.text,
+                    doc.url || source.url
+                  );
+                  analysisInput = limitInputForProvider(combinedMarkupInput, selectedModel, sourceGranularityCore);
+                } else if (source.mode === 'scrape') {
+                  const targetUrl = doc.url || source.url;
+                  try {
+                    const rawMarkup = await fetchRawWebContent(targetUrl);
+                    if (rawMarkup && rawMarkup.trim().length > 0) {
+                      const combinedMarkupInput = buildMarkupAnalysisPayload(
+                        rawMarkup,
+                        doc.text,
+                        targetUrl
+                      );
+                      analysisInput = limitInputForProvider(combinedMarkupInput, selectedModel, sourceGranularityCore);
+                    }
+                  } catch {
+                    // fallback to already-collected text
                   }
-                } catch {
-                  // fallback to already-collected text
                 }
               }
               const isOpenAIRateLimit = (message: string) =>
@@ -1130,7 +1294,7 @@ export default function App() {
               console.error("Web ingest doc failed:", docError);
               failedCount += 1;
               processedCount += 1;
-              const msg = readErrorMessage(docError);
+              const msg = improveWebErrorMessage(source, readErrorMessage(docError));
               failureReasons.push(`[${source.name} / ${doc.title}] ${msg}`);
             } finally {
               setWebCollectProgress({
@@ -1147,7 +1311,7 @@ export default function App() {
         } catch (sourceError) {
           console.error("Web ingest source failed:", sourceError);
           failedCount += 1;
-          const msg = readErrorMessage(sourceError);
+          const msg = improveWebErrorMessage(source, readErrorMessage(sourceError));
           failureReasons.push(`[${source.name}] ${msg}`);
           setWebCollectProgress({
             phase: `Erreur source: ${source.name} (${msg.slice(0, 80)})`,
@@ -1309,6 +1473,7 @@ export default function App() {
       setPotentialCapture(null);
       setIsWizardOpen(false);
       setLastCapturedId(convId);
+      setSourceTab(activeTab);
       setSelectedConvId(convId);
       setActiveTab('conv');
       setTimeout(() => setLastCapturedId(null), 3000);
@@ -1671,7 +1836,7 @@ export default function App() {
                 return (
                   <li key={c.id} className="space-y-2">
                     <div 
-                      onClick={() => { setSelectedConvId(c.id); setActiveTab('conv'); }}
+                      onClick={() => { setSourceTab(activeTab); setSelectedConvId(c.id); setActiveTab('conv'); }}
                       onDoubleClick={() => loadConversationIntoChat(c.id)}
                       className={cn("group flex items-center gap-2 px-3 py-2 rounded-xl cursor-pointer text-sm truncate transition-all", selectedConvId === c.id ? "bg-natural-sand text-natural-heading font-medium" : "hover:bg-natural-sand/50 text-natural-muted")}
                     >
@@ -1681,7 +1846,7 @@ export default function App() {
                     {convSegments.length > 0 && (
                       <div className="ml-6 space-y-1.5 border-l-2 border-natural-sand pl-3">
                         {convSegments.map(s => (
-                          <div key={s.id} onClick={() => { setSelectedConvId(c.id); setActiveTab('conv'); }} className="text-[10px] text-natural-stone hover:text-natural-accent cursor-pointer truncate max-w-full italic font-serif leading-tight">
+                          <div key={s.id} onClick={() => { setSourceTab(activeTab); setSelectedConvId(c.id); setActiveTab('conv'); }} className="text-[10px] text-natural-stone hover:text-natural-accent cursor-pointer truncate max-w-full italic font-serif leading-tight">
                             "{s.content.substring(0, 45)}..."
                           </div>
                         ))}
@@ -1820,7 +1985,7 @@ export default function App() {
                     <div className="bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm space-y-6">
                       <div className="flex items-center gap-3">
                         <div className="p-2 bg-natural-sand rounded-xl text-natural-accent"><Globe className="w-5 h-5" /></div>
-                        <h3 className="font-serif text-xl text-natural-heading">Veille Web (RSS / Scrape)</h3>
+	                        <h3 className="font-serif text-xl text-natural-heading">Veille Web (RSS / Scrape / Proxy)</h3>
                       </div>
                       <p className="text-sm text-natural-muted italic">
                         Chaque adresse web peut être définie en mode RSS ou Scrape, puis collectée automatiquement.
@@ -1832,21 +1997,22 @@ export default function App() {
                           placeholder="Nom source"
                           className="md:col-span-1 p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
                         />
-                        <input
-                          value={webSourceDraft.url}
-                          onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, url: e.target.value }))}
-                          placeholder="https://exemple.com/feed.xml ou article"
-                          className="md:col-span-2 p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
-                        />
+	                        <input
+	                          value={webSourceDraft.url}
+	                          onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, url: e.target.value }))}
+	                          placeholder="https://exemple.com/feed.xml ou article (ou URL de référence proxy)"
+	                          className="md:col-span-2 p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
+	                        />
                         <select
                           value={webSourceDraft.mode}
                           onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, mode: e.target.value as WebSourceMode }))}
                           className="md:col-span-1 p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs font-semibold"
-                        >
-                          <option value="rss">RSS</option>
-                          <option value="scrape">Scrape</option>
-                        </select>
-                      </div>
+	                        >
+	                          <option value="rss">RSS</option>
+	                          <option value="scrape">Scrape</option>
+	                          <option value="browser_proxy">Proxy navigateur</option>
+	                        </select>
+	                      </div>
                       <div className="grid grid-cols-1 md:grid-cols-6 gap-2">
                         <input
                           value={webSourceDraft.titlePrefix}
@@ -1892,21 +2058,83 @@ export default function App() {
                           <option value="provider">Vecteur Provider</option>
                         </select>
                       </div>
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-                        <input
-                          type="number"
-                          min={1}
-                          max={20}
-                          step={1}
-                          value={webSourceDraft.rssMaxItems}
-                          onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, rssMaxItems: Number(e.target.value) }))}
-                          className="p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
-                          title="Nombre max d'items RSS"
-                        />
-                        <p className="md:col-span-2 text-[11px] text-natural-muted">
-                          Parametres appliques a cette source uniquement: granularite, collection, similarite, vecteur, et nombre max d'items RSS.
-                        </p>
-                      </div>
+	                      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+	                        {webSourceDraft.mode === 'rss' && (
+	                          <input
+	                            type="number"
+	                            min={1}
+	                            max={20}
+	                            step={1}
+	                            value={webSourceDraft.rssMaxItems}
+	                            onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, rssMaxItems: Number(e.target.value) }))}
+	                            className="p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
+	                            title="Nombre max d'items RSS"
+	                          />
+	                        )}
+	                        <p className={cn("text-[11px] text-natural-muted", webSourceDraft.mode === 'rss' ? "md:col-span-2" : "md:col-span-3")}>
+	                          Parametres appliques a cette source uniquement: granularite, collection, similarite, vecteur{webSourceDraft.mode === 'rss' ? ", et nombre max d'items RSS." : "."}
+	                        </p>
+	                      </div>
+		                      {webSourceDraft.mode === 'browser_proxy' && (
+		                        <div className="rounded-2xl border border-natural-sand bg-natural-bg/40 p-4 space-y-3">
+		                          <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">Capture proxy navigateur</p>
+		                          <p className="text-[11px] text-natural-muted">
+		                            Mode sans copier-coller manuel: votre navigateur envoie l'onglet au relay local, puis Socrate le charge ici.
+		                          </p>
+		                          <div className="rounded-xl border border-natural-sand bg-white p-3 space-y-2">
+		                            <p className="text-[10px] text-natural-stone">
+		                              1) Lancez le relay local une fois: <span className="font-mono">npm run proxy-relay</span>
+		                            </p>
+		                            <p className="text-[10px] text-natural-stone">
+		                              2) Dans l'onglet cible, exécutez ce bookmarklet (favori URL):
+		                            </p>
+		                            <textarea
+		                              readOnly
+		                              value={`javascript:(async()=>{try{const p={pageUrl:location.href,pageTitle:document.title,rawContent:document.documentElement?document.documentElement.outerHTML:document.body.innerHTML,source:'bookmarklet'};await fetch('http://127.0.0.1:3211/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});alert('Capture envoyee a Socrate');}catch(e){alert('Echec capture: '+e);}})();`}
+		                              className="w-full min-h-[80px] p-2 bg-natural-bg border border-natural-sand rounded-lg text-[10px] font-mono"
+		                            />
+		                          </div>
+		                          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+		                            <input
+		                              value={webSourceDraft.browserProxyPageUrl}
+	                              onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, browserProxyPageUrl: e.target.value }))}
+	                              placeholder="URL de l'onglet capture (optionnel)"
+	                              className="p-3 bg-white border border-natural-sand rounded-xl text-xs"
+	                            />
+	                            <input
+	                              value={webSourceDraft.browserProxyPageTitle}
+	                              onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, browserProxyPageTitle: e.target.value }))}
+	                              placeholder="Titre de la page (optionnel)"
+	                              className="p-3 bg-white border border-natural-sand rounded-xl text-xs"
+	                            />
+	                          </div>
+	                          <textarea
+	                            value={webSourceDraft.browserProxyRawContent}
+	                            onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, browserProxyRawContent: e.target.value }))}
+	                            placeholder="Collez ici le contenu HTML/texte de l'onglet..."
+	                            className="w-full min-h-[140px] p-3 bg-white border border-natural-sand rounded-xl text-xs font-mono"
+	                          />
+		                          <div className="flex items-center gap-2">
+		                            <button
+		                              type="button"
+		                              onClick={handleFetchProxyFromRelay}
+		                              className="px-3 py-2 bg-natural-heading text-white rounded-xl text-[10px] font-black uppercase tracking-widest"
+		                            >
+		                              Charger depuis relay
+		                            </button>
+		                            <button
+		                              type="button"
+		                              onClick={handleCaptureProxyFromClipboard}
+		                              className="px-3 py-2 bg-white border border-natural-sand text-natural-heading rounded-xl text-[10px] font-black uppercase tracking-widest"
+		                            >
+		                              Coller manuel (optionnel)
+		                            </button>
+		                            <span className="text-[10px] text-natural-stone">
+		                              Taille capture: {webSourceDraft.browserProxyRawContent.trim().length.toLocaleString()} caracteres
+	                            </span>
+	                          </div>
+	                        </div>
+	                      )}
                       <div className="flex gap-2">
                         <button
                           onClick={editingWebSourceId ? handleSaveEditWebSource : handleAddWebSource}
@@ -1975,16 +2203,20 @@ export default function App() {
                             <div className="min-w-0 flex-1">
                               <p className="text-xs font-bold text-natural-heading truncate">{source.name}</p>
                               <p className="text-[10px] text-natural-muted truncate">{source.url}</p>
-                              <p className="text-[10px] text-natural-stone truncate">
-                                Titre: {source.titlePrefix || '[WEB]'} | Mode: {source.mode === 'scrape' ? 'Scrape' : 'RSS'} | Granularite: {(granularityProfiles.find((p) => p.id === source.granularityProfileId)?.name) || source.granularityProfileId || 'balanced'} | Similarite: {Number(source.similarityThreshold ?? 0.35).toFixed(2)} | Vecteur: {source.vectorEngineMode || 'local'}{source.mode === 'rss' ? ` | RSS max: ${source.rssMaxItems ?? 5}` : ''}
-                              </p>
-                            </div>
-                            <span className={cn(
-                              "text-[9px] uppercase tracking-widest font-black px-2 py-1 rounded-full",
-                              source.mode === 'rss' ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"
-                            )}>
-                              {source.mode}
-                            </span>
+	                              <p className="text-[10px] text-natural-stone truncate">
+	                                Titre: {source.titlePrefix || '[WEB]'} | Mode: {source.mode === 'scrape' ? 'Scrape' : source.mode === 'browser_proxy' ? 'Proxy navigateur' : 'RSS'} | Granularite: {(granularityProfiles.find((p) => p.id === source.granularityProfileId)?.name) || source.granularityProfileId || 'balanced'} | Similarite: {Number(source.similarityThreshold ?? 0.35).toFixed(2)} | Vecteur: {source.vectorEngineMode || 'local'}{source.mode === 'rss' ? ` | RSS max: ${source.rssMaxItems ?? 5}` : ''}{source.mode === 'browser_proxy' ? ` | Capture: ${source.browserProxySnapshot?.capturedAt ? new Date(source.browserProxySnapshot.capturedAt).toLocaleString() : 'Aucune'}` : ''}
+	                              </p>
+	                            </div>
+	                            <span className={cn(
+	                              "text-[9px] uppercase tracking-widest font-black px-2 py-1 rounded-full",
+	                              source.mode === 'rss'
+	                                ? "bg-emerald-100 text-emerald-700"
+	                                : source.mode === 'scrape'
+	                                  ? "bg-amber-100 text-amber-700"
+	                                  : "bg-sky-100 text-sky-700"
+	                            )}>
+	                              {source.mode}
+	                            </span>
                             <button
                               onClick={() => handleStartEditWebSource(source)}
                               className="px-2 py-1 text-[10px] font-black uppercase tracking-wider rounded-lg border border-natural-sand text-natural-muted hover:text-natural-heading hover:border-natural-beige"
@@ -2787,7 +3019,7 @@ export default function App() {
                           return (
                             <button
                               key={conv.id}
-                              onClick={() => { setSelectedConvId(conv.id); setSourceTab('conv'); setActiveTab('conv'); }}
+                              onClick={() => { setSelectedConvId(conv.id); setSourceTab('files'); setActiveTab('conv'); }}
                               className="text-left bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm hover:shadow-xl hover:translate-y-[-4px] transition-all group relative overflow-hidden"
                             >
                               <div className="absolute top-0 right-0 p-4 opacity-0 group-hover:opacity-100 transition-opacity">

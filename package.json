@@ -4,9 +4,11 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --port=3001 --host=0.0.0.0",
+    "dev": "node scripts/devRunner.mjs",
+    "dev:vite": "vite --port=3001 --host=0.0.0.0",
     "build": "vite build",
     "preview": "vite preview --port=3002 --host=0.0.0.0",
+    "proxy-relay": "node scripts/browserProxyRelay.mjs",
     "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
     "lint": "tsc --noEmit"
   },

@@ -1,6 +1,13 @@
 import { Readability } from '@mozilla/readability';
 
-export type WebSourceMode = 'rss' | 'scrape';
+export type WebSourceMode = 'rss' | 'scrape' | 'browser_proxy';
+
+export interface BrowserProxySnapshot {
+  pageUrl?: string;
+  pageTitle?: string;
+  rawContent: string;
+  capturedAt?: number;
+}
 
 export interface WebSourceDefinition {
   id: string;
@@ -14,6 +21,7 @@ export interface WebSourceDefinition {
   similarityThreshold?: number;
   vectorEngineMode?: 'local' | 'provider';
   rssMaxItems?: number;
+  browserProxySnapshot?: BrowserProxySnapshot;
 }
 
 export interface IngestedDocument {
@@ -23,6 +31,7 @@ export interface IngestedDocument {
   title: string;
   url?: string;
   text: string;
+  rawContent?: string;
   publishedAt?: string;
 }
 
@@ -100,6 +109,30 @@ function extractReadableWebContent(html: string, url?: string, titleHint?: strin
     title: titleHint || '',
     text: stripHtml(raw),
   };
+}
+
+function isLikelyErrorOrBlockedPage(input: { title?: string; text?: string; raw?: string; url?: string }) {
+  const title = String(input.title || '').toLowerCase();
+  const text = String(input.text || '').toLowerCase();
+  const raw = String(input.raw || '').toLowerCase();
+  const url = String(input.url || '').toLowerCase();
+  const probe = `${title}\n${text}\n${raw}`.slice(0, 6000);
+  const patterns = [
+    'oops, something went wrong',
+    'something went wrong',
+    'access denied',
+    'captcha',
+    'robot check',
+    'verify you are human',
+    'error 451',
+    'http 451',
+    'for legal reasons',
+  ];
+  const hasErrorPattern = patterns.some((p) => probe.includes(p));
+  if (!hasErrorPattern) return false;
+  const tinyText = text.trim().length > 0 && text.trim().length < 420;
+  const yahooLike = /yahoo\.com/.test(url) || probe.includes('yahoo');
+  return tinyText || yahooLike;
 }
 
 function truncate(value: string, max = 12000) {
@@ -228,6 +261,9 @@ async function collectFromRss(source: WebSourceDefinition, maxItems = 5): Promis
 async function collectFromScrape(source: WebSourceDefinition): Promise<IngestedDocument[]> {
   const html = await fetchTextWithFallbacks(source.url);
   const readable = extractReadableWebContent(html, source.url, source.name || source.url);
+  if (isLikelyErrorOrBlockedPage({ title: readable.title, text: readable.text, raw: html, url: source.url })) {
+    throw new Error('Page source bloquee ou erreur de rendu (ex: Oops/451/CAPTCHA).');
+  }
   const text = truncate(readable.text, 16000);
   if (!text) return [];
   return [{
@@ -237,6 +273,35 @@ async function collectFromScrape(source: WebSourceDefinition): Promise<IngestedD
     title: readable.title || source.name || source.url,
     url: source.url,
     text,
+    rawContent: html,
+  }];
+}
+
+async function collectFromBrowserProxy(source: WebSourceDefinition): Promise<IngestedDocument[]> {
+  const snapshot = source.browserProxySnapshot;
+  const raw = String(snapshot?.rawContent || '').trim();
+  if (!raw) {
+    throw new Error("Aucune capture proxy disponible pour cette source. Ouvrez l'onglet cible, copiez son contenu, puis collez-le dans la source proxy.");
+  }
+  const pageUrl = String(snapshot?.pageUrl || source.url || '').trim();
+  const pageTitle = String(snapshot?.pageTitle || source.name || pageUrl || source.url || 'Page proxy').trim();
+  const readable = extractReadableWebContent(raw, pageUrl || source.url, pageTitle);
+  if (isLikelyErrorOrBlockedPage({ title: readable.title, text: readable.text, raw, url: pageUrl || source.url })) {
+    throw new Error("Capture proxy invalide (page d'erreur detectee: Oops/451/CAPTCHA).");
+  }
+  const bestText = truncate(getLongestTextCandidate([readable.text, stripHtml(raw)]), 22000);
+  if (!bestText) {
+    throw new Error("Capture proxy vide ou illisible.");
+  }
+  return [{
+    sourceId: source.id,
+    sourceName: source.name || source.url,
+    sourceUrl: source.url,
+    title: readable.title || pageTitle || source.name || source.url,
+    url: pageUrl || source.url,
+    text: bestText,
+    rawContent: raw,
+    publishedAt: snapshot?.capturedAt ? new Date(snapshot.capturedAt).toISOString() : undefined,
   }];
 }
 
@@ -251,6 +316,9 @@ function getYahooFallbackScrapeUrl(sourceUrl: string) {
 }
 
 export async function collectFromWebSource(source: WebSourceDefinition, maxRssItems = 5): Promise<IngestedDocument[]> {
+  if (source.mode === 'browser_proxy') {
+    return collectFromBrowserProxy(source);
+  }
   if (source.mode === 'rss') {
     try {
       return collectFromRss(source, maxRssItems);

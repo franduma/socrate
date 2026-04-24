@@ -1,4 +1,4 @@
-import { 
+import {
   ChevronLeft, 
   Tag, 
   Calendar, 
@@ -21,8 +21,10 @@ import {
   Activity,
   BookOpenText,
   Sparkles,
-  Fingerprint
+  Fingerprint,
+  Settings
 } from 'lucide-react';
+import { Readability } from '@mozilla/readability';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { formatDate, cn } from '../lib/utils';
@@ -75,6 +77,310 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
     const origin = trace.webDocumentUrl || trace.webSourceUrl;
     const originPart = origin ? ` | Origine: ${origin}` : '';
     return `Granularite: ${trace.granularityName} | Collection: ${collection} | Similarite: ${trace.similarityThreshold.toFixed(2)} | Provider: ${trace.provider} | Vecteur: ${vectorMode}${originPart}`;
+  };
+  const decodeEntities = (value: string) =>
+    String(value || '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>');
+
+  const extractReadableFromHtml = (raw: string) => {
+    const html = String(raw || '');
+    if (!/<[a-zA-Z][\w:-]*[\s/>]/.test(html)) return html;
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, 'text/html');
+      doc.querySelectorAll('script,style,noscript,svg').forEach((el) => el.remove());
+      const text = (doc.body?.innerText || doc.body?.textContent || '').trim();
+      return text || html;
+    } catch {
+      return html;
+    }
+  };
+
+  const extractArticleFromHtml = (raw: string) => {
+    const html = String(raw || '');
+    if (!/<[a-zA-Z][\w:-]*[\s/>]/.test(html)) return '';
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, 'text/html');
+      const reader = new Readability(doc, {
+        charThreshold: 120,
+        keepClasses: false,
+        maxElemsToParse: 0,
+      });
+      const article = reader.parse();
+      if (!article) return '';
+      const articleHtml = String(article.content || article.textContent || '').trim();
+      if (!articleHtml) return '';
+      const plain = extractReadableFromHtml(articleHtml);
+      return formatLongTextForReading(plain);
+    } catch {
+      return '';
+    }
+  };
+
+  const formatLongTextForReading = (raw: string) => {
+    const normalized = decodeEntities(String(raw || ''))
+      .replace(/\r/g, '\n')
+      .replace(/\t+/g, ' ')
+      .replace(/\s+[|]\s+/g, '\n')
+      .replace(/\s+[•·]\s+/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+
+    if (!normalized) return normalized;
+    const hasLineBreaks = normalized.includes('\n');
+    if (hasLineBreaks) {
+      const lines = normalized
+        .split(/\n+/)
+        .map((l) => l.replace(/\s+/g, ' ').trim())
+        .filter(Boolean);
+      return lines.join('\n');
+    }
+
+    const sentences = normalized
+      .replace(/\s+/g, ' ')
+      .split(/(?<=[.!?])\s+(?=[A-Z0-9À-ÖØ-Þ])/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (sentences.length >= 5) {
+      const blocks: string[] = [];
+      let current = '';
+      for (const s of sentences) {
+        if (!current) {
+          current = s;
+          continue;
+        }
+        if ((current.length + 1 + s.length) > 320) {
+          blocks.push(current);
+          current = s;
+        } else {
+          current = `${current} ${s}`;
+        }
+      }
+      if (current) blocks.push(current);
+      return blocks.join('\n\n');
+    }
+
+    const words = normalized.split(/\s+/);
+    const rows: string[] = [];
+    let row = '';
+    let count = 0;
+    for (const w of words) {
+      if (!row) {
+        row = w;
+        count = 1;
+        continue;
+      }
+      if (count >= 18) {
+        rows.push(row);
+        row = w;
+        count = 1;
+      } else {
+        row = `${row} ${w}`;
+        count += 1;
+      }
+    }
+    if (row) rows.push(row);
+    return rows.join('\n');
+  };
+
+  const cleanWebChromeNoise = (raw: string) => {
+    let text = String(raw || '');
+    if (!text.trim()) return text;
+    const collapse = text.replace(/\s+/g, ' ').trim();
+
+    const trailingMarkers = [
+      'Nos incontournables',
+      'Toutes les infolettres',
+      'Les plus consultés',
+      'Actualités Vidéos',
+      'Nous joindre',
+      'Exprimez-vous',
+      'Contribuez au dialogue',
+    ];
+    let cutTail = collapse.length;
+    for (const marker of trailingMarkers) {
+      const idx = collapse.indexOf(marker);
+      if (idx >= 0) cutTail = Math.min(cutTail, idx);
+    }
+    text = collapse.slice(0, cutTail);
+
+    // Remove common leading site chrome visible on La Presse pages.
+    text = text.replace(/^.*?(?=Justice et faits divers|Actualités|International|Affaires|Sports|Arts|Société|Gourmand|Voyage|Maison)\s*/i, '');
+
+    const menuNoisePatterns = [
+      /Consulter lapresse\.ca[\s\S]*?Se déconnecter/gi,
+      /Accueil Actualités[\s\S]*?Liens utiles/gi,
+      /Actualités International Dialogue Contexte Affaires Sports Auto Arts[\s\S]*?Votre compte/gi,
+      /Chroniques Éditoriaux Caricatures Analyses National Politique[\s\S]*?Je soutiens La Presse/gi,
+      /Votre compte La Presse[\s\S]*?Se déconnecter/gi,
+      /À propos de La Presse Centre d'aide La Presse/gi,
+      /PHOTO FOURNIE PAR LA SÛRETÉ DU QUÉBEC/gi,
+      /\b\d+\s*\/\s*\d+\b/gi,
+    ];
+    menuNoisePatterns.forEach((pattern) => {
+      text = text.replace(pattern, ' ');
+    });
+
+    // Keep a likely article-centered window when publication timestamp exists.
+    const publishedIdx = text.search(/\bPublié à\b/i);
+    if (publishedIdx > 0) {
+      const start = Math.max(0, publishedIdx - 1200);
+      text = text.slice(start);
+    }
+
+    return text.replace(/\s{2,}/g, ' ').trim();
+  };
+
+  const forceLineWrap = (raw: string, wordsPerLine = 32) => {
+    const words = String(raw || '')
+      .split(/\s+/)
+      .map((w) => w.trim())
+      .filter(Boolean);
+    if (!words.length) return '';
+    const lines: string[] = [];
+    let line: string[] = [];
+    for (const w of words) {
+      line.push(w);
+      if (line.length >= wordsPerLine) {
+        lines.push(line.join(' '));
+        line = [];
+      }
+    }
+    if (line.length) lines.push(line.join(' '));
+    return lines.join('\n');
+  };
+
+  const formatSegmentDisplayText = (segment: Segment) => {
+    const trace = segment.analysisTrace || latestConversationTrace;
+    const granularity = String(trace?.granularityName || '').toLowerCase();
+    const isMarkupWeb = granularity.includes('markup') || granularity.includes('html') || granularity.includes('xml');
+    const source = String(segment.originalText || segment.content || '');
+    let readable = isMarkupWeb ? extractReadableFromHtml(source) : source;
+
+    if (isMarkupWeb && segment.role === 'assistant') {
+      const technical = (segments || []).find((s) => s.role === 'system' && s.conversationId === segment.conversationId);
+      if (technical) {
+        const technicalSource = String(technical.originalText || technical.content || '');
+        const articleReadable = extractArticleFromHtml(technicalSource);
+        const technicalReadable = articleReadable || formatLongTextForReading(
+          extractReadableFromHtml(technicalSource)
+        );
+        const currentReadable = formatLongTextForReading(readable);
+        const technicalLen = technicalReadable.replace(/\s+/g, ' ').trim().length;
+        const currentLen = currentReadable.replace(/\s+/g, ' ').trim().length;
+        // If socratic segment is too short or likely collapsed, prefer article-like text derived from technical source.
+        if (technicalLen > 400 && currentLen < Math.max(220, Math.floor(technicalLen * 0.35))) {
+          readable = technicalReadable;
+        }
+      }
+    }
+
+    let output = formatLongTextForReading(readable);
+    if (isMarkupWeb) {
+      output = formatLongTextForReading(cleanWebChromeNoise(output));
+      const lines = output.split('\n').filter(Boolean);
+      const hasLongLine = lines.some((l) => l.length > 260);
+      if (hasLongLine || lines.length <= 2) {
+        output = forceLineWrap(output, 32);
+      }
+    }
+    return output;
+  };
+
+  const parseWebDisplayZones = (text: string) => {
+    const raw = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!raw) return { title: '', meta: [] as string[], body: '' };
+
+    const title = raw.split(/(?<=[!?\.])\s+/)[0] || '';
+    const meta: string[] = [];
+
+    const extract = (regex: RegExp, label: string) => {
+      const m = raw.match(regex);
+      if (m?.[0]) {
+        const v = m[0].replace(/\s+/g, ' ').trim();
+        if (v) meta.push(`${label}: ${v}`);
+      }
+    };
+
+    extract(/Publié à\s+[0-9h:\s]{2,20}/i, 'Publié');
+    extract(/Mis à jour à\s+[0-9h:\s]{2,20}/i, 'Mis à jour');
+    extract(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i, 'Courriel');
+
+    const accountFlags = [
+      /\bSe connecter\b/i.test(raw),
+      /\bMon profil\b/i.test(raw),
+      /\bMes dons\b/i.test(raw),
+      /\bSe déconnecter\b/i.test(raw),
+    ];
+    if (accountFlags.some(Boolean)) {
+      meta.push('Espace compte détecté');
+    }
+
+    let body = raw
+      .replace(/Publié à\s+[0-9h:\s]{2,20}/gi, ' ')
+      .replace(/Mis à jour à\s+[0-9h:\s]{2,20}/gi, ' ')
+      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, ' ')
+      .replace(/\bSe connecter\b|\bMon profil\b|\bMes dons\b|\bSe déconnecter\b/gi, ' ')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+
+    if (title && body.toLowerCase().startsWith(title.toLowerCase())) {
+      body = body.slice(title.length).trim();
+    }
+
+    body = formatLongTextForReading(body);
+    return { title, meta, body };
+  };
+
+  const renderSegmentContent = (segment: Segment) => {
+    const trace = segment.analysisTrace || latestConversationTrace;
+    const granularity = String(trace?.granularityName || '').toLowerCase();
+    const isMarkupWeb = granularity.includes('markup') || granularity.includes('html') || granularity.includes('xml');
+    const formatted = formatSegmentDisplayText(segment);
+
+    if (!(isMarkupWeb && segment.role === 'assistant')) {
+      return (
+        <div className="text-natural-text leading-relaxed whitespace-pre-wrap text-base md:text-lg font-serif">
+          {formatted}
+        </div>
+      );
+    }
+
+    const zones = parseWebDisplayZones(formatted);
+    return (
+      <div className="space-y-3">
+        {!!zones.title && (
+          <div className="rounded-2xl border border-natural-sand bg-white p-3">
+            <p className="text-[10px] uppercase tracking-widest font-black text-natural-muted">Titre</p>
+            <p className="text-base md:text-lg font-serif text-natural-heading mt-1">{zones.title}</p>
+          </div>
+        )}
+        {zones.meta.length > 0 && (
+          <div className="rounded-2xl border border-natural-sand bg-natural-bg/40 p-3">
+            <p className="text-[10px] uppercase tracking-widest font-black text-natural-muted mb-2">Métadonnées détectées</p>
+            <div className="flex flex-wrap gap-2">
+              {zones.meta.map((m, i) => (
+                <span key={`${m}-${i}`} className="text-[10px] font-bold px-2 py-1 rounded-full bg-white border border-natural-sand text-natural-stone">
+                  {m}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+        <div className="rounded-2xl border border-natural-sand bg-white p-3">
+          <p className="text-[10px] uppercase tracking-widest font-black text-natural-muted">Corps de l’article</p>
+          <p className="text-natural-text leading-relaxed whitespace-pre-wrap text-base md:text-lg font-serif mt-2">
+            {zones.body || formatted}
+          </p>
+        </div>
+      </div>
+    );
   };
   useEffect(() => {
     const handler = (event: Event) => {
@@ -279,21 +585,25 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                   onClick={() => setInspectedSegment(segment)}
                   className={cn(
                     "flex gap-6 p-8 rounded-[32px] border border-natural-sand shadow-sm transition-all hover:shadow-md cursor-zoom-in active:scale-[0.99]",
-                    segment.role === 'assistant' ? 'bg-white' : 'bg-natural-bg',
+                    segment.role === 'assistant' ? 'bg-white' : segment.role === 'system' ? 'bg-natural-peach/20' : 'bg-natural-bg',
                     segment.metadata?.isPivot && 'border-natural-brown border-2'
                   )}
                 >
                   <div className={`mt-1 w-10 h-10 rounded-2xl flex items-center justify-center shrink-0 shadow-sm ${
-                    segment.role === 'assistant' ? 'bg-natural-accent text-white' : 'bg-natural-beige text-natural-muted'
+                    segment.role === 'assistant'
+                      ? 'bg-natural-accent text-white'
+                      : segment.role === 'system'
+                        ? 'bg-natural-brown text-white'
+                        : 'bg-natural-beige text-natural-muted'
                   }`}>
-                    {segment.role === 'assistant' ? <Bot className="w-6 h-6" /> : <User className="w-6 h-6" />}
+                    {segment.role === 'assistant' ? <Bot className="w-6 h-6" /> : segment.role === 'system' ? <Settings className="w-6 h-6" /> : <User className="w-6 h-6" />}
                   </div>
                   
                   <div className="flex-1 space-y-4">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-3">
                         <span className="text-[10px] font-bold text-natural-muted uppercase tracking-[0.2em]">
-                          {segment.role === 'assistant' ? 'Analyse Socratique' : 'Position Initiale'}
+                          {segment.role === 'assistant' ? 'Analyse Socratique' : segment.role === 'system' ? 'Segment Technique' : 'Position Initiale'}
                         </span>
                         <div className="opacity-0 group-hover:opacity-100 transition-opacity bg-natural-sand/50 px-2 py-0.5 rounded text-[9px] font-bold text-natural-muted uppercase text-center min-w-[120px]">Cliquez : Inspecter</div>
                       </div>
@@ -341,9 +651,7 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                         </button>
                       </div>
                     </div>
-                    <div className="text-natural-text leading-relaxed whitespace-pre-wrap text-base md:text-lg font-serif">
-                      {segment.originalText || segment.content}
-                    </div>
+                    {renderSegmentContent(segment)}
                     <div className="text-[10px] text-natural-stone uppercase tracking-wider font-semibold border-t border-dashed border-natural-sand pt-3">
                       Conversation: {conversation.title}
                     </div>
@@ -481,14 +789,18 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                     <div className="flex items-center gap-4">
                       <div className={cn(
                         "w-12 h-12 rounded-2xl flex items-center justify-center shadow-lg",
-                        inspectedSegment.role === 'assistant' ? "bg-natural-accent text-white" : "bg-natural-beige text-natural-muted"
+                        inspectedSegment.role === 'assistant'
+                          ? "bg-natural-accent text-white"
+                          : inspectedSegment.role === 'system'
+                            ? "bg-natural-brown text-white"
+                            : "bg-natural-beige text-natural-muted"
                       )}>
-                        {inspectedSegment.role === 'assistant' ? <Bot className="w-8 h-8" /> : <User className="w-8 h-8" />}
+                        {inspectedSegment.role === 'assistant' ? <Bot className="w-8 h-8" /> : inspectedSegment.role === 'system' ? <Settings className="w-8 h-8" /> : <User className="w-8 h-8" />}
                       </div>
                       <div>
                         <h4 className="font-serif text-2xl text-natural-heading">Inspection du segment</h4>
                         <p className="text-[10px] font-bold text-natural-muted uppercase tracking-widest">
-                          {inspectedSegment.role === 'assistant' ? 'Socrate' : 'Explorateur'} • ID: {inspectedSegment.id.substring(0, 8)}
+                          {inspectedSegment.role === 'assistant' ? 'Socrate' : inspectedSegment.role === 'system' ? 'Technique' : 'Explorateur'} • ID: {inspectedSegment.id.substring(0, 8)}
                         </p>
                         <p className="text-[10px] font-semibold text-natural-stone uppercase tracking-wider mt-1">
                           Conversation: {conversation.title}
@@ -515,10 +827,8 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                         <Quote className="w-3 h-3" />
                         Texte Verbatim (Original)
                       </div>
-                      <div className="text-lg leading-relaxed font-serif text-natural-text pl-6 py-2 bg-natural-bg/30 rounded-r-3xl prose prose-sm prose-slate">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                          {inspectedSegment.originalText || inspectedSegment.content}
-                        </ReactMarkdown>
+                      <div className="text-lg leading-relaxed font-serif text-natural-text pl-6 py-2 bg-natural-bg/30 rounded-r-3xl whitespace-pre-wrap break-words">
+                        {renderSegmentContent(inspectedSegment)}
                       </div>
                     </div>
 
@@ -527,8 +837,8 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                         <BrainCircuit className="w-3 h-3" />
                         Essence (Analyse IA)
                       </div>
-                      <p className="text-sm text-natural-muted italic leading-relaxed">
-                        "{inspectedSegment.content}"
+                      <p className="text-sm text-natural-muted italic leading-relaxed whitespace-pre-wrap break-words">
+                        {formatLongTextForReading(String(inspectedSegment.content || ''))}
                       </p>
                     </div>
 
