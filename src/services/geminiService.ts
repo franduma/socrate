@@ -600,12 +600,48 @@ function extractMarkupReadableText(text: string): string {
     .trim();
 }
 
+function looksLikeCnbcFrontpageMarkup(sourceCode: string, readable: string): boolean {
+  const src = String(sourceCode || "").toLowerCase();
+  const txt = String(readable || "").toLowerCase();
+  return src.includes("cnbc") || txt.includes("cnbc") || src.includes("search.cnbc.com");
+}
+
+function formatRelativeTimeTimeline(readable: string): string {
+  const raw = String(readable || "");
+  if (!raw.trim()) return raw;
+
+  // Force a new line before relative-time markers used in financial frontpages.
+  // Examples: "7 hours ago", "4 hour ago", "26 min ago", "12 minutes ago".
+  const withBreaks = raw.replace(
+    /\s+(?=(?:\d+\s+(?:hours?|hrs?|minutes?|mins?|min)\s+ago)\b)/gi,
+    "\n"
+  );
+
+  const lines = withBreaks
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const timeAnchoredLines = lines.filter((line) =>
+    /^\d+\s+(hours?|hrs?|minutes?|mins?|min)\s+ago\b/i.test(line)
+  );
+
+  // If we found timeline-like rows, prefer those for human readability.
+  if (timeAnchoredLines.length >= 3) {
+    return timeAnchoredLines.join("\n");
+  }
+  return lines.join("\n");
+}
+
 function forceMarkupSplitShape(parsed: any, originalText: string, options?: AnalyzeOptions) {
   if (!isMarkupMode(options)) return;
   if (!looksLikeMarkup(originalText)) return;
 
   const sourceCode = String(originalText || "").trim();
-  const readable = extractMarkupReadableText(sourceCode);
+  let readable = extractMarkupReadableText(sourceCode);
+  if (looksLikeCnbcFrontpageMarkup(sourceCode, readable)) {
+    readable = formatRelativeTimeTimeline(readable);
+  }
   const existingSegments = Array.isArray(parsed?.segments) ? parsed.segments : [];
   const maxSegmentTextLen = existingSegments.reduce((max: number, s: any) => {
     const len = String(s?.originalText || s?.content || "").trim().length;
