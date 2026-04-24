@@ -239,15 +239,45 @@ function buildLocalInterpretation(text: string, role: Segment["role"]): string {
   return `Lecture locale: segment ${questionTone}, posture "${posture}", rôle détecté "${role}".`;
 }
 
+function isWeakGraphLabel(label: string) {
+  const l = String(label || "").trim().toLowerCase();
+  if (!l) return true;
+  if (/^\d+([.,]\d+)?$/.test(l)) return true;
+  if (/^(analyse|analysis|position|segment)\s*\d*$/i.test(l)) return true;
+  return false;
+}
+
+function makeInformativeLabelFromText(text: string, fallback: string) {
+  const tokens = tokenizeSemantic(String(text || ""))
+    .filter((t) => t.length >= 3 && !/^\d+$/.test(t))
+    .slice(0, 7);
+  if (!tokens.length) return fallback;
+  return truncateText(tokens.join(" "), 62);
+}
+
+function cleanGraphNodeLabel(label: string, contextText = "", fallback = "Concept") {
+  const candidate = String(label || "").trim();
+  if (!candidate || isWeakGraphLabel(candidate)) {
+    return makeInformativeLabelFromText(contextText, fallback);
+  }
+  return truncateText(candidate, 62);
+}
+
 function buildFallbackSegmentGraph(segment: any, index = 0) {
   const sourceText = String(segment.originalText || segment.content || "");
   const topTokens = tokenizeSemantic(sourceText).slice(0, 4);
   const centerId = `seg-core-${index}`;
   const centerAbstraction = segment.role === "assistant" ? "conceptuel" : "concret";
+  const centerFallback = segment.role === "assistant" ? `Analyse ${index + 1}` : `Position ${index + 1}`;
+  const centerLabel = cleanGraphNodeLabel(
+    centerFallback,
+    sourceText,
+    centerFallback
+  );
   const nodes: Array<{ id: string; label: string; type: string; properties?: Record<string, any> }> = [
     {
       id: centerId,
-      label: segment.role === "assistant" ? `Analyse ${index + 1}` : `Position ${index + 1}`,
+      label: centerLabel,
       type: segment.role === "assistant" ? "Analysis" : "Question",
       properties: {
         semanticPosition: segment.role === "assistant" ? "analyse_socratique" : "position_initiale",
@@ -309,9 +339,10 @@ function buildFallbackConversationGraph(parsed: any): {
     const sid = `node-seg-${i}`;
     segmentNodeIds.push(sid);
     const rawLabel = String(seg?.content || seg?.originalText || `Segment ${i + 1}`);
+    const readableLabel = cleanGraphNodeLabel(rawLabel, rawLabel, `Segment ${i + 1}`);
     nodes.push({
       id: sid,
-      label: truncateText(rawLabel, 62),
+      label: readableLabel,
       type: seg?.role === "assistant" ? "SocraticAnalysis" : "InitialPosition",
       properties: {
         index: i,
@@ -559,6 +590,52 @@ function forceIntactFreeTextShape(parsed: any, originalText: string, options?: A
   ];
 }
 
+function forceSingleBlockSocraticPair(parsed: any, originalText: string, options?: AnalyzeOptions) {
+  if (isMarkupMode(options)) return;
+  if (looksLikeStructuredDialog(originalText)) return;
+
+  const existingSegments = Array.isArray(parsed?.segments) ? parsed.segments : [];
+  if (existingSegments.length !== 1) return;
+
+  const seg = existingSegments[0] || {};
+  const role = String(seg?.role || "").toLowerCase();
+  const content = String(seg?.originalText || seg?.content || "").trim();
+  const fullText = String(originalText || "").trim();
+  if (!content || !fullText) return;
+
+  const hasAssistant = existingSegments.some((s: any) => {
+    const r = String(s?.role || "").toLowerCase();
+    return r === "assistant" || r === "system";
+  });
+  if (hasAssistant) return;
+
+  const longEnough = content.length >= 80 || fullText.length >= 80;
+  if (!longEnough) return;
+  if (isQuestionLike(content)) return;
+
+  const inferredQuestion = inferQuestionFromAnalysis(content);
+  parsed.segments = [
+    {
+      content: inferredQuestion,
+      originalText: inferredQuestion,
+      role: "user",
+      semanticSignature: `monoblock-q-${uuidv4().substring(0, 8)}`,
+      tags: ["question-inferree", "fallback-monobloc"],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: { reason: "Question inferee: segmentation initiale monobloc detectee." },
+    },
+    {
+      content: fullText,
+      originalText: fullText,
+      role: "assistant",
+      semanticSignature: `monoblock-a-${uuidv4().substring(0, 8)}`,
+      tags: ["analyse-socratique-detectee", "fallback-monobloc"],
+      knowledgeGraph: seg?.knowledgeGraph || { nodes: [], edges: [] },
+      metadata: { reason: "Texte libre conserve comme analyse socratique (normalisation monobloc)." },
+    },
+  ];
+}
+
 function isMarkupMode(options?: AnalyzeOptions): boolean {
   if (options?.granularity === "markup") return true;
   const instruction = String(options?.customSegmentationInstruction || "").toLowerCase();
@@ -786,6 +863,7 @@ function normalizeAnalysisPayload(parsed: any, originalText: string, options?: A
   const safeParsed = parsed || {};
   forceIntactFreeTextShape(safeParsed, originalText, options);
   forceMarkupSplitShape(safeParsed, originalText, options);
+  forceSingleBlockSocraticPair(safeParsed, originalText, options);
 
   if (!safeParsed.segments || safeParsed.segments.length === 0) {
     safeParsed.segments = [
@@ -813,15 +891,17 @@ function normalizeAnalysisPayload(parsed: any, originalText: string, options?: A
 
   const globalKg = safeParsed.analysis.knowledgeGraph || { nodes: [], edges: [] };
   globalKg.nodes = (globalKg.nodes || []).map((n: any) => {
+    const contextText = String(n?.properties?.sourceText || n?.properties?.context || n?.properties?.snippet || "");
+    const cleanedLabel = cleanGraphNodeLabel(String(n?.label || n?.id || ""), contextText, "Concept");
     const level = normalizeAbstractionLevel(
       (n.properties && (n.properties.abstractionLevel || n.properties.abstraction_level)) ||
-      inferAbstractionLevel(String(n.label || n.id || ""), String(n.type || "Concept"))
+      inferAbstractionLevel(String(cleanedLabel || n.id || ""), String(n.type || "Concept"))
     );
     const scoreRaw = Number((n.properties && (n.properties.abstractionScore ?? n.properties.abstraction_score)) ?? ABSTRACTION_SCORE_BY_LEVEL[level]);
     const score = Number.isFinite(scoreRaw) ? Math.max(0, Math.min(1, scoreRaw)) : ABSTRACTION_SCORE_BY_LEVEL[level];
     return {
       id: n.id || uuidv4(),
-      label: n.label || n.id || "Unit",
+      label: cleanedLabel || n.id || "Unit",
       type: n.type || "Concept",
       properties: {
         ...(n.properties || {}),
@@ -842,15 +922,17 @@ function normalizeAnalysisPayload(parsed: any, originalText: string, options?: A
   safeParsed.segments = safeParsed.segments.map((seg: any) => {
     const localKg = seg.knowledgeGraph || { nodes: [], edges: [] };
     localKg.nodes = (localKg.nodes || []).map((n: any) => {
+      const contextText = String(seg?.originalText || seg?.content || n?.properties?.sourceText || "");
+      const cleanedLabel = cleanGraphNodeLabel(String(n?.label || n?.id || ""), contextText, "Concept");
       const level = normalizeAbstractionLevel(
         (n.properties && (n.properties.abstractionLevel || n.properties.abstraction_level)) ||
-        inferAbstractionLevel(String(n.label || n.id || ""), String(n.type || "Concept"))
+        inferAbstractionLevel(String(cleanedLabel || n.id || ""), String(n.type || "Concept"))
       );
       const scoreRaw = Number((n.properties && (n.properties.abstractionScore ?? n.properties.abstraction_score)) ?? ABSTRACTION_SCORE_BY_LEVEL[level]);
       const score = Number.isFinite(scoreRaw) ? Math.max(0, Math.min(1, scoreRaw)) : ABSTRACTION_SCORE_BY_LEVEL[level];
       return {
         id: n.id || uuidv4(),
-        label: n.label || n.id || "Unit",
+        label: cleanedLabel || n.id || "Unit",
         type: n.type || "Concept",
         properties: {
           ...(n.properties || {}),

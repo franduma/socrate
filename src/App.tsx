@@ -453,6 +453,7 @@ export default function App() {
 
   const conversations = useLiveQuery(() => db.conversations.orderBy('updatedAt').reverse().toArray()) || [];
   const files = useLiveQuery(() => db.files.toArray()) || [];
+  const webImportedConversations = conversations.filter((c) => !!(c.analysisTrace?.webSourceUrl || c.analysisTrace?.webDocumentUrl));
   const segments = useLiveQuery(() => db.segments.toArray()) || [];
   const facettesList = useLiveQuery(() => db.facettes.toArray()) || [];
   const facetCollections = useLiveQuery(() => db.facetCollections.toArray()) || [];
@@ -815,6 +816,19 @@ export default function App() {
     }
     await registerSemanticAttributesFromAnalysis(enrichedResult.analysis, enrichedResult.segments);
     return convId;
+  };
+
+  const handleDeleteFileImport = async (fileId: string) => {
+    await db.files.delete(fileId);
+  };
+
+  const handleDeleteWebImport = async (conversationId: string) => {
+    await db.segments.where('conversationId').equals(conversationId).delete();
+    await db.conversations.delete(conversationId);
+    if (selectedConvId === conversationId) {
+      setSelectedConvId(null);
+      setActiveTab('files');
+    }
   };
 
   const clampSimilarity = (value: number) => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0.35));
@@ -1643,7 +1657,7 @@ export default function App() {
           <nav className="px-3 space-y-1.5">
             <NavItem icon={<MessageSquare className="w-4 h-4" />} label="Conversations" active={activeTab === 'conv'} onClick={() => { setActiveTab('conv'); setSelectedConvId(null); }} count={conversations.length} />
             <NavItem icon={<Quote className="w-4 h-4" />} label="Segments" active={activeTab === 'segments'} onClick={() => { setActiveTab('segments'); setSelectedConvId(null); }} />
-            <NavItem icon={<FileText className="w-4 h-4" />} label="Fichiers" active={activeTab === 'files'} onClick={() => { setActiveTab('files'); setSelectedConvId(null); }} count={files.length} />
+            <NavItem icon={<FileText className="w-4 h-4" />} label="Imports" active={activeTab === 'files'} onClick={() => { setActiveTab('files'); setSelectedConvId(null); }} count={files.length + conversations.filter((c) => !!(c.analysisTrace?.webSourceUrl || c.analysisTrace?.webDocumentUrl)).length} />
             <NavItem icon={<Settings className="w-4 h-4" />} label="Paramètres" active={activeTab === 'settings'} onClick={() => { setActiveTab('settings'); setSelectedConvId(null); }} />
             <NavItem icon={<MessageSquare className="w-4 h-4" />} label="Chat Socrate" active={activeTab === 'chat'} onClick={() => { setActiveTab('chat'); setSelectedConvId(null); }} />
           </nav>
@@ -2689,8 +2703,8 @@ export default function App() {
                     <div className="flex items-center gap-6">
                       <div className="w-16 h-16 bg-natural-accent rounded-[24px] flex items-center justify-center shadow-xl shadow-natural-accent/20"><FileText className="w-8 h-8 text-white" /></div>
                       <div>
-                        <h1 className="font-serif text-4xl text-natural-heading mb-2">Bibliothèque de Fichiers</h1>
-                        <p className="text-natural-muted text-xs uppercase tracking-[0.3em] font-black opacity-60">Matériau brut & Transcriptions</p>
+                        <h1 className="font-serif text-4xl text-natural-heading mb-2">Bibliothèque des imports</h1>
+                        <p className="text-natural-muted text-xs uppercase tracking-[0.3em] font-black opacity-60">Section Fichiers + Section Web</p>
                       </div>
                     </div>
                     <button 
@@ -2710,37 +2724,114 @@ export default function App() {
                       Vider la bibliothèque
                     </button>
                   </header>
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-                    {files.map(f => (
-                      <div key={f.id} className="bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm hover:shadow-xl hover:translate-y-[-4px] transition-all cursor-pointer group relative overflow-hidden">
-                        <div className="absolute top-0 right-0 p-4 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <div className="w-10 h-10 bg-natural-sand/50 rounded-full flex items-center justify-center text-natural-accent">
-                            <ChevronRight className="w-5 h-5" />
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-4 mb-6">
-                          <div className="w-12 h-12 bg-natural-bg rounded-2xl flex items-center justify-center text-natural-muted group-hover:bg-natural-accent/10 group-hover:text-natural-accent transition-colors"><FileText className="w-6 h-6" /></div>
-                          <h4 className="font-serif text-xl text-natural-heading truncate flex-1 leading-tight">{f.name}</h4>
-                        </div>
-                        <div className="space-y-6">
-                          <p className="text-sm text-natural-muted line-clamp-4 italic leading-relaxed opacity-80">
-                            {f.content.substring(0, 200)}...
-                          </p>
-                          <div className="flex flex-wrap gap-2 pt-4 border-t border-natural-sand/50">
-                            {f.tags.map(t => <span key={t} className="text-[10px] font-black uppercase tracking-widest px-3 py-1 bg-natural-sand/50 rounded-full text-natural-muted">{t}</span>)}
-                          </div>
-                        </div>
+                  <div className="space-y-8">
+                    <section className="space-y-4">
+                      <div className="flex items-center gap-3">
+                        <FileText className="w-4 h-4 text-natural-accent" />
+                        <h2 className="font-serif text-2xl text-natural-heading">Fichiers</h2>
                       </div>
-                    ))}
-                    {files.length === 0 && (
-                      <div className="md:col-span-3 py-32 text-center bg-white/40 rounded-[48px] border-2 border-dashed border-natural-sand">
-                        <div className="w-20 h-20 bg-natural-sand/50 rounded-full flex items-center justify-center mx-auto mb-6 text-natural-muted">
-                          <FileText className="w-10 h-10" />
-                        </div>
-                        <p className="font-serif italic text-2xl text-natural-muted">Votre bibliothèque est vide.</p>
-                        <p className="text-xs uppercase tracking-widest font-black text-natural-stone mt-2">Importez des documents depuis la capture rapide</p>
+                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                        {files.map(f => (
+                          <div key={f.id} className="bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm hover:shadow-xl hover:translate-y-[-4px] transition-all cursor-pointer group relative overflow-hidden">
+                            <div className="absolute top-0 right-0 p-4 opacity-0 group-hover:opacity-100 transition-opacity">
+                              <div className="w-10 h-10 bg-natural-sand/50 rounded-full flex items-center justify-center text-natural-accent">
+                                <ChevronRight className="w-5 h-5" />
+                              </div>
+                            </div>
+                            <button
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                if (!confirm(`Supprimer cet import fichier ?\n\n${f.name}`)) return;
+                                await handleDeleteFileImport(f.id);
+                              }}
+                              className="absolute top-4 left-4 p-2 rounded-xl text-natural-stone hover:text-red-500 hover:bg-red-50 border border-transparent hover:border-red-100 opacity-0 group-hover:opacity-100 transition-all"
+                              title="Supprimer cet import"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                            <div className="flex items-center gap-4 mb-6">
+                              <div className="w-12 h-12 bg-natural-bg rounded-2xl flex items-center justify-center text-natural-muted group-hover:bg-natural-accent/10 group-hover:text-natural-accent transition-colors"><FileText className="w-6 h-6" /></div>
+                              <h4 className="font-serif text-xl text-natural-heading truncate flex-1 leading-tight">{f.name}</h4>
+                            </div>
+                            <div className="space-y-6">
+                              <p className="text-sm text-natural-muted line-clamp-4 italic leading-relaxed opacity-80">
+                                {f.content.substring(0, 200)}...
+                              </p>
+                              <div className="flex flex-wrap gap-2 pt-4 border-t border-natural-sand/50">
+                                {f.tags.map(t => <span key={t} className="text-[10px] font-black uppercase tracking-widest px-3 py-1 bg-natural-sand/50 rounded-full text-natural-muted">{t}</span>)}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                        {files.length === 0 && (
+                          <div className="md:col-span-3 py-20 text-center bg-white/40 rounded-[48px] border-2 border-dashed border-natural-sand">
+                            <div className="w-16 h-16 bg-natural-sand/50 rounded-full flex items-center justify-center mx-auto mb-4 text-natural-muted">
+                              <FileText className="w-8 h-8" />
+                            </div>
+                            <p className="font-serif italic text-xl text-natural-muted">Aucun fichier importé.</p>
+                            <p className="text-xs uppercase tracking-widest font-black text-natural-stone mt-2">Importez des documents depuis la capture rapide</p>
+                          </div>
+                        )}
                       </div>
-                    )}
+                    </section>
+
+                    <section className="space-y-4">
+                      <div className="flex items-center gap-3">
+                        <Globe className="w-4 h-4 text-natural-accent" />
+                        <h2 className="font-serif text-2xl text-natural-heading">Web</h2>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                        {webImportedConversations.map((conv) => {
+                          const trace = conv.analysisTrace;
+                          const origin = trace?.webDocumentUrl || trace?.webSourceUrl || '';
+                          return (
+                            <button
+                              key={conv.id}
+                              onClick={() => { setSelectedConvId(conv.id); setSourceTab('conv'); setActiveTab('conv'); }}
+                              className="text-left bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm hover:shadow-xl hover:translate-y-[-4px] transition-all group relative overflow-hidden"
+                            >
+                              <div className="absolute top-0 right-0 p-4 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <div className="w-10 h-10 bg-natural-sand/50 rounded-full flex items-center justify-center text-natural-accent">
+                                  <ChevronRight className="w-5 h-5" />
+                                </div>
+                              </div>
+                              <span
+                                onClick={async (e) => {
+                                  e.stopPropagation();
+                                  if (!confirm(`Supprimer cet import web ?\n\n${conv.title}`)) return;
+                                  await handleDeleteWebImport(conv.id);
+                                }}
+                                className="absolute top-4 left-4 p-2 rounded-xl text-natural-stone hover:text-red-500 hover:bg-red-50 border border-transparent hover:border-red-100 opacity-0 group-hover:opacity-100 transition-all"
+                                title="Supprimer cet import"
+                                role="button"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </span>
+                              <div className="flex items-center gap-4 mb-4">
+                                <div className="w-12 h-12 bg-natural-bg rounded-2xl flex items-center justify-center text-natural-muted group-hover:bg-natural-accent/10 group-hover:text-natural-accent transition-colors"><Globe className="w-6 h-6" /></div>
+                                <h4 className="font-serif text-xl text-natural-heading line-clamp-2 leading-tight">{conv.title}</h4>
+                              </div>
+                              <p className="text-[11px] text-natural-muted uppercase tracking-wider font-semibold">Origine</p>
+                              <p className="text-xs text-natural-stone break-all line-clamp-2 mt-1">{origin || 'URL indisponible'}</p>
+                              {trace && (
+                                <p className="text-[10px] text-natural-muted mt-4 uppercase tracking-wider">
+                                  {trace.granularityName} | sim {Number(trace.similarityThreshold ?? 0.35).toFixed(2)} | {trace.vectorEngineMode || 'local'}
+                                </p>
+                              )}
+                            </button>
+                          );
+                        })}
+                        {webImportedConversations.length === 0 && (
+                          <div className="md:col-span-3 py-20 text-center bg-white/40 rounded-[48px] border-2 border-dashed border-natural-sand">
+                            <div className="w-16 h-16 bg-natural-sand/50 rounded-full flex items-center justify-center mx-auto mb-4 text-natural-muted">
+                              <Globe className="w-8 h-8" />
+                            </div>
+                            <p className="font-serif italic text-xl text-natural-muted">Aucun import Web.</p>
+                            <p className="text-xs uppercase tracking-widest font-black text-natural-stone mt-2">Lancez une collecte dans Réglages → Veille Web</p>
+                          </div>
+                        )}
+                      </div>
+                    </section>
                   </div>
                 </motion.div>
             ) : activeTab === 'segments' && !selectedConvId ? (

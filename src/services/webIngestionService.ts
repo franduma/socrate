@@ -1,3 +1,5 @@
+import { Readability } from '@mozilla/readability';
+
 export type WebSourceMode = 'rss' | 'scrape';
 
 export interface WebSourceDefinition {
@@ -35,6 +37,69 @@ function stripHtml(value: string) {
     .replace(/&#39;/g, "'")
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function extractLongestTextFromSelectors(doc: Document) {
+  const selectors = [
+    'article',
+    'main',
+    '[role="main"]',
+    '.article-body',
+    '.article-content',
+    '.post-content',
+    '.entry-content',
+    '#content',
+    '#main',
+  ];
+  let best = '';
+  selectors.forEach((selector) => {
+    doc.querySelectorAll(selector).forEach((node) => {
+      const text = stripHtml((node as HTMLElement).innerText || node.textContent || '');
+      if (text.length > best.length) best = text;
+    });
+  });
+  return best;
+}
+
+function extractReadableWebContent(html: string, url?: string, titleHint?: string) {
+  const raw = String(html || '');
+  if (!raw.trim()) {
+    return { title: titleHint || '', text: '' };
+  }
+
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(raw, 'text/html');
+
+    const readability = new Readability(doc, {
+      charThreshold: 120,
+      keepClasses: false,
+      maxElemsToParse: 0,
+    });
+    const article = readability.parse();
+    const readableText = stripHtml(article?.content || article?.textContent || '');
+    if (readableText.length >= 120) {
+      return {
+        title: (article?.title || titleHint || '').trim(),
+        text: readableText,
+      };
+    }
+
+    const heuristic = extractLongestTextFromSelectors(doc);
+    if (heuristic.length >= 80) {
+      return {
+        title: titleHint || doc.title || '',
+        text: heuristic,
+      };
+    }
+  } catch {
+    // Fallback below
+  }
+
+  return {
+    title: titleHint || '',
+    text: stripHtml(raw),
+  };
 }
 
 function truncate(value: string, max = 12000) {
@@ -125,10 +190,15 @@ async function collectFromRss(source: WebSourceDefinition, maxItems = 5): Promis
       if (!doc.url) return doc;
       try {
         const html = await fetchTextWithFallbacks(doc.url);
-        const articleText = truncate(stripHtml(html), 22000);
+        const readable = extractReadableWebContent(html, doc.url, doc.title);
+        const articleText = truncate(readable.text, 22000);
         const bestText = getLongestTextCandidate([articleText, doc.text]);
         const composed = truncate(
-          [doc.publishedAt ? `Published: ${doc.publishedAt}` : '', doc.title, bestText || doc.text]
+          [
+            doc.publishedAt ? `Published: ${doc.publishedAt}` : '',
+            readable.title || doc.title,
+            bestText || doc.text,
+          ]
             .filter(Boolean)
             .join('\n\n'),
           22000
@@ -157,13 +227,14 @@ async function collectFromRss(source: WebSourceDefinition, maxItems = 5): Promis
 
 async function collectFromScrape(source: WebSourceDefinition): Promise<IngestedDocument[]> {
   const html = await fetchTextWithFallbacks(source.url);
-  const text = truncate(stripHtml(html), 16000);
+  const readable = extractReadableWebContent(html, source.url, source.name || source.url);
+  const text = truncate(readable.text, 16000);
   if (!text) return [];
   return [{
     sourceId: source.id,
     sourceName: source.name || source.url,
     sourceUrl: source.url,
-    title: source.name || source.url,
+    title: readable.title || source.name || source.url,
     url: source.url,
     text,
   }];
