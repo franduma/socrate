@@ -491,9 +491,15 @@ function reconcileSocraticRoles(segments: any[]): any[] {
 }
 
 function looksLikeStructuredDialog(text: string): boolean {
-  const t = String(text || "").toLowerCase();
-  if (/\[(user|assistant|system)\]/.test(t)) return true;
-  if (/\b(question|reponse|réponse|q:|r:|user:|assistant:)\b/.test(t)) return true;
+  const lines = String(text || "")
+    .toLowerCase()
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.some((l) => /^\[(user|assistant|system)\]/.test(l))) return true;
+  if (lines.some((l) => /^(user|assistant|system)\s*:/.test(l))) return true;
+  if (lines.some((l) => /^(q|r)\s*:/.test(l))) return true;
+  if (lines.some((l) => /^(question|reponse|réponse)\s*:/.test(l))) return true;
   return false;
 }
 
@@ -516,6 +522,17 @@ function forceIntactFreeTextShape(parsed: any, originalText: string, options?: A
 
   const inferredQuestion = inferQuestionFromAnalysis(originalText);
   const fullText = String(originalText || "").trim() || "Texte indisponible.";
+  const existingSegments = Array.isArray(parsed?.segments) ? parsed.segments : [];
+  const roles = new Set(existingSegments.map((s: any) => String(s?.role || "").toLowerCase()));
+  const maxSegmentTextLen = existingSegments.reduce((max: number, s: any) => {
+    const len = String(s?.originalText || s?.content || "").trim().length;
+    return Math.max(max, len);
+  }, 0);
+  const coverage = fullText.length ? maxSegmentTextLen / fullText.length : 0;
+  const alreadyHasQuestionAndAnalysis = roles.has("user") && (roles.has("assistant") || roles.has("system"));
+
+  // Keep provider output only if it really preserves long-block structure and content coverage.
+  if (alreadyHasQuestionAndAnalysis && coverage >= 0.75) return;
 
   parsed.segments = [
     {
