@@ -15,6 +15,7 @@ export interface SegmentationTrace {
   semanticCollectionName?: string;
   semanticAttributeLabels: string[];
   similarityThreshold: number;
+  includeTechnicalSegment?: boolean;
   webSourceName?: string;
   webSourceUrl?: string;
   webDocumentTitle?: string;

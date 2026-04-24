@@ -273,6 +273,11 @@ export default function App() {
   const [vectorEngineMode, setVectorEngineMode] = useState<'local' | 'provider'>(
     (localStorage.getItem('VECTOR_ENGINE_MODE') as any) || 'local'
   );
+  const [includeTechnicalSegment, setIncludeTechnicalSegment] = useState<boolean>(() => {
+    const raw = localStorage.getItem('INCLUDE_TECHNICAL_SEGMENT');
+    if (raw == null) return true;
+    return raw !== 'false';
+  });
   const [selectedGranularityId, setSelectedGranularityId] = useState<string>(
     localStorage.getItem('SEGMENT_GRANULARITY_PROFILE_ID') ||
     localStorage.getItem('SEGMENT_GRANULARITY') ||
@@ -377,6 +382,9 @@ export default function App() {
     localStorage.setItem('VECTOR_ENGINE_MODE', vectorEngineMode);
     window.dispatchEvent(new CustomEvent('vector-engine-mode-changed', { detail: { mode: vectorEngineMode } }));
   }, [vectorEngineMode]);
+  useEffect(() => {
+    localStorage.setItem('INCLUDE_TECHNICAL_SEGMENT', includeTechnicalSegment ? 'true' : 'false');
+  }, [includeTechnicalSegment]);
 
   useEffect(() => {
     localStorage.setItem('SEGMENT_GRANULARITY_PROFILE_ID', selectedGranularityId);
@@ -559,6 +567,7 @@ export default function App() {
     similarityThreshold: Number.isFinite(overrides?.similarityThreshold as number)
       ? (overrides?.similarityThreshold as number)
       : selectedSemanticSimilarity,
+    includeTechnicalSegment: overrides?.includeTechnicalSegment ?? includeTechnicalSegment,
     webSourceName: overrides?.webSourceName,
     webSourceUrl: overrides?.webSourceUrl,
     webDocumentTitle: overrides?.webDocumentTitle,
@@ -570,7 +579,8 @@ export default function App() {
     const collection = trace.semanticCollectionName || 'aucune-collection';
     const sim = Number.isFinite(trace.similarityThreshold) ? trace.similarityThreshold.toFixed(2) : '0.35';
     const vector = trace.vectorEngineMode || 'local';
-    return `[${granularity} | ${collection} | sim:${sim} | vec:${vector}]`;
+    const tech = trace.includeTechnicalSegment === false ? 'tech:off' : 'tech:on';
+    return `[${granularity} | ${collection} | sim:${sim} | vec:${vector} | ${tech}]`;
   };
 
   useEffect(() => {
@@ -904,7 +914,11 @@ export default function App() {
     if (!top.length) return "Quelle est la question de fond qui éclaire cet article ?";
     return `Comment interpréter les liens entre ${top.join(', ')} dans cet article ?`;
   };
-  const ensureMarkupProxyCoverage = (result: any, doc: { text?: string; rawContent?: string }) => {
+  const ensureMarkupProxyCoverage = (
+    result: any,
+    doc: { text?: string; rawContent?: string },
+    options?: { includeTechnicalSegment?: boolean }
+  ) => {
     const fullReadable = String(doc?.text || '').trim();
     if (!fullReadable || fullReadable.length < 220) return result;
     const segments = Array.isArray(result?.segments) ? result.segments : [];
@@ -944,7 +958,7 @@ export default function App() {
       },
     ];
     const raw = String(doc?.rawContent || '').trim();
-    if (raw) {
+    if (raw && options?.includeTechnicalSegment !== false) {
       rebuiltSegments.push({
         content: 'CODE_MARKUP_SOURCE',
         originalText: raw,
@@ -1322,6 +1336,7 @@ export default function App() {
                     semanticAttributeLabels: sourceSemanticAttributes.map((a) => a.label),
                     similarityThreshold: sourceSimilarity,
                     vectorEngineMode: sourceVectorMode,
+                    includeTechnicalSegment,
                   });
                   break;
                 } catch (providerError: any) {
@@ -1347,7 +1362,11 @@ export default function App() {
                 throw new Error("Analyse indisponible apres retries OpenAI.");
               }
               if (sourceGranularityCore === 'markup' && source.mode === 'browser_proxy') {
-                result = ensureMarkupProxyCoverage(result, { text: doc.text, rawContent: doc.rawContent });
+                result = ensureMarkupProxyCoverage(
+                  result,
+                  { text: doc.text, rawContent: doc.rawContent },
+                  { includeTechnicalSegment }
+                );
               }
               const enrichedResult = {
                 ...result,
@@ -1453,6 +1472,7 @@ export default function App() {
         semanticAttributeLabels: selectedSemanticAttributes.map((a) => a.label),
         similarityThreshold: selectedSemanticSimilarity,
         vectorEngineMode,
+        includeTechnicalSegment,
       });
       const enrichedResult = {
         ...result,
@@ -1806,6 +1826,7 @@ export default function App() {
         semanticAttributeLabels: selectedSemanticAttributes.map((a) => a.label),
         similarityThreshold: selectedSemanticSimilarity,
         vectorEngineMode,
+        includeTechnicalSegment,
       });
       const enrichedResult = {
         ...result,
@@ -2058,6 +2079,25 @@ export default function App() {
                         <p className="text-[10px] text-natural-stone uppercase tracking-wider">
                           Mode actif: {vectorEngineMode === 'local' ? 'Local Vector (PC)' : 'Provider Vector (API)'}
                         </p>
+                        <div className="rounded-xl border border-natural-sand bg-white p-3 flex items-center justify-between gap-3">
+                          <div>
+                            <p className="text-[10px] font-black uppercase tracking-widest text-natural-heading">Segment technique</p>
+                            <p className="text-[11px] text-natural-muted">
+                              Active ou masque le segment technique (code/markup) pendant l'analyse.
+                            </p>
+                          </div>
+                          <button
+                            onClick={() => setIncludeTechnicalSegment((prev) => !prev)}
+                            className={cn(
+                              "px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest border transition-all",
+                              includeTechnicalSegment
+                                ? "bg-natural-accent text-white border-natural-accent"
+                                : "bg-white text-natural-muted border-natural-sand"
+                            )}
+                          >
+                            {includeTechnicalSegment ? 'Actif' : 'Inactif'}
+                          </button>
+                        </div>
                       </div>
                     </div>
 

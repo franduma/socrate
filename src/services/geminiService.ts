@@ -35,6 +35,7 @@ type AnalyzeOptions = {
   semanticAttributeLabels?: string[];
   similarityThreshold?: number;
   vectorEngineMode?: "local" | "provider";
+  includeTechnicalSegment?: boolean;
 };
 
 const GEMINI_MODELS_TO_TRY = [
@@ -694,6 +695,10 @@ function isMarkupMode(options?: AnalyzeOptions): boolean {
   );
 }
 
+function shouldIncludeTechnicalSegment(options?: AnalyzeOptions): boolean {
+  return options?.includeTechnicalSegment !== false;
+}
+
 function looksLikeMarkup(text: string): boolean {
   const t = String(text || "").trim();
   if (!t) return false;
@@ -873,6 +878,7 @@ function formatRelativeTimeTimeline(readable: string): string {
 
 function forceMarkupSplitShape(parsed: any, originalText: string, options?: AnalyzeOptions) {
   if (!isMarkupMode(options)) return;
+  const includeTechnicalSegment = shouldIncludeTechnicalSegment(options);
   const { sourceCode, readableFromSource, hasStructuredMarkupPayload, sourceLooksLikeMarkup } = readMarkupPayloadSections(originalText);
   if (!sourceLooksLikeMarkup && !hasStructuredMarkupPayload) return;
   let readable = formatReadableForHumans(readableFromSource);
@@ -904,6 +910,10 @@ function forceMarkupSplitShape(parsed: any, originalText: string, options?: Anal
           originalText: formatted || current,
         };
       });
+    }
+    if (!includeTechnicalSegment) {
+      parsed.segments = (Array.isArray(parsed?.segments) ? parsed.segments : existingSegments)
+        .filter((s: any) => String(s?.role || "").toLowerCase() !== "system");
     }
     return;
   }
@@ -1173,10 +1183,45 @@ function normalizeAnalysisPayload(parsed: any, originalText: string, options?: A
   });
 
   safeParsed.segments = reconcileSocraticRoles(safeParsed.segments);
+  stripTechnicalSegmentsWhenDisabled(safeParsed, originalText, options);
   ensureGraphCompleteness(safeParsed);
   enrichGraphRichness(safeParsed);
 
   return safeParsed as AnalysisResult;
+}
+
+function stripTechnicalSegmentsWhenDisabled(parsed: any, originalText: string, options?: AnalyzeOptions) {
+  if (shouldIncludeTechnicalSegment(options)) return;
+  if (!Array.isArray(parsed?.segments)) return;
+
+  const filtered = parsed.segments.filter((seg: any) => {
+    const role = String(seg?.role || "").toLowerCase();
+    const content = String(seg?.content || seg?.originalText || "").trim();
+    const tags = Array.isArray(seg?.tags) ? seg.tags.map((t: any) => String(t || "").toLowerCase()) : [];
+    const isTechnical =
+      role === "system" ||
+      content === "CODE_MARKUP_SOURCE" ||
+      tags.includes("code-source");
+    return !isTechnical;
+  });
+
+  if (filtered.length > 0) {
+    parsed.segments = filtered;
+    return;
+  }
+
+  const readable = formatReadableForHumans(extractMarkupReadableText(String(originalText || "")));
+  parsed.segments = [
+    {
+      content: readable || "Contenu lisible indisponible.",
+      originalText: readable || "Contenu lisible indisponible.",
+      role: "assistant",
+      semanticSignature: `markup-content-${uuidv4().substring(0, 8)}`,
+      tags: ["markup", "contenu-extrait"],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: { reason: "Segment technique desactive: contenu lisible conserve." },
+    },
+  ];
 }
 
 async function callOpenAIChatCompletion(
