@@ -104,9 +104,138 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
   const extractArticleFromHtml = (raw: string) => {
     const html = String(raw || '');
     if (!/<[a-zA-Z][\w:-]*[\s/>]/.test(html)) return '';
+    const decodeEscaped = (value: string) => {
+      const v = String(value || '');
+      return v
+        .replace(/\\n/g, '\n')
+        .replace(/\\r/g, '\n')
+        .replace(/\\t/g, ' ')
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, '\\')
+        .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+    };
+    const collectStringsByKeys = (root: any, keys: Set<string>, out: string[] = [], depth = 0): string[] => {
+      if (depth > 20 || root == null) return out;
+      if (Array.isArray(root)) {
+        root.forEach((item) => collectStringsByKeys(item, keys, out, depth + 1));
+        return out;
+      }
+      if (typeof root === 'object') {
+        Object.entries(root).forEach(([k, v]) => {
+          if (typeof v === 'string' && keys.has(k.toLowerCase())) {
+            out.push(v);
+          } else {
+            collectStringsByKeys(v, keys, out, depth + 1);
+          }
+        });
+      }
+      return out;
+    };
+    const extractByRegex = (source: string, regex: RegExp) => {
+      const out: string[] = [];
+      for (const match of source.matchAll(regex)) {
+        const val = String(match[1] || '').trim();
+        if (!val) continue;
+        out.push(decodeEscaped(val));
+      }
+      return out;
+    };
+    const extractStructuredArticleText = (source: string) => {
+      const candidates: string[] = [];
+      const authors: string[] = [];
+      const headlines: string[] = [];
+      const wanted = new Set([
+        'articlebody',
+        'description',
+        'headline',
+        'summary',
+        'body',
+        'name',
+      ]);
+
+      const jsonLdMatches = [...source.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+      for (const match of jsonLdMatches) {
+        const rawJson = String(match[1] || '').trim();
+        if (!rawJson) continue;
+        try {
+          const parsed = JSON.parse(rawJson);
+          const values = collectStringsByKeys(parsed, wanted);
+          values.forEach((v) => candidates.push(v));
+        } catch {
+          // ignore malformed JSON-LD blocks
+        }
+      }
+
+      const nextDataMatch = source.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+      if (nextDataMatch?.[1]) {
+        try {
+          const parsed = JSON.parse(String(nextDataMatch[1]).trim());
+          const values = collectStringsByKeys(parsed, wanted);
+          values.forEach((v) => candidates.push(v));
+        } catch {
+          // ignore malformed NEXT_DATA
+        }
+      }
+
+      // Yahoo-specific and generic raw-string fallbacks when JSON structures are malformed/obfuscated.
+      extractByRegex(source, /"articleBody"\s*:\s*"([\s\S]*?)"/gi).forEach((v) => candidates.push(v));
+      extractByRegex(source, /"headline"\s*:\s*"([\s\S]*?)"/gi).forEach((v) => headlines.push(v));
+      extractByRegex(source, /"author"\s*:\s*\{[\s\S]*?"name"\s*:\s*"([^"]+?)"[\s\S]*?\}/gi).forEach((v) => authors.push(v));
+      extractByRegex(source, /"byline"\s*:\s*"([\s\S]*?)"/gi).forEach((v) => authors.push(v));
+
+      const cleaned = candidates
+        .map((t) => decodeEscaped(String(t || '')))
+        .map((t) => t.replace(/\s+/g, ' ').trim())
+        .filter((t) => t.length >= 120);
+      const body = cleaned.length ? cleaned.sort((a, b) => b.length - a.length)[0] : '';
+      const headline = headlines
+        .map((t) => t.replace(/\s+/g, ' ').trim())
+        .filter((t) => t.length >= 10)
+        .sort((a, b) => b.length - a.length)[0] || '';
+      const author = authors
+        .map((t) => t.replace(/\s+/g, ' ').trim())
+        .filter((t) => t.length >= 3 && t.length <= 80)
+        .sort((a, b) => b.length - a.length)[0] || '';
+
+      if (!body && !headline) return '';
+      return [headline, author ? `Par ${author}` : '', body].filter(Boolean).join('\n\n').trim();
+    };
+    const extractYahooDomArticleText = (doc: Document) => {
+      const headline =
+        (doc.querySelector('h1')?.textContent || '').trim();
+
+      const selectorCandidates = [
+        '[data-testid="caas-body"] p',
+        '.caas-body p',
+        '[class*="caas-body"] p',
+        'article p',
+        'main article p',
+      ];
+      let bestParagraphs: string[] = [];
+      for (const selector of selectorCandidates) {
+        const paragraphs = Array.from(doc.querySelectorAll(selector))
+          .map((n) => String((n as HTMLElement).innerText || n.textContent || '').replace(/\s+/g, ' ').trim())
+          .filter((t) => t.length > 50);
+        if (paragraphs.length > bestParagraphs.length) {
+          bestParagraphs = paragraphs;
+        }
+      }
+      if (!bestParagraphs.length) return '';
+      const joined = bestParagraphs.join('\n\n');
+      return [headline, joined].filter(Boolean).join('\n\n').trim();
+    };
+
     try {
       const parser = new DOMParser();
       const doc = parser.parseFromString(html, 'text/html');
+      const pageUrl = `${doc.location?.href || ''} ${html}`.toLowerCase();
+      const isYahoo = /yahoo\.com/.test(pageUrl);
+      if (isYahoo) {
+        const yahooDom = extractYahooDomArticleText(doc);
+        if (yahooDom && yahooDom.length >= 300) {
+          return formatLongTextForReading(yahooDom);
+        }
+      }
       const reader = new Readability(doc, {
         charThreshold: 120,
         keepClasses: false,
@@ -117,9 +246,14 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
       const articleHtml = String(article.content || article.textContent || '').trim();
       if (!articleHtml) return '';
       const plain = extractReadableFromHtml(articleHtml);
-      return formatLongTextForReading(plain);
+      const structured = extractStructuredArticleText(html);
+      const chosen = (isYahoo && structured.length >= 200)
+        ? structured
+        : (plain.length >= structured.length ? plain : structured || plain);
+      return formatLongTextForReading(chosen);
     } catch {
-      return '';
+      const structured = extractStructuredArticleText(html);
+      return structured ? formatLongTextForReading(structured) : '';
     }
   };
 
@@ -189,10 +323,13 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
     return rows.join('\n');
   };
 
-  const cleanWebChromeNoise = (raw: string) => {
+  const cleanWebChromeNoise = (raw: string, sourceUrl?: string) => {
     let text = String(raw || '');
     if (!text.trim()) return text;
     const collapse = text.replace(/\s+/g, ' ').trim();
+    const source = String(sourceUrl || '').toLowerCase();
+    const isLaPresse = source.includes('lapresse.ca');
+    const isYahoo = source.includes('yahoo.com');
 
     const trailingMarkers = [
       'Nos incontournables',
@@ -210,8 +347,10 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
     }
     text = collapse.slice(0, cutTail);
 
-    // Remove common leading site chrome visible on La Presse pages.
-    text = text.replace(/^.*?(?=Justice et faits divers|Actualités|International|Affaires|Sports|Arts|Société|Gourmand|Voyage|Maison)\s*/i, '');
+    if (isLaPresse) {
+      // Remove common leading site chrome visible on La Presse pages.
+      text = text.replace(/^.*?(?=Justice et faits divers|Actualités|International|Affaires|Sports|Arts|Société|Gourmand|Voyage|Maison)\s*/i, '');
+    }
 
     const menuNoisePatterns = [
       /Consulter lapresse\.ca[\s\S]*?Se déconnecter/gi,
@@ -226,6 +365,13 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
     menuNoisePatterns.forEach((pattern) => {
       text = text.replace(pattern, ' ');
     });
+
+    if (isYahoo) {
+      text = text
+        .replace(/Investment ideas Research reports Community Personal Finance[\s\S]*?Watch Now/gi, ' ')
+        .replace(/Yahoo Sports AM Show all[\s\S]*?Terms Privacy/gi, ' ')
+        .replace(/Best [A-Za-z0-9%'\- ]{3,80}(?=\s)/g, ' ');
+    }
 
     // Keep a likely article-centered window when publication timestamp exists.
     const publishedIdx = text.search(/\bPublié à\b/i);
@@ -283,7 +429,7 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
 
     let output = formatLongTextForReading(readable);
     if (isMarkupWeb) {
-      output = formatLongTextForReading(cleanWebChromeNoise(output));
+      output = formatLongTextForReading(cleanWebChromeNoise(output, trace?.webDocumentUrl || trace?.webSourceUrl));
       const lines = output.split('\n').filter(Boolean);
       const hasLongLine = lines.some((l) => l.length > 260);
       if (hasLongLine || lines.length <= 2) {

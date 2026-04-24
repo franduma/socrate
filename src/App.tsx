@@ -87,6 +87,7 @@ type WebSourceDraft = {
   browserProxyPageUrl: string;
   browserProxyPageTitle: string;
   browserProxyRawContent: string;
+  browserProxyRenderedContent: string;
 };
 
 type WebCollectProgress = {
@@ -335,13 +336,14 @@ export default function App() {
           similarityThreshold: Number.isFinite(Number(s.similarityThreshold)) ? Number(s.similarityThreshold) : 0.35,
           vectorEngineMode: s.vectorEngineMode === 'provider' ? 'provider' : 'local',
           rssMaxItems: Number.isFinite(Number(s.rssMaxItems)) ? Math.max(1, Math.min(20, Number(s.rssMaxItems))) : 5,
-          browserProxySnapshot: s.browserProxySnapshot && typeof s.browserProxySnapshot === 'object'
-            ? {
-                pageUrl: String(s.browserProxySnapshot.pageUrl || ''),
-                pageTitle: String(s.browserProxySnapshot.pageTitle || ''),
-                rawContent: String(s.browserProxySnapshot.rawContent || ''),
-                capturedAt: Number.isFinite(Number(s.browserProxySnapshot.capturedAt)) ? Number(s.browserProxySnapshot.capturedAt) : undefined,
-              }
+	          browserProxySnapshot: s.browserProxySnapshot && typeof s.browserProxySnapshot === 'object'
+	            ? {
+	                pageUrl: String(s.browserProxySnapshot.pageUrl || ''),
+	                pageTitle: String(s.browserProxySnapshot.pageTitle || ''),
+	                rawContent: String(s.browserProxySnapshot.rawContent || ''),
+	                renderedContent: String(s.browserProxySnapshot.renderedContent || ''),
+	                capturedAt: Number.isFinite(Number(s.browserProxySnapshot.capturedAt)) ? Number(s.browserProxySnapshot.capturedAt) : undefined,
+	              }
             : undefined,
         }));
     } catch {
@@ -357,11 +359,12 @@ export default function App() {
     semanticCollectionId: '',
     similarityThreshold: 0.35,
     vectorEngineMode: 'local',
-    rssMaxItems: 5,
-    browserProxyPageUrl: '',
-    browserProxyPageTitle: '',
-    browserProxyRawContent: '',
-  });
+	    rssMaxItems: 5,
+	    browserProxyPageUrl: '',
+	    browserProxyPageTitle: '',
+	    browserProxyRawContent: '',
+	    browserProxyRenderedContent: '',
+	  });
   const [editingWebSourceId, setEditingWebSourceId] = useState<string | null>(null);
   const [isCollectingWeb, setIsCollectingWeb] = useState(false);
   const [webCollectProgress, setWebCollectProgress] = useState<WebCollectProgress | null>(null);
@@ -890,6 +893,72 @@ export default function App() {
       .filter(Boolean)
       .join('\n\n');
   };
+  const inferQuestionFromTextLocal = (text: string) => {
+    const tokens = tokenizeSemanticLocal(text);
+    const freq = new Map<string, number>();
+    tokens.forEach((t) => freq.set(t, (freq.get(t) || 0) + 1));
+    const top = [...freq.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4)
+      .map(([w]) => w);
+    if (!top.length) return "Quelle est la question de fond qui éclaire cet article ?";
+    return `Comment interpréter les liens entre ${top.join(', ')} dans cet article ?`;
+  };
+  const ensureMarkupProxyCoverage = (result: any, doc: { text?: string; rawContent?: string }) => {
+    const fullReadable = String(doc?.text || '').trim();
+    if (!fullReadable || fullReadable.length < 220) return result;
+    const segments = Array.isArray(result?.segments) ? result.segments : [];
+    const assistantLike = segments
+      .filter((s: any) => {
+        const role = String(s?.role || '').toLowerCase();
+        return role === 'assistant' || role === 'system';
+      })
+      .map((s: any) => String(s?.originalText || s?.content || '').trim())
+      .filter(Boolean);
+    const longest = assistantLike.sort((a, b) => b.length - a.length)[0] || '';
+    const baseVec = vectorizeText(fullReadable);
+    const bestSimilarity = assistantLike.reduce((best, t) => {
+      const score = cosineLocal(baseVec, vectorizeText(t));
+      return Math.max(best, score);
+    }, 0);
+    const hasCoverage = longest.length >= Math.max(240, Math.floor(fullReadable.length * 0.6)) || bestSimilarity >= 0.45;
+    if (hasCoverage) return result;
+
+    const inferredQuestion = inferQuestionFromTextLocal(fullReadable);
+    const rebuiltSegments: any[] = [
+      {
+        content: inferredQuestion,
+        originalText: inferredQuestion,
+        role: 'user',
+        tags: ['question-inferree', 'proxy-coverage-fallback'],
+        metadata: { reason: 'Question inférée: couverture provider insuffisante en mode proxy markup.' },
+        knowledgeGraph: { nodes: [], edges: [] },
+      },
+      {
+        content: fullReadable,
+        originalText: fullReadable,
+        role: 'assistant',
+        tags: ['analyse-socratique-detectee', 'proxy-coverage-fallback', 'contenu-extrait'],
+        metadata: { reason: 'Contenu article restauré depuis la capture proxy (couverture insuffisante).' },
+        knowledgeGraph: { nodes: [], edges: [] },
+      },
+    ];
+    const raw = String(doc?.rawContent || '').trim();
+    if (raw) {
+      rebuiltSegments.push({
+        content: 'CODE_MARKUP_SOURCE',
+        originalText: raw,
+        role: 'system',
+        tags: ['markup', 'code-source'],
+        metadata: { reason: 'Source technique conservée depuis la capture proxy.' },
+        knowledgeGraph: { nodes: [], edges: [] },
+      });
+    }
+    return {
+      ...result,
+      segments: rebuiltSegments,
+    };
+  };
   const limitInputForProvider = (
     value: string,
     provider: string,
@@ -910,11 +979,12 @@ export default function App() {
     semanticCollectionId: selectedSemanticCollectionId || '',
     similarityThreshold: clampSimilarity(selectedSemanticSimilarity),
     vectorEngineMode,
-    rssMaxItems: 5,
-    browserProxyPageUrl: '',
-    browserProxyPageTitle: '',
-    browserProxyRawContent: '',
-  });
+	    rssMaxItems: 5,
+	    browserProxyPageUrl: '',
+	    browserProxyPageTitle: '',
+	    browserProxyRawContent: '',
+	    browserProxyRenderedContent: '',
+	  });
   const browserProxyRelayBaseUrl = 'http://127.0.0.1:3211';
 
   const extractTitleFromMarkup = (raw: string) => {
@@ -929,11 +999,12 @@ export default function App() {
         alert("Presse-papiers vide.");
         return;
       }
-      setWebSourceDraft((prev) => ({
-        ...prev,
-        browserProxyRawContent: text,
-        browserProxyPageTitle: prev.browserProxyPageTitle || extractTitleFromMarkup(text),
-      }));
+	      setWebSourceDraft((prev) => ({
+	        ...prev,
+	        browserProxyRawContent: text,
+	        browserProxyRenderedContent: '',
+	        browserProxyPageTitle: prev.browserProxyPageTitle || extractTitleFromMarkup(text),
+	      }));
     } catch (e) {
       console.error("Clipboard read failed:", e);
       alert("Impossible de lire le presse-papiers. Utilisez le collage manuel dans la zone de capture.");
@@ -952,17 +1023,19 @@ export default function App() {
       }
       const payload = await res.json();
       const snapshot = payload?.snapshot || {};
-      const raw = String(snapshot.rawContent || '');
+	      const raw = String(snapshot.rawContent || '');
+	      const rendered = String(snapshot.renderedContent || '');
       if (!raw.trim()) {
         alert("Le relay n'a pas retourné de contenu exploitable.");
         return;
       }
-      setWebSourceDraft((prev) => ({
-        ...prev,
-        browserProxyPageUrl: String(snapshot.pageUrl || prev.browserProxyPageUrl || prev.url || ''),
-        browserProxyPageTitle: String(snapshot.pageTitle || prev.browserProxyPageTitle || extractTitleFromMarkup(raw)),
-        browserProxyRawContent: raw,
-      }));
+	      setWebSourceDraft((prev) => ({
+	        ...prev,
+	        browserProxyPageUrl: String(snapshot.pageUrl || prev.browserProxyPageUrl || prev.url || ''),
+	        browserProxyPageTitle: String(snapshot.pageTitle || prev.browserProxyPageTitle || extractTitleFromMarkup(raw)),
+	        browserProxyRawContent: raw,
+	        browserProxyRenderedContent: rendered,
+	      }));
       alert("Capture relay importée dans la source proxy.");
     } catch (error) {
       console.error("Relay fetch failed:", error);
@@ -1002,6 +1075,7 @@ export default function App() {
               pageUrl: webSourceDraft.browserProxyPageUrl.trim() || normalized,
               pageTitle: webSourceDraft.browserProxyPageTitle.trim() || name,
               rawContent: webSourceDraft.browserProxyRawContent,
+              renderedContent: webSourceDraft.browserProxyRenderedContent,
               capturedAt: Date.now(),
             }
           : undefined,
@@ -1028,6 +1102,7 @@ export default function App() {
       browserProxyPageUrl: source.browserProxySnapshot?.pageUrl || '',
       browserProxyPageTitle: source.browserProxySnapshot?.pageTitle || '',
       browserProxyRawContent: source.browserProxySnapshot?.rawContent || '',
+      browserProxyRenderedContent: source.browserProxySnapshot?.renderedContent || '',
     });
   };
 
@@ -1071,6 +1146,7 @@ export default function App() {
                       pageUrl: webSourceDraft.browserProxyPageUrl.trim() || normalized,
                       pageTitle: webSourceDraft.browserProxyPageTitle.trim() || name,
                       rawContent: webSourceDraft.browserProxyRawContent,
+                      renderedContent: webSourceDraft.browserProxyRenderedContent,
                       capturedAt: Date.now(),
                     }
                   : undefined,
@@ -1269,6 +1345,9 @@ export default function App() {
               }
               if (!result) {
                 throw new Error("Analyse indisponible apres retries OpenAI.");
+              }
+              if (sourceGranularityCore === 'markup' && source.mode === 'browser_proxy') {
+                result = ensureMarkupProxyCoverage(result, { text: doc.text, rawContent: doc.rawContent });
               }
               const enrichedResult = {
                 ...result,
@@ -2088,11 +2167,11 @@ export default function App() {
 		                            <p className="text-[10px] text-natural-stone">
 		                              2) Dans l'onglet cible, exécutez ce bookmarklet (favori URL):
 		                            </p>
-		                            <textarea
-		                              readOnly
-		                              value={`javascript:(async()=>{try{const p={pageUrl:location.href,pageTitle:document.title,rawContent:document.documentElement?document.documentElement.outerHTML:document.body.innerHTML,source:'bookmarklet'};await fetch('http://127.0.0.1:3211/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});alert('Capture envoyee a Socrate');}catch(e){alert('Echec capture: '+e);}})();`}
-		                              className="w-full min-h-[80px] p-2 bg-natural-bg border border-natural-sand rounded-lg text-[10px] font-mono"
-		                            />
+                            <textarea
+                              readOnly
+                              value={`javascript:(async()=>{const article=document.querySelector('article');const main=document.querySelector('main,[role=\"main\"]');const rendered=((article&&article.innerText)||(main&&main.innerText)||(document.body&&document.body.innerText)||'').trim();const p={pageUrl:location.href,pageTitle:document.title,rawContent:document.documentElement?document.documentElement.outerHTML:document.body.innerHTML,renderedContent:rendered,source:'bookmarklet'};try{await fetch('http://127.0.0.1:3211/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});alert('Capture envoyee a Socrate');return;}catch(_e){}const w=window.open('http://127.0.0.1:3211/receiver','_blank');if(!w){alert('Echec capture directe. Autorisez les popups puis reessayez.');return;}setTimeout(()=>{try{w.postMessage({type:'SOCRATE_PROXY_CAPTURE',payload:p},'*');alert('Fenetre relay ouverte. Validez la capture dans cette fenetre.');}catch(e){alert('Echec capture via relay: '+e);}},700);})();`}
+                              className="w-full min-h-[80px] p-2 bg-natural-bg border border-natural-sand rounded-lg text-[10px] font-mono"
+                            />
 		                          </div>
 		                          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
 		                            <input
@@ -2129,11 +2208,11 @@ export default function App() {
 		                            >
 		                              Coller manuel (optionnel)
 		                            </button>
-		                            <span className="text-[10px] text-natural-stone">
-		                              Taille capture: {webSourceDraft.browserProxyRawContent.trim().length.toLocaleString()} caracteres
-	                            </span>
-	                          </div>
-	                        </div>
+                            <span className="text-[10px] text-natural-stone">
+                              Taille capture HTML: {webSourceDraft.browserProxyRawContent.trim().length.toLocaleString()} caracteres | Rendu texte: {webSourceDraft.browserProxyRenderedContent.trim().length.toLocaleString()} caracteres
+                            </span>
+                          </div>
+                        </div>
 	                      )}
                       <div className="flex gap-2">
                         <button

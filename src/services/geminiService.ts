@@ -636,6 +636,52 @@ function forceSingleBlockSocraticPair(parsed: any, originalText: string, options
   ];
 }
 
+function forceLowCoverageSocraticFallback(parsed: any, originalText: string, options?: AnalyzeOptions) {
+  if (isMarkupMode(options)) return;
+  if (looksLikeStructuredDialog(originalText)) return;
+
+  const fullText = String(originalText || "").trim();
+  if (fullText.length < 320) return;
+
+  const existingSegments = Array.isArray(parsed?.segments) ? parsed.segments : [];
+  if (!existingSegments.length) return;
+
+  const longest = existingSegments.reduce((max: number, s: any) => {
+    const len = String(s?.originalText || s?.content || "").trim().length;
+    return Math.max(max, len);
+  }, 0);
+  const coverage = fullText.length ? longest / fullText.length : 0;
+  const hasAssistant = existingSegments.some((s: any) => {
+    const role = String(s?.role || "").toLowerCase();
+    return role === "assistant" || role === "system";
+  });
+
+  // If provider output only reflects a tiny fraction of the source text, force a readable full-text pair.
+  if (hasAssistant && coverage >= 0.55) return;
+
+  const inferredQuestion = inferQuestionFromAnalysis(fullText);
+  parsed.segments = [
+    {
+      content: inferredQuestion,
+      originalText: inferredQuestion,
+      role: "user",
+      semanticSignature: `coverage-q-${uuidv4().substring(0, 8)}`,
+      tags: ["question-inferree", "fallback-couverture"],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: { reason: "Question inferee: couverture trop faible du texte source." },
+    },
+    {
+      content: fullText,
+      originalText: fullText,
+      role: "assistant",
+      semanticSignature: `coverage-a-${uuidv4().substring(0, 8)}`,
+      tags: ["analyse-socratique-detectee", "fallback-couverture"],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: { reason: "Texte source restaure: sortie provider trop courte." },
+    },
+  ];
+}
+
 function isMarkupMode(options?: AnalyzeOptions): boolean {
   if (options?.granularity === "markup") return true;
   const instruction = String(options?.customSegmentationInstruction || "").toLowerCase();
@@ -1030,6 +1076,7 @@ function normalizeAnalysisPayload(parsed: any, originalText: string, options?: A
   forceMarkupSplitShape(safeParsed, originalText, options);
   forceMarkupReadableSocraticShape(safeParsed, originalText, options);
   forceSingleBlockSocraticPair(safeParsed, originalText, options);
+  forceLowCoverageSocraticFallback(safeParsed, originalText, options);
 
   if (!safeParsed.segments || safeParsed.segments.length === 0) {
     safeParsed.segments = [

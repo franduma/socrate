@@ -53,6 +53,7 @@ app.post('/capture', (req, res) => {
   const pageUrl = String(body.pageUrl || '').trim();
   const pageTitle = String(body.pageTitle || '').trim();
   const rawContent = String(body.rawContent || '');
+  const renderedContent = String(body.renderedContent || '');
   if (!rawContent.trim()) {
     res.status(400).json({ ok: false, error: 'rawContent is required.' });
     return;
@@ -61,11 +62,17 @@ app.post('/capture', (req, res) => {
     pageUrl,
     pageTitle,
     rawContent,
+    renderedContent,
     capturedAt: Date.now(),
     source: String(body.source || 'browser'),
   };
   saveSnapshot(snapshot);
-  res.json({ ok: true, bytes: rawContent.length, capturedAt: snapshot.capturedAt });
+  res.json({
+    ok: true,
+    bytes: rawContent.length,
+    renderedBytes: renderedContent.length,
+    capturedAt: snapshot.capturedAt,
+  });
 });
 
 app.get('/receiver', (_req, res) => {

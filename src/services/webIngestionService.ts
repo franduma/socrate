@@ -6,6 +6,7 @@ export interface BrowserProxySnapshot {
   pageUrl?: string;
   pageTitle?: string;
   rawContent: string;
+  renderedContent?: string;
   capturedAt?: number;
 }
 
@@ -70,6 +71,77 @@ function extractLongestTextFromSelectors(doc: Document) {
   return best;
 }
 
+function decodeEscaped(value: string) {
+  const v = String(value || '');
+  return v
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\n')
+    .replace(/\\t/g, ' ')
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\')
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
+
+function collectStringsByKeys(root: any, keys: Set<string>, out: string[] = [], depth = 0): string[] {
+  if (depth > 20 || root == null) return out;
+  if (Array.isArray(root)) {
+    root.forEach((item) => collectStringsByKeys(item, keys, out, depth + 1));
+    return out;
+  }
+  if (typeof root === 'object') {
+    Object.entries(root).forEach(([k, v]) => {
+      if (typeof v === 'string' && keys.has(String(k).toLowerCase())) {
+        out.push(v);
+      } else {
+        collectStringsByKeys(v, keys, out, depth + 1);
+      }
+    });
+  }
+  return out;
+}
+
+function extractStructuredArticleText(rawHtml: string) {
+  const source = String(rawHtml || '');
+  const candidates: string[] = [];
+  const wanted = new Set(['articlebody', 'headline', 'description', 'summary', 'body', 'name', 'byline']);
+
+  const jsonLdMatches = [...source.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+  for (const match of jsonLdMatches) {
+    const rawJson = String(match[1] || '').trim();
+    if (!rawJson) continue;
+    try {
+      const parsed = JSON.parse(rawJson);
+      collectStringsByKeys(parsed, wanted).forEach((v) => candidates.push(v));
+    } catch {
+      // ignore malformed JSON-LD
+    }
+  }
+
+  const nextDataMatch = source.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+  if (nextDataMatch?.[1]) {
+    try {
+      const parsed = JSON.parse(String(nextDataMatch[1]).trim());
+      collectStringsByKeys(parsed, wanted).forEach((v) => candidates.push(v));
+    } catch {
+      // ignore malformed NEXT_DATA
+    }
+  }
+
+  // raw-string fallback
+  [...source.matchAll(/"articleBody"\s*:\s*"([\s\S]*?)"/gi)].forEach((m) => candidates.push(String(m[1] || '')));
+  [...source.matchAll(/"headline"\s*:\s*"([\s\S]*?)"/gi)].forEach((m) => candidates.push(String(m[1] || '')));
+  [...source.matchAll(/"byline"\s*:\s*"([\s\S]*?)"/gi)].forEach((m) => candidates.push(String(m[1] || '')));
+  [...source.matchAll(/"author"\s*:\s*\{[\s\S]*?"name"\s*:\s*"([^"]+?)"[\s\S]*?\}/gi)].forEach((m) => candidates.push(String(m[1] || '')));
+
+  const cleaned = candidates
+    .map((t) => decodeEscaped(String(t || '')))
+    .map((t) => stripHtml(t))
+    .map((t) => t.replace(/\s+/g, ' ').trim())
+    .filter((t) => t.length >= 120);
+  if (!cleaned.length) return '';
+  return cleaned.sort((a, b) => b.length - a.length)[0];
+}
+
 function extractReadableWebContent(html: string, url?: string, titleHint?: string) {
   const raw = String(html || '');
   if (!raw.trim()) {
@@ -79,6 +151,8 @@ function extractReadableWebContent(html: string, url?: string, titleHint?: strin
   try {
     const parser = new DOMParser();
     const doc = parser.parseFromString(raw, 'text/html');
+    const structured = extractStructuredArticleText(raw);
+    const isYahoo = /yahoo\.com/i.test(String(url || '')) || /yahoo\.com/i.test(raw);
 
     const readability = new Readability(doc, {
       charThreshold: 120,
@@ -87,6 +161,23 @@ function extractReadableWebContent(html: string, url?: string, titleHint?: strin
     });
     const article = readability.parse();
     const readableText = stripHtml(article?.content || article?.textContent || '');
+    const bestCandidate = (() => {
+      const ranked = [readableText, structured]
+        .map((t) => String(t || '').trim())
+        .filter((t) => t.length >= 80)
+        .sort((a, b) => b.length - a.length);
+      if (!ranked.length) return '';
+      // For Yahoo, prefer structured payload because DOM text is often polluted by nav chrome.
+      if (isYahoo && structured.length >= 160) return structured;
+      return ranked[0];
+    })();
+    if (bestCandidate.length >= 120) {
+      return {
+        title: (article?.title || titleHint || '').trim(),
+        text: bestCandidate,
+      };
+    }
+
     if (readableText.length >= 120) {
       return {
         title: (article?.title || titleHint || '').trim(),
@@ -147,6 +238,57 @@ function getLongestTextCandidate(texts: Array<string | undefined | null>) {
     .filter((t) => t.length > 0);
   if (!normalized.length) return '';
   return normalized.sort((a, b) => b.length - a.length)[0];
+}
+
+function tokenizeForMatch(value: string) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 4);
+}
+
+function countSharedTitleTokens(text: string, title: string) {
+  const textTokens = new Set(tokenizeForMatch(text));
+  const titleTokens = Array.from(new Set(tokenizeForMatch(title)));
+  if (!titleTokens.length || !textTokens.size) return 0;
+  return titleTokens.reduce((n, token) => n + (textTokens.has(token) ? 1 : 0), 0);
+}
+
+function chooseBestProxyText(options: {
+  rendered: string;
+  readable: string;
+  rawStripped: string;
+  pageUrl: string;
+  pageTitle: string;
+}) {
+  const rendered = String(options.rendered || '').trim();
+  const readable = String(options.readable || '').trim();
+  const rawStripped = String(options.rawStripped || '').trim();
+  const pageUrl = String(options.pageUrl || '').toLowerCase();
+  const pageTitle = String(options.pageTitle || '').trim();
+  const isYahoo = /yahoo\.com/.test(pageUrl);
+
+  const renderedTitleOverlap = countSharedTitleTokens(rendered, pageTitle);
+  const readableTitleOverlap = countSharedTitleTokens(readable, pageTitle);
+  const renderedLooksUsable = rendered.length >= 350 && renderedTitleOverlap >= 2;
+
+  // Yahoo article pages often have very long navigation shells in raw/readability;
+  // when rendered proxy text matches the page title, prefer it.
+  if (isYahoo && renderedLooksUsable) {
+    return rendered;
+  }
+
+  if (renderedLooksUsable && rendered.length >= 700) {
+    return rendered;
+  }
+
+  if (readable.length >= 500 && readableTitleOverlap >= 2) {
+    return readable;
+  }
+
+  return getLongestTextCandidate([readable, rendered, rawStripped]);
 }
 
 async function fetchTextWithFallbacks(url: string) {
@@ -283,13 +425,21 @@ async function collectFromBrowserProxy(source: WebSourceDefinition): Promise<Ing
   if (!raw) {
     throw new Error("Aucune capture proxy disponible pour cette source. Ouvrez l'onglet cible, copiez son contenu, puis collez-le dans la source proxy.");
   }
+  const rendered = String(snapshot?.renderedContent || '').trim();
   const pageUrl = String(snapshot?.pageUrl || source.url || '').trim();
   const pageTitle = String(snapshot?.pageTitle || source.name || pageUrl || source.url || 'Page proxy').trim();
   const readable = extractReadableWebContent(raw, pageUrl || source.url, pageTitle);
+  const bestHumanReadable = chooseBestProxyText({
+    rendered,
+    readable: readable.text,
+    rawStripped: stripHtml(raw),
+    pageUrl: pageUrl || source.url,
+    pageTitle,
+  });
   if (isLikelyErrorOrBlockedPage({ title: readable.title, text: readable.text, raw, url: pageUrl || source.url })) {
     throw new Error("Capture proxy invalide (page d'erreur detectee: Oops/451/CAPTCHA).");
   }
-  const bestText = truncate(getLongestTextCandidate([readable.text, stripHtml(raw)]), 22000);
+  const bestText = truncate(bestHumanReadable, 22000);
   if (!bestText) {
     throw new Error("Capture proxy vide ou illisible.");
   }
