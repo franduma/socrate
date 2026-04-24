@@ -497,8 +497,21 @@ function looksLikeStructuredDialog(text: string): boolean {
   return false;
 }
 
+function isIntactLikeMode(options?: AnalyzeOptions): boolean {
+  if (options?.granularity === "intact") return true;
+  const instruction = String(options?.customSegmentationInstruction || "").toLowerCase();
+  if (!instruction) return false;
+  return (
+    instruction.includes("segmentation=intact") ||
+    instruction.includes("blocs longs") ||
+    instruction.includes("grands blocs") ||
+    instruction.includes("1 à 4 segments") ||
+    instruction.includes("1-4")
+  );
+}
+
 function forceIntactFreeTextShape(parsed: any, originalText: string, options?: AnalyzeOptions) {
-  if (options?.granularity !== "intact") return;
+  if (!isIntactLikeMode(options)) return;
   if (looksLikeStructuredDialog(originalText)) return;
 
   const inferredQuestion = inferQuestionFromAnalysis(originalText);
