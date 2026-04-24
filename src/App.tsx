@@ -819,6 +819,23 @@ export default function App() {
 
   const clampSimilarity = (value: number) => Math.max(0, Math.min(1, Number.isFinite(value) ? value : 0.35));
   const clampRssItems = (value: number) => Math.max(1, Math.min(20, Number.isFinite(value) ? Math.round(value) : 5));
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const capText = (value: string, maxChars: number) => {
+    const text = String(value || '').trim();
+    if (text.length <= maxChars) return text;
+    return `${text.slice(0, maxChars)}\n\n[...contenu tronque automatiquement pour respecter les limites provider...]`;
+  };
+  const limitInputForProvider = (
+    value: string,
+    provider: string,
+    granularity: 'intact' | 'balanced' | 'fine' | 'markup'
+  ) => {
+    if (provider === 'openai' || provider === 'codex') {
+      const maxChars = granularity === 'markup' ? 7000 : 9000;
+      return capText(value, maxChars);
+    }
+    return capText(value, 22000);
+  };
   const buildWebSourceDraftDefaults = (): WebSourceDraft => ({
     name: '',
     url: '',
@@ -1025,26 +1042,56 @@ export default function App() {
                 webDocumentTitle: doc.title,
                 webDocumentUrl: doc.url || source.url,
               });
-              let analysisInput = doc.text;
+              let analysisInput = limitInputForProvider(doc.text, selectedModel, sourceGranularityCore);
               if (sourceGranularityCore === 'markup' && source.mode === 'scrape') {
                 const targetUrl = doc.url || source.url;
                 try {
                   const rawMarkup = await fetchRawWebContent(targetUrl);
                   if (rawMarkup && rawMarkup.trim().length > 0) {
-                    analysisInput = rawMarkup;
+                    analysisInput = limitInputForProvider(rawMarkup, selectedModel, sourceGranularityCore);
                   }
                 } catch {
                   // fallback to already-collected text
                 }
               }
-              const result = await analyzeAndSegmentConversation(analysisInput, {
-                granularity: sourceGranularityCore,
-                customSegmentationInstruction: sourceGranularityProfile.instruction,
-                semanticCollectionName: sourceCollection?.name,
-                semanticAttributeLabels: sourceSemanticAttributes.map((a) => a.label),
-                similarityThreshold: sourceSimilarity,
-                vectorEngineMode: sourceVectorMode,
-              });
+              const isOpenAIRateLimit = (message: string) =>
+                /openai http 429|rate limit exceeded|tokens per min|tpm/i.test(message);
+              let result: any = null;
+              let analysisPayload = analysisInput;
+              const maxAttempts = 3;
+              for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                try {
+                  result = await analyzeAndSegmentConversation(analysisPayload, {
+                    granularity: sourceGranularityCore,
+                    customSegmentationInstruction: sourceGranularityProfile.instruction,
+                    semanticCollectionName: sourceCollection?.name,
+                    semanticAttributeLabels: sourceSemanticAttributes.map((a) => a.label),
+                    similarityThreshold: sourceSimilarity,
+                    vectorEngineMode: sourceVectorMode,
+                  });
+                  break;
+                } catch (providerError: any) {
+                  const msg = readErrorMessage(providerError);
+                  if (!isOpenAIRateLimit(msg) || attempt >= maxAttempts - 1) {
+                    throw providerError;
+                  }
+                  const reduceFactor = attempt === 0 ? 0.55 : 0.35;
+                  analysisPayload = capText(analysisPayload, Math.max(2500, Math.floor(analysisPayload.length * reduceFactor)));
+                  setWebCollectProgress((prev) => ({
+                    phase: `Attente quota OpenAI (${attempt + 1}/${maxAttempts - 1})`,
+                    sourceName: source.name,
+                    docTitle: doc.title,
+                    current: prev?.current || processedCount,
+                    total: prev?.total || totalPlanned,
+                    saved: prev?.saved || savedCount,
+                    failed: prev?.failed || failedCount,
+                  }));
+                  await sleep(12000 * (attempt + 1));
+                }
+              }
+              if (!result) {
+                throw new Error("Analyse indisponible apres retries OpenAI.");
+              }
               const enrichedResult = {
                 ...result,
                 analysisTrace,
@@ -1915,7 +1962,7 @@ export default function App() {
                               <p className="text-xs font-bold text-natural-heading truncate">{source.name}</p>
                               <p className="text-[10px] text-natural-muted truncate">{source.url}</p>
                               <p className="text-[10px] text-natural-stone truncate">
-                                Titre: {source.titlePrefix || '[WEB]'} | Granularite: {(granularityProfiles.find((p) => p.id === source.granularityProfileId)?.name) || source.granularityProfileId || 'balanced'} | Similarite: {Number(source.similarityThreshold ?? 0.35).toFixed(2)} | Vecteur: {source.vectorEngineMode || 'local'} | RSS max: {source.rssMaxItems ?? 5}
+                                Titre: {source.titlePrefix || '[WEB]'} | Mode: {source.mode === 'scrape' ? 'Scrape' : 'RSS'} | Granularite: {(granularityProfiles.find((p) => p.id === source.granularityProfileId)?.name) || source.granularityProfileId || 'balanced'} | Similarite: {Number(source.similarityThreshold ?? 0.35).toFixed(2)} | Vecteur: {source.vectorEngineMode || 'local'}{source.mode === 'rss' ? ` | RSS max: ${source.rssMaxItems ?? 5}` : ''}
                               </p>
                             </div>
                             <span className={cn(
