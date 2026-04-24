@@ -837,13 +837,12 @@ export default function App() {
         throw new Error("L'analyse n'a produit aucun segment de texte.");
       }
 
-      const isSessionUpdate = activeTab === 'chat' && currentChatConvId;
-      const convId = isSessionUpdate ? currentChatConvId! : uuidv4();
+      // Always persist a new analysis snapshot to avoid overwriting previous runs
+      // when parameters differ across series.
+      const convId = uuidv4();
       const now = Date.now();
       const captureTrace: SegmentationTrace = potentialCapture.analysisTrace || buildSegmentationTrace();
-      const existingConversation = isSessionUpdate ? await db.conversations.get(convId) : undefined;
-      const previousTraces = existingConversation?.segmentationTraces || (existingConversation?.analysisTrace ? [existingConversation.analysisTrace] : []);
-      const segmentationTraces = [...previousTraces, captureTrace].slice(-25);
+      const segmentationTraces = [captureTrace];
 
       const convData: any = {
         id: convId,
@@ -863,20 +862,12 @@ export default function App() {
         segmentationTraces,
       };
 
-      if (!isSessionUpdate) {
-        convData.createdAt = now;
-        await db.conversations.add(convData);
-      } else {
-        await db.conversations.update(convId, convData);
-      }
+      convData.createdAt = now;
+      await db.conversations.add(convData);
 
       // Si c'est une mise à jour, on peut éventuellement supprimer les anciens segments
       // mais l'utilisateur veut du "conservatif". On va faire un put pour écraser par ID si possible
       // ou simplement nettoyer si on re-segmente tout le fil.
-      if (isSessionUpdate) {
-        await db.segments.where('conversationId').equals(convId).delete();
-      }
-
       let prevId: string | undefined = undefined;
       for (let i = 0; i < potentialCapture.segments.length; i++) {
         const seg = potentialCapture.segments[i];
@@ -1181,20 +1172,6 @@ export default function App() {
       // Update potentialCapture
       setPotentialCapture(enrichedResult);
       
-      // Update or create conversation metadata
-      if (currentChatConvId) {
-          await db.conversations.update(currentChatConvId, {
-              knowledgeGraph: enrichedResult.analysis.knowledgeGraph,
-              semanticSignature: enrichedResult.analysis.semanticSignature,
-              semanticAnalysis: {
-                summary: enrichedResult.analysis.summary,
-                themes: enrichedResult.analysis.themes,
-                suggestedTags: enrichedResult.analysis.suggestedTags,
-                deviations: enrichedResult.analysis.deviations
-              }
-          });
-      }
-
       // Nouveau format de titre : [Attr1, Attr2] - Socrate Chat - YYMMDD_HHMM
       const attrs = (enrichedResult.analysis.suggestedTags || []).slice(0, 2).join(', ');
       const now = new Date();
