@@ -1,6 +1,7 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { Segment } from "../types";
 import { v4 as uuidv4 } from "uuid";
+import { renderPromptTemplate } from "./promptConfigService";
 
 type Provider = "gemini" | "hardwired_gemini" | "openai" | "claude" | "openrouter" | "codex";
 export type SegmentGranularity = "intact" | "balanced" | "fine" | "markup";
@@ -551,12 +552,113 @@ function isIntactLikeMode(options?: AnalyzeOptions): boolean {
   );
 }
 
+function extractLeadingQuestionAndAnswer(text: string): { question: string; answer: string } | null {
+  const full = String(text || "").trim();
+  if (!full) return null;
+
+  const labeled = full.match(
+    /^\s*(?:question|q)\s*[:\-]\s*([\s\S]*?\?)\s*(?:\n+|\s+)(?:reponse|réponse|r)\s*[:\-]\s*([\s\S]+)$/i
+  );
+  if (labeled) {
+    const question = String(labeled[1] || "").trim();
+    const answer = String(labeled[2] || "").trim();
+    if (isQuestionLike(question) && answer.length >= 20) {
+      return { question, answer };
+    }
+  }
+
+  const firstQuestionMatch = full.match(/^([\s\S]{0,360}?\?)\s*([\s\S]+)$/);
+  if (!firstQuestionMatch) return null;
+  const question = String(firstQuestionMatch[1] || "").replace(/\s+/g, " ").trim();
+  let answer = String(firstQuestionMatch[2] || "").trim();
+  answer = answer.replace(/^[-–—:\)\]\s]+/, "").trim();
+  if (!isQuestionLike(question)) return null;
+  if (question.length < 8 || answer.length < 20) return null;
+  return { question, answer };
+}
+
+function extractStructuredDialogSegments(
+  text: string
+): Array<{ role: "user" | "assistant"; content: string }> {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (!lines.length) return [];
+
+  const segments: Array<{ role: "user" | "assistant"; content: string }> = [];
+  const pushOrAppend = (role: "user" | "assistant", content: string) => {
+    const c = String(content || "").trim();
+    if (!c) return;
+    const last = segments[segments.length - 1];
+    if (last && last.role === role) {
+      last.content = `${last.content}\n${c}`.trim();
+      return;
+    }
+    segments.push({ role, content: c });
+  };
+
+  const toRole = (raw: string): "user" | "assistant" | null => {
+    const k = String(raw || "")
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "");
+    if (["question", "q", "user", "utilisateur"].includes(k)) return "user";
+    if (["reponse", "r", "assistant", "answer"].includes(k)) return "assistant";
+    return null;
+  };
+
+  let currentRole: "user" | "assistant" | null = null;
+  for (const line of lines) {
+    const prefixed =
+      line.match(/^\[\s*(question|q|user|utilisateur|reponse|réponse|r|assistant|answer)\s*\]\s*[:\-]?\s*(.*)$/i) ||
+      line.match(/^(question|q|user|utilisateur|reponse|réponse|r|assistant|answer)\s*[:\-]\s*(.*)$/i);
+
+    if (prefixed) {
+      const role = toRole(prefixed[1]);
+      const payload = String(prefixed[2] || "").trim();
+      if (role) {
+        currentRole = role;
+        pushOrAppend(role, payload);
+        continue;
+      }
+    }
+
+    if (currentRole) {
+      pushOrAppend(currentRole, line);
+      continue;
+    }
+  }
+
+  const hasUser = segments.some((s) => s.role === "user");
+  const hasAssistant = segments.some((s) => s.role === "assistant");
+  if (!hasUser || !hasAssistant) return [];
+  return segments.filter((s) => s.content.length >= 2);
+}
+
 function forceIntactFreeTextShape(parsed: any, originalText: string, options?: AnalyzeOptions) {
   if (!isIntactLikeMode(options)) return;
+  if (isMarkupMode(options)) return;
+
+  const structured = extractStructuredDialogSegments(originalText);
+  if (structured.length >= 2) {
+    parsed.segments = structured.map((seg, idx) => ({
+      content: `${seg.role === "user" ? "[USER]" : "[ASSISTANT]"}: ${seg.content}`,
+      originalText: `${seg.role === "user" ? "[USER]" : "[ASSISTANT]"}: ${seg.content}`,
+      role: seg.role,
+      semanticSignature: `intact-structured-${idx}-${uuidv4().substring(0, 8)}`,
+      tags: ["intact", "source-structured-dialog", "speaker-prefix-preserved"],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: { reason: "Dialogue structure detecte et preserve localement (mode blocs longs)." },
+    }));
+    return;
+  }
   if (looksLikeStructuredDialog(originalText)) return;
 
-  const inferredQuestion = inferQuestionFromAnalysis(originalText);
   const fullText = String(originalText || "").trim() || "Texte indisponible.";
+  const explicitPair = extractLeadingQuestionAndAnswer(fullText);
+  const inferredQuestion = explicitPair?.question || inferQuestionFromAnalysis(originalText);
+  const analysisBody = explicitPair?.answer || fullText;
   const existingSegments = Array.isArray(parsed?.segments) ? parsed.segments : [];
   const roles = new Set(existingSegments.map((s: any) => String(s?.role || "").toLowerCase()));
   const maxSegmentTextLen = existingSegments.reduce((max: number, s: any) => {
@@ -566,8 +668,10 @@ function forceIntactFreeTextShape(parsed: any, originalText: string, options?: A
   const coverage = fullText.length ? maxSegmentTextLen / fullText.length : 0;
   const alreadyHasQuestionAndAnalysis = roles.has("user") && (roles.has("assistant") || roles.has("system"));
 
-  // Keep provider output only if it really preserves long-block structure and content coverage.
-  if (alreadyHasQuestionAndAnalysis && coverage >= 0.75) return;
+  if (!explicitPair) {
+    // Keep provider output only if it really preserves long-block structure and content coverage.
+    if (alreadyHasQuestionAndAnalysis && coverage >= 0.75) return;
+  }
 
   parsed.segments = [
     {
@@ -575,13 +679,13 @@ function forceIntactFreeTextShape(parsed: any, originalText: string, options?: A
       originalText: inferredQuestion,
       role: "user",
       semanticSignature: `intact-q-${uuidv4().substring(0, 8)}`,
-      tags: ["question-inferree", "intact"],
+      tags: [explicitPair ? "question-source-detectee" : "question-inferree", "intact"],
       knowledgeGraph: { nodes: [], edges: [] },
       metadata: { reason: "Question inférée pour texte libre (mode blocs longs)." },
     },
     {
-      content: fullText,
-      originalText: fullText,
+      content: analysisBody,
+      originalText: analysisBody,
       role: "assistant",
       semanticSignature: `intact-a-${uuidv4().substring(0, 8)}`,
       tags: ["analyse-socratique-detectee", "intact"],
@@ -681,6 +785,208 @@ function forceLowCoverageSocraticFallback(parsed: any, originalText: string, opt
       metadata: { reason: "Texte source restaure: sortie provider trop courte." },
     },
   ];
+}
+
+function getSimilarityThreshold(options?: AnalyzeOptions) {
+  const raw = Number(options?.similarityThreshold);
+  if (!Number.isFinite(raw)) return 0.35;
+  return Math.max(0, Math.min(1, raw));
+}
+
+function getWordBudgetForProgressiveSegmentation(options?: AnalyzeOptions) {
+  const similarity = getSimilarityThreshold(options);
+  const granularity = options?.granularity || "balanced";
+  if (granularity === "intact") return 280;
+  if (granularity === "fine") {
+    // stricter similarity => smaller chunks => more segments
+    return Math.max(55, Math.round(150 - similarity * 80));
+  }
+  // balanced: progressive middle-ground, less aggressive truncation than provider-only outputs
+  return Math.max(85, Math.round(240 - similarity * 170));
+}
+
+function splitTextByWordBudget(text: string, maxWords: number): string[] {
+  const lines = String(text || "")
+    .replace(/\r/g, "\n")
+    .split(/\n+/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (!lines.length) return [];
+
+  const chunks: string[] = [];
+  for (const line of lines) {
+    const sentences = line
+      .split(/(?<=[.!?])\s+(?=[A-Z0-9À-ÖØ-Þ])/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const units = sentences.length > 1 ? sentences : [line];
+    let current: string[] = [];
+    let count = 0;
+    for (const unit of units) {
+      const words = unit.split(/\s+/).filter(Boolean);
+      if (count > 0 && count + words.length > maxWords) {
+        chunks.push(current.join(" ").trim());
+        current = [];
+        count = 0;
+      }
+      current.push(unit);
+      count += words.length;
+    }
+    if (current.length) chunks.push(current.join(" ").trim());
+  }
+  return chunks.filter((c) => c.length > 0);
+}
+
+function buildSegmentsFromStructuredSource(originalText: string, options?: AnalyzeOptions) {
+  const structured = extractStructuredDialogSegments(originalText);
+  if (structured.length < 2) return [];
+  const maxWords = getWordBudgetForProgressiveSegmentation(options);
+  const withPrefixes = true;
+  const similarity = getSimilarityThreshold(options);
+  const granularity = options?.granularity || "balanced";
+  const maxAssistantParts = granularity === "fine"
+    ? Math.max(3, Math.min(6, Math.round(3 + similarity * 3)))
+    : Math.max(2, Math.min(4, Math.round(2 + similarity * 2)));
+  const packToMaxParts = (parts: string[], maxParts: number) => {
+    if (parts.length <= maxParts) return parts;
+    const out: string[] = [];
+    const bucketSize = Math.ceil(parts.length / maxParts);
+    for (let i = 0; i < parts.length; i += bucketSize) {
+      out.push(parts.slice(i, i + bucketSize).join(" ").trim());
+    }
+    return out.filter(Boolean);
+  };
+
+  const exploded = structured.flatMap((seg) => {
+    const rolePrefix = seg.role === "user" ? "[USER]: " : "[ASSISTANT]: ";
+    if (seg.role === "user") {
+      // Preserve question count exactly for Q/R corpora outside markup mode.
+      const text = withPrefixes ? `${rolePrefix}${seg.content}` : seg.content;
+      return [{
+        content: text,
+        originalText: text,
+        role: seg.role,
+      }];
+    }
+    const parts = splitTextByWordBudget(seg.content, maxWords);
+    const cappedParts = packToMaxParts(parts.length ? parts : [seg.content], maxAssistantParts);
+    return cappedParts.map((part) => {
+      const text = withPrefixes ? `${rolePrefix}${part}` : part;
+      return {
+        content: text,
+        originalText: text,
+        role: seg.role,
+      };
+    });
+  });
+  return exploded.filter((seg) => String(seg.content || "").trim().length > 0);
+}
+
+function ensureSpeakerPrefixesForStructuredDialog(parsed: any, originalText: string, options?: AnalyzeOptions) {
+  if (isMarkupMode(options)) return;
+  const structured = extractStructuredDialogSegments(originalText);
+  if (structured.length < 2) return;
+  if (!Array.isArray(parsed?.segments)) return;
+
+  parsed.segments = parsed.segments.map((seg: any) => {
+    const role = String(seg?.role || "").toLowerCase();
+    if (role !== "user" && role !== "assistant") return seg;
+    const sourceText = String(seg?.originalText || seg?.content || "").trim();
+    if (!sourceText) return seg;
+    if (/^\[(user|assistant)\]\s*:/i.test(sourceText)) return seg;
+    const prefix = role === "user" ? "[USER]: " : "[ASSISTANT]: ";
+    const next = `${prefix}${sourceText}`;
+    return {
+      ...seg,
+      content: next,
+      originalText: next,
+      tags: Array.isArray(seg?.tags) ? [...new Set([...(seg.tags || []), "speaker-prefix-preserved"])] : ["speaker-prefix-preserved"],
+    };
+  });
+}
+
+function buildSegmentsFromRawSource(originalText: string, options?: AnalyzeOptions) {
+  const fullText = String(originalText || "").trim();
+  if (!fullText) return [];
+  const explicitPair = extractLeadingQuestionAndAnswer(fullText);
+  const maxWords = getWordBudgetForProgressiveSegmentation(options);
+  if (explicitPair) {
+    const answerParts = splitTextByWordBudget(explicitPair.answer, maxWords);
+    return [
+      {
+        content: explicitPair.question,
+        originalText: explicitPair.question,
+        role: "user" as const,
+      },
+      ...(answerParts.length ? answerParts : [explicitPair.answer]).map((part) => ({
+        content: part,
+        originalText: part,
+        role: "assistant" as const,
+      })),
+    ];
+  }
+
+  const paragraphParts = splitTextByWordBudget(fullText, maxWords);
+  return paragraphParts.map((part) => ({
+    content: part,
+    originalText: part,
+    role: isQuestionLike(part) ? ("user" as const) : ("assistant" as const),
+  }));
+}
+
+function estimateSourceCoverageRatio(originalText: string, segments: any[]): number {
+  const source = String(originalText || "").replace(/\s+/g, " ").trim();
+  if (!source.length) return 1;
+  const rendered = (segments || [])
+    .map((s: any) => String(s?.originalText || s?.content || ""))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!rendered.length) return 0;
+  return Math.min(1, rendered.length / source.length);
+}
+
+function enforceProgressiveCoverageAndSimilarity(parsed: any, originalText: string, options?: AnalyzeOptions) {
+  if (isMarkupMode(options)) return;
+  if (isIntactLikeMode(options)) return;
+
+  const granularity = options?.granularity || "balanced";
+  if (granularity !== "balanced" && granularity !== "fine") return;
+
+  const currentSegments = Array.isArray(parsed?.segments) ? parsed.segments : [];
+  const currentCoverage = estimateSourceCoverageRatio(originalText, currentSegments);
+  const minCoverage = granularity === "balanced" ? 0.82 : 0.7;
+
+  const fromStructured = buildSegmentsFromStructuredSource(originalText, options);
+  if (fromStructured.length >= 2) {
+    const targetCoverage = estimateSourceCoverageRatio(originalText, fromStructured);
+    const isClearlyRicher = targetCoverage > currentCoverage + 0.08;
+    if (currentCoverage < minCoverage || isClearlyRicher) {
+      parsed.segments = fromStructured.map((seg, idx) => ({
+        ...seg,
+        semanticSignature: `progressive-structured-${idx}-${uuidv4().substring(0, 8)}`,
+        tags: ["progressive-segmentation", granularity, `sim-${getSimilarityThreshold(options).toFixed(2)}`],
+        knowledgeGraph: { nodes: [], edges: [] },
+        metadata: {
+          reason: `Segmentation locale progressive appliquee (${granularity}) pour preserver le contenu et refléter la similarite.`,
+        },
+      }));
+      return;
+    }
+  }
+
+  if (currentCoverage >= minCoverage) return;
+  const fromRaw = buildSegmentsFromRawSource(originalText, options);
+  if (fromRaw.length < 2) return;
+  parsed.segments = fromRaw.map((seg, idx) => ({
+    ...seg,
+    semanticSignature: `progressive-raw-${idx}-${uuidv4().substring(0, 8)}`,
+    tags: ["progressive-segmentation", granularity, `sim-${getSimilarityThreshold(options).toFixed(2)}`],
+    knowledgeGraph: { nodes: [], edges: [] },
+    metadata: {
+      reason: `Fallback progressif local (${granularity}) applique pour eviter la perte de contenu.`,
+    },
+  }));
 }
 
 function isMarkupMode(options?: AnalyzeOptions): boolean {
@@ -1087,6 +1393,7 @@ function normalizeAnalysisPayload(parsed: any, originalText: string, options?: A
   forceMarkupReadableSocraticShape(safeParsed, originalText, options);
   forceSingleBlockSocraticPair(safeParsed, originalText, options);
   forceLowCoverageSocraticFallback(safeParsed, originalText, options);
+  enforceProgressiveCoverageAndSimilarity(safeParsed, originalText, options);
 
   if (!safeParsed.segments || safeParsed.segments.length === 0) {
     safeParsed.segments = [
@@ -1183,6 +1490,7 @@ function normalizeAnalysisPayload(parsed: any, originalText: string, options?: A
   });
 
   safeParsed.segments = reconcileSocraticRoles(safeParsed.segments);
+  ensureSpeakerPrefixesForStructuredDialog(safeParsed, originalText, options);
   stripTechnicalSegmentsWhenDisabled(safeParsed, originalText, options);
   ensureGraphCompleteness(safeParsed);
   enrichGraphRichness(safeParsed);
@@ -1281,9 +1589,14 @@ export async function analyzeAndSegmentConversation(text: string, options?: Anal
     options?.customSegmentationInstruction?.trim() ||
     getSegmentationInstruction(options?.granularity || "balanced");
   const semanticComparisonInstruction = getSemanticComparisonInstruction(options);
+  const renderedAnalyzePrompt = renderPromptTemplate("analyze_and_segment", {
+    segmentationInstruction,
+    semanticComparisonInstruction,
+    textJson: JSON.stringify(text),
+  });
 
   if (provider === "openai") {
-    const prompt = `
+    const prompt = renderedAnalyzePrompt || `
  Tu es Socrate, expert en maieutique. Deconstruis cet echange.
  ${segmentationInstruction}
  ${semanticComparisonInstruction}
@@ -1377,7 +1690,7 @@ TEXTE: ${JSON.stringify(text)}
               role: "user",
               parts: [
                 {
-                  text: `
+                  text: renderedAnalyzePrompt || `
  Tu es Socrate, expert en maieutique. Deconstruis cet echange.
  ${segmentationInstruction}
  ${semanticComparisonInstruction}
@@ -1431,9 +1744,12 @@ TEXTE: ${JSON.stringify(text)}
 
 export async function deepAnalyzeConversation(text: string): Promise<string> {
   const provider = getSelectedProvider();
+  const configuredPrompt = renderPromptTemplate("deep_analysis", {
+    textQuoted: JSON.stringify(text),
+  });
 
   if (provider === "openai") {
-    const prompt = `
+    const prompt = configuredPrompt || `
 Tu es un expert en analyse semantique profonde.
 ANALYSE CE TEXTE:
 "${text.replace(/"/g, '\\"')}"
@@ -1453,7 +1769,7 @@ FORMAT: Markdown structure.
         role: "user",
         parts: [
           {
-            text: `
+            text: configuredPrompt || `
 Tu es un expert en analyse semantique profonde.
 ANALYSE CE TEXTE: "${text.replace(/"/g, '\\"')}"
 FORMAT: Markdown structure.
@@ -1476,7 +1792,11 @@ export async function enrichSegmentSemantics(
   const localInterpretation = buildLocalInterpretation(text, role);
   const provider = getSelectedProvider();
 
-  const prompt = `
+  const prompt = renderPromptTemplate("enrich_segment_semantics", {
+    conversationSummaryJson: JSON.stringify(conversationSummary),
+    role,
+    segmentTextJson: JSON.stringify(text),
+  }) || `
 Tu dois produire une sortie JSON stricte:
 {
   "semanticVectorDescription": "description vectorielle concise",

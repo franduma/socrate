@@ -31,7 +31,7 @@ import { formatDate, cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from '../lib/db';
-import { Suspense, lazy, useEffect, useState } from 'react';
+import { Component, Fragment, Suspense, lazy, useEffect, useMemo, useState } from 'react';
 import { Segment, SegmentationTrace } from '../types';
 
 const ConceptualMap = lazy(() =>
@@ -51,14 +51,458 @@ interface ConversationViewProps {
   onBack: () => void;
 }
 
+class ComparisonErrorBoundary extends Component<
+  { children: React.ReactNode },
+  { hasError: boolean; message: string }
+> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, message: '' };
+  }
+
+  static getDerivedStateFromError(error: any) {
+    return {
+      hasError: true,
+      message: String(error?.message || 'Erreur de rendu dans la comparaison.'),
+    };
+  }
+
+  componentDidCatch(error: any) {
+    console.error('ComparisonErrorBoundary caught:', error);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-red-800 text-xs leading-relaxed">
+          <p className="font-bold uppercase tracking-widest text-[10px] mb-1">Erreur comparaison</p>
+          <p>{this.state.message}</p>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+type DiffKind = 'equal' | 'removed' | 'added';
+type DiffPart = { kind: DiffKind; text: string };
+type MarkerDiffRow = {
+  leftText: string;
+  rightText: string;
+  leftMissingMarkers: number[];
+  rightMissingMarkers: number[];
+  leftOwnMarker?: number;
+  rightOwnMarker?: number;
+  leftKind: DiffKind | 'empty';
+  rightKind: DiffKind | 'empty';
+};
+
+function chunkLongLine(line: string, maxWords = 22): string[] {
+  const words = String(line || '').split(/\s+/).filter(Boolean);
+  if (words.length <= maxWords) return [line];
+  const out: string[] = [];
+  let cursor = 0;
+  while (cursor < words.length) {
+    out.push(words.slice(cursor, cursor + maxWords).join(' '));
+    cursor += maxWords;
+  }
+  return out;
+}
+
+function normalizeDiffUnits(text: string): string[] {
+  const raw = String(text || '').replace(/\r/g, '\n').trim();
+  if (!raw) return [];
+  const lines = raw
+    .split(/\n+/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  const units: string[] = [];
+  for (const line of lines) {
+    const sentenceLike = line
+      .split(/(?<=[.!?])\s+(?=[A-Z0-9À-ÖØ-Þ])/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const candidates = sentenceLike.length > 1 ? sentenceLike : chunkLongLine(line);
+    for (const c of candidates) {
+      const cleaned = c.replace(/\s+/g, ' ').trim();
+      if (!cleaned) continue;
+      units.push(cleaned);
+      if (units.length >= 220) return units;
+    }
+  }
+  return units;
+}
+
+function buildSideBySideDiff(leftText: string, rightText: string): { left: DiffPart[]; right: DiffPart[] } {
+  const leftUnits = normalizeDiffUnits(leftText);
+  const rightUnits = normalizeDiffUnits(rightText);
+  const n = leftUnits.length;
+  const m = rightUnits.length;
+
+  if (!n && !m) return { left: [], right: [] };
+  if (!n) return { left: [], right: rightUnits.map((text) => ({ kind: 'added' as DiffKind, text })) };
+  if (!m) return { left: leftUnits.map((text) => ({ kind: 'removed' as DiffKind, text })), right: [] };
+
+  const dp: number[][] = Array.from({ length: n + 1 }, () => Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      if (leftUnits[i] === rightUnits[j]) {
+        dp[i][j] = dp[i + 1][j + 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+  }
+
+  const left: DiffPart[] = [];
+  const right: DiffPart[] = [];
+  let i = 0;
+  let j = 0;
+
+  while (i < n && j < m) {
+    if (leftUnits[i] === rightUnits[j]) {
+      left.push({ kind: 'equal', text: leftUnits[i] });
+      right.push({ kind: 'equal', text: rightUnits[j] });
+      i += 1;
+      j += 1;
+      continue;
+    }
+    if (dp[i + 1][j] >= dp[i][j + 1]) {
+      left.push({ kind: 'removed', text: leftUnits[i] });
+      i += 1;
+    } else {
+      right.push({ kind: 'added', text: rightUnits[j] });
+      j += 1;
+    }
+  }
+
+  while (i < n) {
+    left.push({ kind: 'removed', text: leftUnits[i] });
+    i += 1;
+  }
+  while (j < m) {
+    right.push({ kind: 'added', text: rightUnits[j] });
+    j += 1;
+  }
+
+  return { left, right };
+}
+
+function buildMarkerDiffRowsFromParts(leftParts: DiffPart[], rightParts: DiffPart[]): MarkerDiffRow[] {
+  const rows: MarkerDiffRow[] = [];
+  let li = 0;
+  let ri = 0;
+  let markerId = 1;
+  let pendingForLeft: number[] = [];
+  let pendingForRight: number[] = [];
+
+  while (li < leftParts.length || ri < rightParts.length) {
+    const left = leftParts[li];
+    const right = rightParts[ri];
+
+    if (left?.kind === 'equal' && right?.kind === 'equal') {
+      rows.push({
+        leftText: left.text,
+        rightText: right.text,
+        leftMissingMarkers: pendingForLeft,
+        rightMissingMarkers: pendingForRight,
+        leftKind: 'equal',
+        rightKind: 'equal',
+      });
+      pendingForLeft = [];
+      pendingForRight = [];
+      li += 1;
+      ri += 1;
+      continue;
+    }
+
+    if (left?.kind === 'removed') {
+      const id = markerId++;
+      rows.push({
+        leftText: left.text,
+        rightText: '',
+        leftMissingMarkers: [],
+        rightMissingMarkers: [],
+        leftOwnMarker: id,
+        leftKind: 'removed',
+        rightKind: 'empty',
+      });
+      pendingForRight = [...pendingForRight, id];
+      li += 1;
+      continue;
+    }
+
+    if (right?.kind === 'added') {
+      const id = markerId++;
+      rows.push({
+        leftText: '',
+        rightText: right.text,
+        leftMissingMarkers: [],
+        rightMissingMarkers: [],
+        rightOwnMarker: id,
+        leftKind: 'empty',
+        rightKind: 'added',
+      });
+      pendingForLeft = [...pendingForLeft, id];
+      ri += 1;
+      continue;
+    }
+
+    if (left?.kind === 'equal' && !right) {
+      rows.push({
+        leftText: left.text,
+        rightText: '',
+        leftMissingMarkers: pendingForLeft,
+        rightMissingMarkers: pendingForRight,
+        leftKind: 'equal',
+        rightKind: 'empty',
+      });
+      pendingForLeft = [];
+      pendingForRight = [];
+      li += 1;
+      continue;
+    }
+    if (right?.kind === 'equal' && !left) {
+      rows.push({
+        leftText: '',
+        rightText: right.text,
+        leftMissingMarkers: pendingForLeft,
+        rightMissingMarkers: pendingForRight,
+        leftKind: 'empty',
+        rightKind: 'equal',
+      });
+      pendingForLeft = [];
+      pendingForRight = [];
+      ri += 1;
+      continue;
+    }
+
+    if (!left && !right) break;
+    if (left) li += 1;
+    if (right) ri += 1;
+  }
+
+  if (pendingForLeft.length || pendingForRight.length) {
+    rows.push({
+      leftText: '',
+      rightText: '',
+      leftMissingMarkers: pendingForLeft,
+      rightMissingMarkers: pendingForRight,
+      leftKind: 'empty',
+      rightKind: 'empty',
+    });
+  }
+
+  return rows;
+}
+
+function scoreFromCountSimilarity(a: number, b: number): number {
+  const max = Math.max(a, b);
+  if (max === 0) return 1;
+  return Math.max(0, 1 - Math.abs(a - b) / max);
+}
+
+function normalizeTokenForDiff(token: string): string {
+  return String(token || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]/g, '')
+    .trim();
+}
+
+function buildTokenSetForDiff(text: string): Set<string> {
+  const set = new Set<string>();
+  const chunks = String(text || '').match(/\S+/g) || [];
+  for (const chunk of chunks) {
+    const n = normalizeTokenForDiff(chunk);
+    if (!n) continue;
+    set.add(n);
+  }
+  return set;
+}
+
+type ComparisonIndex = {
+  normalizedCorpus: string;
+  phraseSet: Set<string>;
+  tokenSet: Set<string>;
+};
+
+type TraceComparableFields = {
+  granularite: string;
+  collection: string;
+  similarite: string;
+  provider: string;
+  vecteur: string;
+};
+
+function normalizePhraseForComparison(value: string) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function splitTextIntoPhrases(value: string): string[] {
+  const rows = String(value || '')
+    .replace(/\r/g, '\n')
+    .split(/\n+/)
+    .map((r) => r.trim())
+    .filter(Boolean);
+  const phrases: string[] = [];
+  for (const row of rows) {
+    const pieces = row
+      .split(/(?<=[.!?;:])\s+(?=[A-Z0-9À-ÖØ-Þ])/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (pieces.length) phrases.push(...pieces);
+    else phrases.push(row);
+  }
+  return phrases;
+}
+
+function buildComparisonIndex(corpus: string): ComparisonIndex {
+  const normalizedCorpus = normalizePhraseForComparison(corpus);
+  const phraseSet = new Set<string>();
+  splitTextIntoPhrases(corpus).forEach((phrase) => {
+    const n = normalizePhraseForComparison(phrase);
+    if (n) phraseSet.add(n);
+  });
+  return {
+    normalizedCorpus,
+    phraseSet,
+    tokenSet: buildTokenSetForDiff(corpus),
+  };
+}
+
+function normalizeComparableValue(value: string) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getTraceComparableFields(trace?: SegmentationTrace, fallbackVectorMode: 'local' | 'provider' = 'local'): TraceComparableFields {
+  const collection = trace?.semanticCollectionName || 'Aucune collection';
+  const vectorMode = trace?.vectorEngineMode || fallbackVectorMode;
+  const similarity = Number(trace?.similarityThreshold ?? 0.35).toFixed(2);
+  return {
+    granularite: String(trace?.granularityName || 'n/a'),
+    collection: collection,
+    similarite: similarity,
+    provider: String(trace?.provider || 'n/a'),
+    vecteur: String(vectorMode || 'local'),
+  };
+}
+
+function renderTraceValueComparison(value: string, otherValue: string) {
+  const same = normalizeComparableValue(value) === normalizeComparableValue(otherValue);
+  return (
+    <span className={cn('rounded px-1', same ? 'bg-sky-100 text-slate-800' : 'bg-yellow-200 text-yellow-900')}>
+      {value}
+    </span>
+  );
+}
+
+function renderTraceComparisonLine(self: TraceComparableFields, other: TraceComparableFields) {
+  return (
+    <>
+      <span>Granularite: </span>{renderTraceValueComparison(self.granularite, other.granularite)}
+      <span> | Collection: </span>{renderTraceValueComparison(self.collection, other.collection)}
+      <span> | Similarite: </span>{renderTraceValueComparison(self.similarite, other.similarite)}
+      <span> | Provider: </span>{renderTraceValueComparison(self.provider, other.provider)}
+      <span> | Vecteur: </span>{renderTraceValueComparison(self.vecteur, other.vecteur)}
+    </>
+  );
+}
+
+function isPhraseCommonAcrossCorpus(phrase: string, opposite: ComparisonIndex) {
+  const normalized = normalizePhraseForComparison(phrase);
+  if (!normalized) return true;
+  if (opposite.phraseSet.has(normalized)) return true;
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length >= 4 && opposite.normalizedCorpus.includes(normalized)) return true;
+  const uniq = Array.from(new Set(words));
+  if (uniq.length < 3) return false;
+  const overlapCount = uniq.filter((w) => opposite.tokenSet.has(w)).length;
+  const overlapRatio = overlapCount / uniq.length;
+  return overlapCount >= 3 && overlapRatio >= 0.72;
+}
+
+function renderUncommonPhrasesAgainstCorpus(
+  text: string,
+  opposite: ComparisonIndex,
+  withMarkers = false,
+  markerState?: { current: number }
+) {
+  const phrases = splitTextIntoPhrases(text);
+  if (!phrases.length) return <span>Aucun texte</span>;
+  let markerCounter = markerState?.current ?? 1;
+  return (
+    <>
+      {phrases.map((phrase, idx) => {
+        const uncommon = !isPhraseCommonAcrossCorpus(phrase, opposite);
+        const markerId = uncommon ? markerCounter++ : 0;
+        return (
+          <Fragment key={`phrase-frag-${idx}`}>
+            {withMarkers && uncommon ? renderDiffMarker(markerId, `phrase-marker-${idx}`) : null}
+            <span
+              key={`phrase-common-${idx}`}
+              className={cn(
+                'rounded px-0.5',
+                uncommon ? 'bg-yellow-200 text-yellow-900' : 'bg-sky-100 text-slate-800'
+              )}
+            >
+              {phrase}
+              {idx < phrases.length - 1 ? ' ' : ''}
+            </span>
+          </Fragment>
+        );
+      })}
+      {(() => {
+        if (markerState) markerState.current = markerCounter;
+        return null;
+      })()}
+    </>
+  );
+}
+
+function renderDiffMarker(markerId: number, key: string) {
+  return (
+    <span
+      key={key}
+      className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-yellow-300 border border-yellow-500 text-[10px] font-black text-yellow-900 align-middle mr-1"
+      title={`Marqueur ${markerId}`}
+      aria-label={`Marqueur ${markerId}`}
+    >
+      {markerId}
+    </span>
+  );
+}
+
 export function ConversationView({ convId, onBack }: ConversationViewProps) {
-  const [viewMode, setViewMode] = useState<'flux' | 'carte' | 'graphe'>('flux');
+  const [viewMode, setViewMode] = useState<'flux' | 'carte' | 'graphe'>(() => {
+    const saved = localStorage.getItem(`SOCRATE_CONV_VIEW_MODE_${convId}`);
+    return saved === 'carte' || saved === 'graphe' ? saved : 'flux';
+  });
   const [inspectedSegment, setInspectedSegment] = useState<Segment | null>(null);
   const [isMapFullscreen, setIsMapFullscreen] = useState(false);
   const [isAnalyzingDeep, setIsAnalyzingDeep] = useState(false);
+  const [compareConversationId, setCompareConversationId] = useState('');
   
   const conversation = useLiveQuery(() => db.conversations.get(convId), [convId]);
   const segments = useLiveQuery(() => db.segments.where('conversationId').equals(convId).sortBy('timestamp'), [convId]);
+  const compareSegments = useLiveQuery(
+    () => (compareConversationId ? db.segments.where('conversationId').equals(compareConversationId).sortBy('timestamp') : Promise.resolve([])),
+    [compareConversationId]
+  );
+  const allConversations = useLiveQuery(() => db.conversations.toArray()) || [];
 
   const [isGraphFullscreen, setIsGraphFullscreen] = useState(false);
   const [activeSemanticDetail, setActiveSemanticDetail] = useState<{ id: string, type: 'vector' | 'interpretation' } | null>(null);
@@ -70,6 +514,90 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
     || (conversation?.segmentationTraces && conversation.segmentationTraces.length > 0
       ? conversation.segmentationTraces[conversation.segmentationTraces.length - 1]
       : undefined);
+  const compareConversation = allConversations.find((c) => String(c.id) === String(compareConversationId)) || null;
+  const compareTrace: SegmentationTrace | undefined = compareConversation?.analysisTrace
+    || (compareConversation?.segmentationTraces && compareConversation.segmentationTraces.length > 0
+      ? compareConversation.segmentationTraces[compareConversation.segmentationTraces.length - 1]
+      : undefined);
+  const currentInterestEntries = Array.isArray(latestConversationTrace?.interestAttributeScores)
+    ? latestConversationTrace!.interestAttributeScores!
+    : [];
+  const compareInterestEntries = Array.isArray(compareTrace?.interestAttributeScores)
+    ? compareTrace!.interestAttributeScores!
+    : [];
+  const interestLabels = Array.from(new Set([
+    ...currentInterestEntries.map((e) => e.label),
+    ...compareInterestEntries.map((e) => e.label),
+  ]));
+  const interestDiffRows = interestLabels
+    .map((label) => {
+      const left = currentInterestEntries.find((e) => e.label === label)?.score || 0;
+      const right = compareInterestEntries.find((e) => e.label === label)?.score || 0;
+      return { label, left, right, delta: left - right };
+    })
+    .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+  const currentSegmentsList = segments || [];
+  const compareSegmentsList = compareSegments || [];
+  const currentPositionSegments = currentSegmentsList.filter((s) => s.role === 'user');
+  const currentSocraticSegments = currentSegmentsList.filter((s) => s.role === 'assistant');
+  const comparePositionSegments = compareSegmentsList.filter((s) => s.role === 'user');
+  const compareSocraticSegments = compareSegmentsList.filter((s) => s.role === 'assistant');
+  const initialPositionScore = scoreFromCountSimilarity(currentPositionSegments.length, comparePositionSegments.length);
+  const socraticAnalysisScore = scoreFromCountSimilarity(currentSocraticSegments.length, compareSocraticSegments.length);
+  const canDiffInitialPositions =
+    currentPositionSegments.length > 0 && currentPositionSegments.length === comparePositionSegments.length;
+  const canDiffSocratic =
+    currentSocraticSegments.length > 0 && currentSocraticSegments.length === compareSocraticSegments.length;
+  const currentPositionCorpus = currentPositionSegments
+    .map((seg) => String(seg.originalText || seg.content || ''))
+    .join(' ');
+  const comparePositionCorpus = comparePositionSegments
+    .map((seg) => String(seg.originalText || seg.content || ''))
+    .join(' ');
+  const currentSocraticCorpus = currentSocraticSegments
+    .map((seg) => String(seg.originalText || seg.content || ''))
+    .join(' ');
+  const compareSocraticCorpus = compareSocraticSegments
+    .map((seg) => String(seg.originalText || seg.content || ''))
+    .join(' ');
+  const currentPositionIndex = useMemo(() => buildComparisonIndex(currentPositionCorpus), [currentPositionCorpus]);
+  const comparePositionIndex = useMemo(() => buildComparisonIndex(comparePositionCorpus), [comparePositionCorpus]);
+  const currentSocraticIndex = useMemo(() => buildComparisonIndex(currentSocraticCorpus), [currentSocraticCorpus]);
+  const compareSocraticIndex = useMemo(() => buildComparisonIndex(compareSocraticCorpus), [compareSocraticCorpus]);
+  const initialPositionDiffPairs = useMemo(
+    () =>
+      canDiffInitialPositions
+        ? currentPositionSegments.map((leftSeg, idx) => ({
+            index: idx + 1,
+            diff: buildSideBySideDiff(
+              String(leftSeg.originalText || leftSeg.content || ''),
+              String(comparePositionSegments[idx]?.originalText || comparePositionSegments[idx]?.content || '')
+            ),
+          }))
+        : [],
+    [canDiffInitialPositions, currentPositionSegments, comparePositionSegments]
+  );
+  const socraticDiffPairs = useMemo(
+    () =>
+      canDiffSocratic
+        ? currentSocraticSegments.map((leftSeg, idx) => ({
+            index: idx + 1,
+            diff: buildSideBySideDiff(
+              String(leftSeg.originalText || leftSeg.content || ''),
+              String(compareSocraticSegments[idx]?.originalText || compareSocraticSegments[idx]?.content || '')
+            ),
+          }))
+        : [],
+    [canDiffSocratic, currentSocraticSegments, compareSocraticSegments]
+  );
+  const currentTraceFields = useMemo(
+    () => getTraceComparableFields(latestConversationTrace, vectorEngineMode),
+    [latestConversationTrace, vectorEngineMode]
+  );
+  const compareTraceFields = useMemo(
+    () => getTraceComparableFields(compareTrace, vectorEngineMode),
+    [compareTrace, vectorEngineMode]
+  );
   const formatTrace = (trace?: SegmentationTrace) => {
     if (!trace) return '';
     const collection = trace.semanticCollectionName || 'Aucune collection';
@@ -540,6 +1068,9 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
     window.addEventListener('vector-engine-mode-changed', handler as EventListener);
     return () => window.removeEventListener('vector-engine-mode-changed', handler as EventListener);
   }, []);
+  useEffect(() => {
+    localStorage.setItem(`SOCRATE_CONV_VIEW_MODE_${convId}`, viewMode);
+  }, [convId, viewMode]);
 
   const renderDeferredPanel = (node: React.ReactNode, minHeightClass = 'min-h-[300px]') => (
     <Suspense
@@ -722,6 +1253,137 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
             <Trash2 className="w-5 h-5" />
           </button>
         </header>
+
+        <section className="mb-6 bg-white rounded-[24px] border border-natural-sand shadow-sm p-4">
+          <div className="flex items-center justify-between gap-2 mb-2">
+            <h3 className="text-[11px] font-black uppercase tracking-widest text-natural-muted">Comparer deux conversations</h3>
+            <Network className="w-4 h-4 text-natural-accent" />
+          </div>
+          <select
+            value={compareConversationId}
+            onChange={(e) => setCompareConversationId(e.target.value)}
+            className="w-full p-3 bg-white border border-natural-sand rounded-xl text-xs text-natural-heading"
+          >
+            <option value="">Choisir une conversation a comparer</option>
+            {allConversations
+              .filter((c) => c.id !== convId)
+              .map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.title}
+                </option>
+              ))}
+          </select>
+          {compareConversationId && !compareConversation && (
+            <p className="mt-3 text-[11px] text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+              Conversation de comparaison introuvable. Recharge la page puis re-sélectionne la conversation.
+            </p>
+          )}
+          {compareConversation && (
+            <div className="mt-3 bg-natural-bg/50 rounded-xl border border-natural-sand p-3 space-y-1 text-[11px] text-natural-stone">
+              <p>
+                Comparaison active avec: <span className="font-bold text-natural-heading">{compareConversation.title}</span>
+              </p>
+              <p>
+                Score global actuel: <span className="font-bold text-natural-heading">
+                  {Number.isFinite(latestConversationTrace?.interestGlobalScore as number)
+                    ? `${Math.round(Number(latestConversationTrace?.interestGlobalScore) * 100)}%`
+                    : 'n/a'}
+                </span>
+                {' '}| compare: <span className="font-bold text-natural-heading">
+                  {Number.isFinite(compareTrace?.interestGlobalScore as number)
+                    ? `${Math.round(Number(compareTrace?.interestGlobalScore) * 100)}%`
+                    : 'n/a'}
+                </span>
+              </p>
+              <p>
+                Positions initiales: <span className="font-bold text-natural-heading">{Math.round(initialPositionScore * 100)}%</span>
+                {' '}({currentPositionSegments.length} vs {comparePositionSegments.length})
+                {' '}| Analyses socratiques: <span className="font-bold text-natural-heading">{Math.round(socraticAnalysisScore * 100)}%</span>
+                {' '}({currentSocraticSegments.length} vs {compareSocraticSegments.length})
+              </p>
+            </div>
+          )}
+        </section>
+
+        {compareConversation && (
+          <ComparisonErrorBoundary>
+            <section className="mb-8 space-y-4">
+              <div className="bg-white rounded-[24px] border border-natural-sand shadow-sm p-4 space-y-3">
+                <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">Comparaison - Positions initiales</p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="rounded-xl border border-natural-sand bg-white p-3">
+                    <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted mb-1">ACTUEL</p>
+                    <p className="text-[10px] text-natural-stone mb-2 leading-relaxed">{renderTraceComparisonLine(currentTraceFields, compareTraceFields)}</p>
+                    <div className="space-y-2 max-h-[380px] overflow-y-auto custom-scrollbar pr-1">
+                      {currentPositionSegments.length ? currentPositionSegments.map((seg, idx) => (
+                        <div key={`cmp-pi-left-${seg.id}`} className="rounded-lg border border-natural-sand/70 bg-natural-bg/30 p-2">
+                          <p className="text-[10px] font-bold uppercase tracking-wider text-natural-stone mb-1">#{idx + 1}</p>
+                          <p className="text-[11px] text-natural-stone leading-relaxed whitespace-pre-wrap">
+                            {renderUncommonPhrasesAgainstCorpus(String(seg.originalText || seg.content || ''), comparePositionIndex)}
+                          </p>
+                        </div>
+                      )) : <p className="text-[11px] italic text-natural-muted">Aucune position initiale</p>}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-natural-sand bg-white p-3">
+                    <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted mb-1">COMPARE</p>
+                    <p className="text-[10px] text-natural-stone mb-2 leading-relaxed">{renderTraceComparisonLine(compareTraceFields, currentTraceFields)}</p>
+                    <div className="space-y-2 max-h-[380px] overflow-y-auto custom-scrollbar pr-1">
+                      {comparePositionSegments.length ? comparePositionSegments.map((seg, idx) => (
+                        <div key={`cmp-pi-right-${seg.id}`} className="rounded-lg border border-natural-sand/70 bg-natural-bg/30 p-2">
+                          <p className="text-[10px] font-bold uppercase tracking-wider text-natural-stone mb-1">#{idx + 1}</p>
+                          <p className="text-[11px] text-natural-stone leading-relaxed whitespace-pre-wrap">
+                            {renderUncommonPhrasesAgainstCorpus(String(seg.originalText || seg.content || ''), currentPositionIndex)}
+                          </p>
+                        </div>
+                      )) : <p className="text-[11px] italic text-natural-muted">Aucune position initiale</p>}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-white rounded-[24px] border border-natural-sand shadow-sm p-4 space-y-3">
+                <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">Comparaison - Analyses socratiques</p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="rounded-xl border border-natural-sand bg-white p-3">
+                    <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted mb-1">ACTUEL</p>
+                    <p className="text-[10px] text-natural-stone mb-2 leading-relaxed">{renderTraceComparisonLine(currentTraceFields, compareTraceFields)}</p>
+                    <div className="space-y-2 max-h-[380px] overflow-y-auto custom-scrollbar pr-1">
+                      {currentSocraticSegments.length ? (() => {
+                        const markerState = { current: 1 };
+                        return currentSocraticSegments.map((seg, idx) => (
+                          <div key={`cmp-sa-left-${seg.id}`} className="rounded-lg border border-natural-sand/70 bg-natural-bg/30 p-2">
+                            <p className="text-[10px] font-bold uppercase tracking-wider text-natural-stone mb-1">#{idx + 1}</p>
+                            <p className="text-[11px] text-natural-stone leading-relaxed whitespace-pre-wrap">
+                              {renderUncommonPhrasesAgainstCorpus(String(seg.originalText || seg.content || ''), compareSocraticIndex, true, markerState)}
+                            </p>
+                          </div>
+                        ));
+                      })() : <p className="text-[11px] italic text-natural-muted">Aucune analyse socratique</p>}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-natural-sand bg-white p-3">
+                    <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted mb-1">COMPARE</p>
+                    <p className="text-[10px] text-natural-stone mb-2 leading-relaxed">{renderTraceComparisonLine(compareTraceFields, currentTraceFields)}</p>
+                    <div className="space-y-2 max-h-[380px] overflow-y-auto custom-scrollbar pr-1">
+                      {compareSocraticSegments.length ? (() => {
+                        const markerState = { current: 1 };
+                        return compareSocraticSegments.map((seg, idx) => (
+                          <div key={`cmp-sa-right-${seg.id}`} className="rounded-lg border border-natural-sand/70 bg-natural-bg/30 p-2">
+                            <p className="text-[10px] font-bold uppercase tracking-wider text-natural-stone mb-1">#{idx + 1}</p>
+                            <p className="text-[11px] text-natural-stone leading-relaxed whitespace-pre-wrap">
+                              {renderUncommonPhrasesAgainstCorpus(String(seg.originalText || seg.content || ''), currentSocraticIndex, true, markerState)}
+                            </p>
+                          </div>
+                        ));
+                      })() : <p className="text-[11px] italic text-natural-muted">Aucune analyse socratique</p>}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </ComparisonErrorBoundary>
+        )}
 
         <div className="space-y-8">
           {viewMode === 'flux' ? (
@@ -1134,6 +1796,178 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                 <Zap className="w-3.5 h-3.5 text-natural-accent" />
               </h4>
               
+              <div className="space-y-4">
+                <h4 className="text-[10px] font-bold text-natural-muted uppercase tracking-[0.2em] flex items-center justify-between">
+                  Comparaison d'analyse
+                  <Network className="w-3.5 h-3.5" />
+                </h4>
+                <select
+                  value={compareConversationId}
+                  onChange={(e) => setCompareConversationId(e.target.value)}
+                  className="w-full p-3 bg-white border border-natural-sand rounded-xl text-xs text-natural-heading"
+                >
+                  <option value="">Choisir une conversation a comparer</option>
+                  {allConversations.filter((c) => c.id !== convId).map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.title}
+                    </option>
+                  ))}
+                </select>
+
+                {compareConversation && (
+                  <ComparisonErrorBoundary>
+                    <div className="space-y-3">
+                      <div className="bg-white rounded-2xl border border-natural-sand p-3 text-[11px] text-natural-stone space-y-1">
+                        <p>Score global actuel: <span className="font-bold text-natural-heading">{Number.isFinite(latestConversationTrace?.interestGlobalScore as number) ? `${Math.round(Number(latestConversationTrace?.interestGlobalScore) * 100)}%` : 'n/a'}</span></p>
+                        <p>Score global compare: <span className="font-bold text-natural-heading">{Number.isFinite(compareTrace?.interestGlobalScore as number) ? `${Math.round(Number(compareTrace?.interestGlobalScore) * 100)}%` : 'n/a'}</span></p>
+                        <p>Score positions initiales: <span className="font-bold text-natural-heading">{Math.round(initialPositionScore * 100)}%</span> ({currentPositionSegments.length} vs {comparePositionSegments.length})</p>
+                        <p>Score analyses socratiques: <span className="font-bold text-natural-heading">{Math.round(socraticAnalysisScore * 100)}%</span> ({currentSocraticSegments.length} vs {compareSocraticSegments.length})</p>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                        <div className="rounded-lg border border-natural-sand p-2 bg-white">
+                          <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">ACTUEL</p>
+                          <p className="text-[10px] text-natural-stone mt-1 leading-relaxed">
+                            {renderTraceComparisonLine(currentTraceFields, compareTraceFields)}
+                          </p>
+                        </div>
+                        <div className="rounded-lg border border-natural-sand p-2 bg-white">
+                          <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">COMPARE</p>
+                          <p className="text-[10px] text-natural-stone mt-1 leading-relaxed">
+                            {renderTraceComparisonLine(compareTraceFields, currentTraceFields)}
+                          </p>
+                        </div>
+                      </div>
+
+                      {interestDiffRows.length > 0 ? (
+                        <div className="space-y-2 max-h-[220px] overflow-y-auto custom-scrollbar pr-1">
+                          {interestDiffRows.slice(0, 12).map((row) => (
+                            <div key={row.label} className="bg-white rounded-xl border border-natural-sand p-3">
+                              <p className="text-[11px] font-bold text-natural-heading">{row.label}</p>
+                              <p className="text-[10px] text-natural-muted mt-1">
+                                Actuel {(row.left * 100).toFixed(1)}% vs Compare {(row.right * 100).toFixed(1)}% | Delta {row.delta >= 0 ? '+' : ''}{(row.delta * 100).toFixed(1)} pts
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-[11px] text-natural-muted italic">Aucun score d'interet disponible pour comparer ces deux analyses.</p>
+                      )}
+
+                      <div className="bg-white rounded-xl border border-natural-sand p-3 space-y-3">
+                        <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">Diff - Positions initiales</p>
+                        {canDiffInitialPositions ? (
+                          <div className="max-h-[360px] overflow-y-auto custom-scrollbar pr-1 space-y-3">
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-2 sticky top-0 z-10 bg-white pb-2">
+                              <div className="rounded-lg border border-natural-sand p-2 bg-white">
+                                <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">ACTUEL</p>
+                                <p className="text-[10px] text-natural-stone mt-1 leading-relaxed">
+                                  {renderTraceComparisonLine(currentTraceFields, compareTraceFields)}
+                                </p>
+                              </div>
+                              <div className="rounded-lg border border-natural-sand p-2 bg-white">
+                                <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">COMPARE</p>
+                                <p className="text-[10px] text-natural-stone mt-1 leading-relaxed">
+                                  {renderTraceComparisonLine(compareTraceFields, currentTraceFields)}
+                                </p>
+                              </div>
+                            </div>
+                            {initialPositionDiffPairs.map((pair) => {
+                              const rows = buildMarkerDiffRowsFromParts(pair.diff.left, pair.diff.right);
+                              return (
+                                <div key={`position-diff-${pair.index}`} className="rounded-xl border border-natural-sand p-3 bg-natural-bg/20">
+                                  <p className="text-[10px] font-bold uppercase tracking-widest text-natural-stone mb-2">Position initiale #{pair.index}</p>
+                                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                    <div className="rounded-lg border border-natural-sand p-2 bg-white space-y-1">
+                                      {rows.length ? rows.map((row, idx) => (
+                                        <p key={`pi-left-${pair.index}-${idx}`} className={cn('text-[11px] leading-relaxed whitespace-pre-wrap px-2 py-1 rounded',
+                                          row.leftKind === 'equal' ? 'bg-sky-100 text-slate-800' :
+                                          row.leftKind === 'removed' ? 'bg-yellow-200 text-yellow-900 border border-yellow-300' : 'text-natural-stone')}>
+                                          {row.leftMissingMarkers.map((id, mkIdx) => renderDiffMarker(id, `pi-left-missing-${pair.index}-${idx}-${mkIdx}`))}
+                                          {row.leftOwnMarker ? renderDiffMarker(row.leftOwnMarker, `pi-left-own-${pair.index}-${idx}`) : null}
+                                          {row.leftText || (row.leftMissingMarkers.length ? '' : '\u00A0')}
+                                        </p>
+                                      )) : <p className="text-[11px] italic text-natural-muted">Aucun texte</p>}
+                                    </div>
+                                    <div className="rounded-lg border border-natural-sand p-2 bg-white space-y-1">
+                                      {rows.length ? rows.map((row, idx) => (
+                                        <p key={`pi-right-${pair.index}-${idx}`} className={cn('text-[11px] leading-relaxed whitespace-pre-wrap px-2 py-1 rounded',
+                                          row.rightKind === 'equal' ? 'bg-sky-100 text-slate-800' :
+                                          row.rightKind === 'added' ? 'bg-yellow-200 text-yellow-900 border border-yellow-300' : 'text-natural-stone')}>
+                                          {row.rightMissingMarkers.map((id, mkIdx) => renderDiffMarker(id, `pi-right-missing-${pair.index}-${idx}-${mkIdx}`))}
+                                          {row.rightOwnMarker ? renderDiffMarker(row.rightOwnMarker, `pi-right-own-${pair.index}-${idx}`) : null}
+                                          {row.rightText || (row.rightMissingMarkers.length ? '' : '\u00A0')}
+                                        </p>
+                                      )) : <p className="text-[11px] italic text-natural-muted">Aucun texte</p>}
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <p className="text-[11px] text-natural-muted italic">Diff indisponible: le nombre de positions initiales est different ({currentPositionSegments.length} vs {comparePositionSegments.length}).</p>
+                        )}
+                      </div>
+                      <div className="bg-white rounded-xl border border-natural-sand p-3 space-y-3">
+                        <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">Diff - Analyses socratiques</p>
+                        {canDiffSocratic ? (
+                          <div className="max-h-[360px] overflow-y-auto custom-scrollbar pr-1 space-y-3">
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-2 sticky top-0 z-10 bg-white pb-2">
+                              <div className="rounded-lg border border-natural-sand p-2 bg-white">
+                                <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">ACTUEL</p>
+                                <p className="text-[10px] text-natural-stone mt-1 leading-relaxed">
+                                  {renderTraceComparisonLine(currentTraceFields, compareTraceFields)}
+                                </p>
+                              </div>
+                              <div className="rounded-lg border border-natural-sand p-2 bg-white">
+                                <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">COMPARE</p>
+                                <p className="text-[10px] text-natural-stone mt-1 leading-relaxed">
+                                  {renderTraceComparisonLine(compareTraceFields, currentTraceFields)}
+                                </p>
+                              </div>
+                            </div>
+                            {socraticDiffPairs.map((pair) => {
+                              const rows = buildMarkerDiffRowsFromParts(pair.diff.left, pair.diff.right);
+                              return (
+                                <div key={`socratic-diff-${pair.index}`} className="rounded-xl border border-natural-sand p-3 bg-natural-bg/20">
+                                  <p className="text-[10px] font-bold uppercase tracking-widest text-natural-stone mb-2">Analyse socratique #{pair.index}</p>
+                                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                    <div className="rounded-lg border border-natural-sand p-2 bg-white space-y-1">
+                                      {rows.length ? rows.map((row, idx) => (
+                                        <p key={`sa-left-${pair.index}-${idx}`} className={cn('text-[11px] leading-relaxed whitespace-pre-wrap px-2 py-1 rounded',
+                                          row.leftKind === 'equal' ? 'bg-sky-100 text-slate-800' :
+                                          row.leftKind === 'removed' ? 'bg-yellow-200 text-yellow-900 border border-yellow-300' : 'text-natural-stone')}>
+                                          {row.leftMissingMarkers.map((id, mkIdx) => renderDiffMarker(id, `sa-left-missing-${pair.index}-${idx}-${mkIdx}`))}
+                                          {row.leftOwnMarker ? renderDiffMarker(row.leftOwnMarker, `sa-left-own-${pair.index}-${idx}`) : null}
+                                          {row.leftText || (row.leftMissingMarkers.length ? '' : '\u00A0')}
+                                        </p>
+                                      )) : <p className="text-[11px] italic text-natural-muted">Aucun texte</p>}
+                                    </div>
+                                    <div className="rounded-lg border border-natural-sand p-2 bg-white space-y-1">
+                                      {rows.length ? rows.map((row, idx) => (
+                                        <p key={`sa-right-${pair.index}-${idx}`} className={cn('text-[11px] leading-relaxed whitespace-pre-wrap px-2 py-1 rounded',
+                                          row.rightKind === 'equal' ? 'bg-sky-100 text-slate-800' :
+                                          row.rightKind === 'added' ? 'bg-yellow-200 text-yellow-900 border border-yellow-300' : 'text-natural-stone')}>
+                                          {row.rightMissingMarkers.map((id, mkIdx) => renderDiffMarker(id, `sa-right-missing-${pair.index}-${idx}-${mkIdx}`))}
+                                          {row.rightOwnMarker ? renderDiffMarker(row.rightOwnMarker, `sa-right-own-${pair.index}-${idx}`) : null}
+                                          {row.rightText || (row.rightMissingMarkers.length ? '' : '\u00A0')}
+                                        </p>
+                                      )) : <p className="text-[11px] italic text-natural-muted">Aucun texte</p>}
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <p className="text-[11px] text-natural-muted italic">Diff indisponible: le nombre d&apos;analyses socratiques est different ({currentSocraticSegments.length} vs {compareSocraticSegments.length}).</p>
+                        )}
+                      </div>
+                    </div>
+                  </ComparisonErrorBoundary>
+                )}
+              </div>
+
               {conversation.deepAnalysis ? (
                 <div className="bg-white rounded-[24px] p-6 shadow-sm border border-natural-sand prose prose-sm prose-slate max-h-[400px] overflow-y-auto custom-scrollbar">
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>

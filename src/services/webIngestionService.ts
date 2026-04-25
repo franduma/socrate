@@ -18,6 +18,7 @@ export interface WebSourceDefinition {
   enabled: boolean;
   titlePrefix?: string;
   granularityProfileId?: string;
+  promptCollectionId?: string;
   semanticCollectionId?: string;
   similarityThreshold?: number;
   vectorEngineMode?: 'local' | 'provider';

@@ -47,6 +47,16 @@ import { db } from './lib/db';
 import { CustomReaction, ChatMessage, DictionaryEntry, SemanticAttribute, SemanticAttributeCollection, SegmentationTrace } from './types';
 import { v4 as uuidv4 } from 'uuid';
 import { collectFromWebSource, fetchRawWebContent, WebSourceDefinition, WebSourceMode } from './services/webIngestionService';
+import {
+  PROMPT_TEMPLATE_DEFS,
+  PromptCollectionConfig,
+  PromptTemplateKey,
+  getPromptCollections,
+  getActivePromptCollectionId,
+  getDefaultPromptCollection,
+  setActivePromptCollectionId as persistActivePromptCollectionId,
+  saveCustomPromptCollections,
+} from './services/promptConfigService';
 
 /**
  * @license
@@ -80,6 +90,7 @@ type WebSourceDraft = {
   mode: WebSourceMode;
   titlePrefix: string;
   granularityProfileId: string;
+  promptCollectionId: string;
   semanticCollectionId: string;
   similarityThreshold: number;
   vectorEngineMode: 'local' | 'provider';
@@ -98,6 +109,13 @@ type WebCollectProgress = {
   total: number;
   saved: number;
   failed: number;
+};
+
+type InstructionQAItem = {
+  id: string;
+  question: string;
+  answer: string;
+  category: string;
 };
 
 const DEFAULT_GRANULARITY_PROFILES: GranularityProfile[] = [
@@ -204,6 +222,76 @@ function cosineLocal(a: Map<string, number>, b: Map<string, number>) {
   return denom ? dot / denom : 0;
 }
 
+type InterestScoreEntry = {
+  label: string;
+  score: number;
+  matched: boolean;
+};
+
+function computeLocalInterestScores(params: {
+  corpusUnits: string[];
+  attributeLabels: string[];
+  threshold: number;
+}) {
+  const threshold = Math.max(0, Math.min(1, Number.isFinite(params.threshold) ? params.threshold : 0.35));
+  const units = params.corpusUnits
+    .map((u) => String(u || '').trim())
+    .filter(Boolean);
+  const unitEntries = units
+    .map((u) => {
+      const vec = vectorizeText(u);
+      return {
+        unit: u,
+        vec,
+        tokens: new Set(tokenizeSemanticLocal(u)),
+      };
+    })
+    .filter((entry) => entry.vec.size > 0);
+  const attributes = params.attributeLabels
+    .map((l) => String(l || '').trim())
+    .filter(Boolean);
+  if (!attributes.length || !unitEntries.length) {
+    return {
+      globalScore: 0,
+      entries: [] as InterestScoreEntry[],
+    };
+  }
+
+  const entries: InterestScoreEntry[] = attributes.map((label) => {
+    const attrVec = vectorizeText(label);
+    const labelTokens = tokenizeSemanticLocal(label);
+    const normLabel = labelTokens.join(' ');
+    const perUnitScores = unitEntries
+      .map((entry) => {
+        const cosine = cosineLocal(attrVec, entry.vec);
+        const lexical = labelTokens.length
+          ? labelTokens.filter((t) => entry.tokens.has(t)).length / labelTokens.length
+          : 0;
+        const phraseHit = normLabel
+          ? tokenizeSemanticLocal(entry.unit).join(' ').includes(normLabel)
+          : false;
+        return (cosine * 0.55) + (lexical * 0.40) + ((phraseHit ? 1 : 0) * 0.05);
+      })
+      .sort((a, b) => b - a);
+    const top = perUnitScores.slice(0, Math.min(5, perUnitScores.length));
+    const weights = [1, 0.8, 0.6, 0.4, 0.2];
+    const weightedSum = top.reduce((sum, score, idx) => sum + score * weights[idx], 0);
+    const weightTotal = top.reduce((sum, _score, idx) => sum + weights[idx], 0) || 1;
+    const best = weightedSum / weightTotal;
+    return {
+      label,
+      score: Math.max(0, Math.min(1, best)),
+      matched: best >= threshold,
+    };
+  });
+
+  const globalScore = entries.reduce((sum, e) => sum + e.score, 0) / entries.length;
+  return {
+    globalScore: Math.max(0, Math.min(1, globalScore)),
+    entries: entries.sort((a, b) => b.score - a.score),
+  };
+}
+
 function getCoreGranularity(id: string): 'intact' | 'balanced' | 'fine' | 'markup' {
   if (id === 'intact' || id === 'fine' || id === 'balanced' || id === 'markup') return id;
   return 'balanced';
@@ -211,7 +299,7 @@ function getCoreGranularity(id: string): 'intact' | 'balanced' | 'fine' | 'marku
 
 export default function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-  const [activeTab, setActiveTab] = useState<'conv' | 'files' | 'search' | 'segments' | 'settings' | 'chat'>('conv');
+  const [activeTab, setActiveTab] = useState<'conv' | 'files' | 'search' | 'segments' | 'settings' | 'chat' | 'instructions'>('conv');
   const [selectedConvId, setSelectedConvId] = useState<string | null>(null);
   const [inputText, setInputText] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -219,7 +307,7 @@ export default function App() {
   const [isReactionAdminOpen, setIsReactionAdminOpen] = useState(false);
   const [isDictionaryOpen, setIsDictionaryOpen] = useState(false);
   const [dictSearch, setDictSearch] = useState('');
-  const [sourceTab, setSourceTab] = useState<'conv' | 'files' | 'search' | 'segments' | 'settings' | 'chat'>('conv');
+  const [sourceTab, setSourceTab] = useState<'conv' | 'files' | 'search' | 'segments' | 'settings' | 'chat' | 'instructions'>('conv');
   const [potentialCapture, setPotentialCapture] = useState<{ 
     title: string, 
     segments: any[], 
@@ -229,6 +317,48 @@ export default function App() {
   const [isWizardOpen, setIsWizardOpen] = useState(false);
   const [wizardTitle, setWizardTitle] = useState('');
   const [isFinalizingCapture, setIsFinalizingCapture] = useState(false);
+  const [internalInstructionsQA, setInternalInstructionsQA] = useState<InstructionQAItem[]>(() => {
+    const raw = localStorage.getItem('SOCRATE_INTERNAL_INSTRUCTIONS_QA');
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return parsed
+            .filter((item) => item && typeof item.id === 'string')
+            .map((item) => ({
+              id: String(item.id),
+              question: String(item.question || ''),
+              answer: String(item.answer || ''),
+              category: String(item.category || 'General'),
+            }));
+        }
+      } catch {
+        // fallback below
+      }
+    }
+    const legacy = localStorage.getItem('SOCRATE_INTERNAL_INSTRUCTIONS_NOTES') || '';
+    if (legacy.trim()) {
+      return [{ id: uuidv4(), question: '', answer: legacy, category: 'General' }];
+    }
+    return [];
+  });
+  const [editingInstructionIds, setEditingInstructionIds] = useState<Record<string, boolean>>({});
+  const [instructionDrafts, setInstructionDrafts] = useState<Record<string, { question: string; answer: string; category: string }>>({});
+  const [selectedInstructionCategory, setSelectedInstructionCategory] = useState<string>('all');
+  const [instructionCategoryCatalog, setInstructionCategoryCatalog] = useState<string[]>(() => {
+    const raw = localStorage.getItem('SOCRATE_INSTRUCTION_CATEGORY_CATALOG');
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.map((v) => String(v || '').trim()).filter(Boolean);
+    } catch {
+      return [];
+    }
+  });
+  const [isInstructionCategoryManagerOpen, setIsInstructionCategoryManagerOpen] = useState(false);
+  const [instructionCategoryNewDraft, setInstructionCategoryNewDraft] = useState('');
+  const [instructionCategoryRenameDraft, setInstructionCategoryRenameDraft] = useState('');
   const abortControllerRef = useRef<AbortController | null>(null);
 
   // Chat State
@@ -251,6 +381,136 @@ export default function App() {
     if (currentChatConvId) localStorage.setItem('CURRENT_CHAT_CONV_ID', currentChatConvId);
     else localStorage.removeItem('CURRENT_CHAT_CONV_ID');
   }, [currentChatConvId]);
+
+  useEffect(() => {
+    localStorage.setItem('SOCRATE_INTERNAL_INSTRUCTIONS_QA', JSON.stringify(internalInstructionsQA));
+  }, [internalInstructionsQA]);
+  useEffect(() => {
+    localStorage.setItem('SOCRATE_INSTRUCTION_CATEGORY_CATALOG', JSON.stringify(instructionCategoryCatalog));
+  }, [instructionCategoryCatalog]);
+
+  const handleAddInstructionQA = () => {
+    const id = uuidv4();
+    const inferredCategory = selectedInstructionCategory === 'all' ? 'General' : selectedInstructionCategory;
+    setInternalInstructionsQA((prev) => [...prev, { id, question: '', answer: '', category: inferredCategory }]);
+    setInstructionDrafts((prev) => ({ ...prev, [id]: { question: '', answer: '', category: inferredCategory } }));
+    setEditingInstructionIds((prev) => ({ ...prev, [id]: true }));
+  };
+
+  const handleStartEditInstruction = (item: InstructionQAItem) => {
+    setInstructionDrafts((prev) => ({
+      ...prev,
+      [item.id]: {
+        question: item.question || '',
+        answer: item.answer || '',
+        category: item.category || 'General',
+      },
+    }));
+    setEditingInstructionIds((prev) => ({ ...prev, [item.id]: true }));
+  };
+
+  const handleSaveInstruction = (id: string) => {
+    const draft = instructionDrafts[id];
+    if (!draft) return;
+    setInternalInstructionsQA((prev) =>
+      prev.map((qa) => (
+        qa.id === id
+          ? { ...qa, question: draft.question, answer: draft.answer, category: draft.category || 'General' }
+          : qa
+      ))
+    );
+    setEditingInstructionIds((prev) => ({ ...prev, [id]: false }));
+  };
+
+  const handleCancelEditInstruction = (id: string) => {
+    setEditingInstructionIds((prev) => ({ ...prev, [id]: false }));
+    setInstructionDrafts((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  };
+
+  const handleDeleteInstruction = (id: string) => {
+    setInternalInstructionsQA((prev) => prev.filter((qa) => qa.id !== id));
+    setEditingInstructionIds((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setInstructionDrafts((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  };
+
+  const handleAddInstructionCategory = () => {
+    const name = instructionCategoryNewDraft.trim();
+    if (!name) return;
+    setInstructionCategoryCatalog((prev) => {
+      if (prev.some((c) => c.toLowerCase() === name.toLowerCase())) return prev;
+      return [...prev, name].sort((a, b) => a.localeCompare(b));
+    });
+    setInstructionCategoryNewDraft('');
+    setSelectedInstructionCategory(name);
+  };
+
+  const handleRenameInstructionCategory = () => {
+    const from = selectedInstructionCategory;
+    const to = instructionCategoryRenameDraft.trim();
+    if (!from || from === 'all' || !to || from === to) return;
+    setInternalInstructionsQA((prev) =>
+      prev.map((qa) => (String(qa.category || '').trim() === from ? { ...qa, category: to } : qa))
+    );
+    setInstructionDrafts((prev) => {
+      const next = { ...prev };
+      Object.keys(next).forEach((id) => {
+        if ((next[id]?.category || '').trim() === from) {
+          next[id] = { ...next[id], category: to };
+        }
+      });
+      return next;
+    });
+    setInstructionCategoryCatalog((prev) => {
+      const withoutFrom = prev.filter((c) => c !== from);
+      const merged = withoutFrom.some((c) => c.toLowerCase() === to.toLowerCase())
+        ? withoutFrom
+        : [...withoutFrom, to];
+      return merged.sort((a, b) => a.localeCompare(b));
+    });
+    setSelectedInstructionCategory(to);
+    setInstructionCategoryRenameDraft('');
+  };
+
+  const instructionCategories = Array.from(
+    new Set(
+      [...instructionCategoryCatalog, ...internalInstructionsQA.map((qa) => qa.category)]
+        .map((qa) => String(qa || '').trim())
+        .filter(Boolean)
+    )
+  ).sort((a, b) => a.localeCompare(b));
+
+  const visibleInstructionsQA = selectedInstructionCategory === 'all'
+    ? internalInstructionsQA
+    : internalInstructionsQA.filter((qa) => String(qa.category || '').trim() === selectedInstructionCategory);
+
+  useEffect(() => {
+    if (selectedInstructionCategory === 'all') return;
+    if (!instructionCategories.includes(selectedInstructionCategory)) {
+      setSelectedInstructionCategory('all');
+    }
+  }, [instructionCategories, selectedInstructionCategory]);
+  useEffect(() => {
+    if (!isInstructionCategoryManagerOpen) {
+      setInstructionCategoryNewDraft('');
+      setInstructionCategoryRenameDraft('');
+    } else if (selectedInstructionCategory !== 'all') {
+      setInstructionCategoryRenameDraft(selectedInstructionCategory);
+    } else {
+      setInstructionCategoryRenameDraft('');
+    }
+  }, [isInstructionCategoryManagerOpen, selectedInstructionCategory]);
   
   // Selection / Threading State
   const [selectedText, setSelectedText] = useState('');
@@ -337,6 +597,7 @@ export default function App() {
           enabled: s.enabled !== false,
           titlePrefix: String(s.titlePrefix || '[WEB]'),
           granularityProfileId: String(s.granularityProfileId || 'balanced'),
+          promptCollectionId: String(s.promptCollectionId || getActivePromptCollectionId()),
           semanticCollectionId: String(s.semanticCollectionId || ''),
           similarityThreshold: Number.isFinite(Number(s.similarityThreshold)) ? Number(s.similarityThreshold) : 0.35,
           vectorEngineMode: s.vectorEngineMode === 'provider' ? 'provider' : 'local',
@@ -361,6 +622,7 @@ export default function App() {
     mode: 'rss',
     titlePrefix: '[WEB]',
     granularityProfileId: 'balanced',
+    promptCollectionId: getActivePromptCollectionId(),
     semanticCollectionId: '',
     similarityThreshold: 0.35,
     vectorEngineMode: 'local',
@@ -374,6 +636,9 @@ export default function App() {
   const [isCollectingWeb, setIsCollectingWeb] = useState(false);
   const [webCollectProgress, setWebCollectProgress] = useState<WebCollectProgress | null>(null);
   const webCollectStopRequestedRef = useRef(false);
+  const [promptCollections, setPromptCollections] = useState<PromptCollectionConfig[]>(() => getPromptCollections());
+  const [activePromptCollectionId, setActivePromptCollectionId] = useState<string>(() => getActivePromptCollectionId());
+  const [promptCollectionDraft, setPromptCollectionDraft] = useState<PromptCollectionConfig | null>(null);
 
   useEffect(() => {
     localStorage.setItem('SELECTED_MODEL', selectedModel);
@@ -425,7 +690,9 @@ export default function App() {
   const [isSavingKey, setIsSavingKey] = useState(false);
   const [isTestingConnection, setIsTestingConnection] = useState(false);
   const [isSavingGranularity, setIsSavingGranularity] = useState(false);
+  const [isSavingPromptCollections, setIsSavingPromptCollections] = useState(false);
   const [granularitySaveStamp, setGranularitySaveStamp] = useState<number | null>(null);
+  const [promptCollectionsSaveStamp, setPromptCollectionsSaveStamp] = useState<number | null>(null);
 
   const handleTestConnection = async () => {
     setIsTestingConnection(true);
@@ -503,10 +770,12 @@ export default function App() {
   useEffect(() => {
     if (selectedSemanticCollectionId) localStorage.setItem('SELECTED_SEMANTIC_COLLECTION_ID', selectedSemanticCollectionId);
     else localStorage.removeItem('SELECTED_SEMANTIC_COLLECTION_ID');
+    window.dispatchEvent(new CustomEvent('semantic-profile-changed'));
   }, [selectedSemanticCollectionId]);
 
   useEffect(() => {
     localStorage.setItem('SEMANTIC_SIMILARITY_THRESHOLD', String(selectedSemanticSimilarity));
+    window.dispatchEvent(new CustomEvent('semantic-profile-changed'));
   }, [selectedSemanticSimilarity]);
 
   const [dictTab, setDictTab] = useState<'semantic' | 'facets'>('semantic');
@@ -514,6 +783,10 @@ export default function App() {
   const [newCollectionName, setNewCollectionName] = useState('');
   const [selectedFacetsForCollection, setSelectedFacetsForCollection] = useState<string[]>([]);
   const granularityProfiles = [...DEFAULT_GRANULARITY_PROFILES, ...customGranularityProfiles];
+  const activePromptCollection =
+    promptCollections.find((collection) => collection.id === activePromptCollectionId)
+    || promptCollections[0]
+    || getDefaultPromptCollection();
   const selectedGranularityProfile =
     granularityProfiles.find((p) => p.id === selectedGranularityId) || DEFAULT_GRANULARITY_PROFILES[1];
   const configuredSemanticPositions = Array.from(new Set([
@@ -567,6 +840,14 @@ export default function App() {
     similarityThreshold: Number.isFinite(overrides?.similarityThreshold as number)
       ? (overrides?.similarityThreshold as number)
       : selectedSemanticSimilarity,
+    interestGlobalScore: Number.isFinite(overrides?.interestGlobalScore as number)
+      ? Number(overrides?.interestGlobalScore)
+      : undefined,
+    interestCollectionName: overrides?.interestCollectionName
+      ?? (selectedSemanticCollection?.name || undefined),
+    interestAttributeScores: Array.isArray(overrides?.interestAttributeScores)
+      ? overrides?.interestAttributeScores
+      : undefined,
     includeTechnicalSegment: overrides?.includeTechnicalSegment ?? includeTechnicalSegment,
     webSourceName: overrides?.webSourceName,
     webSourceUrl: overrides?.webSourceUrl,
@@ -580,7 +861,32 @@ export default function App() {
     const sim = Number.isFinite(trace.similarityThreshold) ? trace.similarityThreshold.toFixed(2) : '0.35';
     const vector = trace.vectorEngineMode || 'local';
     const tech = trace.includeTechnicalSegment === false ? 'tech:off' : 'tech:on';
-    return `[${granularity} | ${collection} | sim:${sim} | vec:${vector} | ${tech}]`;
+    const interest = Number.isFinite(trace.interestGlobalScore as number)
+      ? `interet:${(Number(trace.interestGlobalScore) * 100).toFixed(1)}%`
+      : 'interet:n/a';
+    return `[${granularity} | ${collection} | sim:${sim} | vec:${vector} | ${tech} | ${interest}]`;
+  };
+
+  const computeTraceInterestFromResult = (
+    result: any,
+    attributeLabels: string[],
+    threshold: number
+  ) => {
+    const graphNodes = Array.isArray(result?.analysis?.knowledgeGraph?.nodes)
+      ? result.analysis.knowledgeGraph.nodes
+      : [];
+    const graphUnits = graphNodes.map((n: any) =>
+      `${String(n?.label || '')} ${String(n?.type || '')} ${String(n?.properties?.semanticPosition || '')}`
+    );
+    const segmentUnits = Array.isArray(result?.segments)
+      ? result.segments.map((s: any) => String(s?.originalText || s?.content || ''))
+      : [];
+    const summaryUnit = String(result?.analysis?.summary || '');
+    return computeLocalInterestScores({
+      corpusUnits: [...graphUnits, ...segmentUnits, summaryUnit],
+      attributeLabels,
+      threshold,
+    });
   };
 
   useEffect(() => {
@@ -588,6 +894,24 @@ export default function App() {
       setSelectedGranularityId('balanced');
     }
   }, [granularityProfiles, selectedGranularityId]);
+
+  useEffect(() => {
+    if (!promptCollections.some((c) => c.id === activePromptCollectionId)) {
+      const fallbackId = promptCollections[0]?.id || getDefaultPromptCollection().id;
+      setActivePromptCollectionId(fallbackId);
+      persistActivePromptCollectionId(fallbackId);
+    }
+  }, [promptCollections, activePromptCollectionId]);
+
+  useEffect(() => {
+    const selected = promptCollections.find((c) => c.id === activePromptCollectionId);
+    if (!selected) return;
+    setPromptCollectionDraft({
+      ...selected,
+      prompts: { ...selected.prompts },
+    });
+    persistActivePromptCollectionId(selected.id);
+  }, [promptCollections, activePromptCollectionId]);
 
   useEffect(() => {
     if (selectedSemanticCollectionId && !semanticAttributeCollections.some((c) => c.id === selectedSemanticCollectionId)) {
@@ -990,6 +1314,7 @@ export default function App() {
     mode: 'rss',
     titlePrefix: '[WEB]',
     granularityProfileId: selectedGranularityProfile.id,
+    promptCollectionId: activePromptCollectionId,
     semanticCollectionId: selectedSemanticCollectionId || '',
     similarityThreshold: clampSimilarity(selectedSemanticSimilarity),
     vectorEngineMode,
@@ -1079,6 +1404,7 @@ export default function App() {
       enabled: true,
       titlePrefix: webSourceDraft.titlePrefix.trim() || '[WEB]',
       granularityProfileId: webSourceDraft.granularityProfileId || selectedGranularityProfile.id,
+      promptCollectionId: webSourceDraft.promptCollectionId || activePromptCollectionId,
       semanticCollectionId: webSourceDraft.semanticCollectionId || '',
       similarityThreshold: clampSimilarity(webSourceDraft.similarityThreshold),
       vectorEngineMode: webSourceDraft.vectorEngineMode || 'local',
@@ -1109,6 +1435,7 @@ export default function App() {
       mode: source.mode,
       titlePrefix: source.titlePrefix || '[WEB]',
       granularityProfileId: source.granularityProfileId || selectedGranularityProfile.id,
+      promptCollectionId: source.promptCollectionId || activePromptCollectionId,
       semanticCollectionId: source.semanticCollectionId || '',
       similarityThreshold: clampSimilarity(source.similarityThreshold ?? selectedSemanticSimilarity),
       vectorEngineMode: source.vectorEngineMode === 'provider' ? 'provider' : 'local',
@@ -1150,6 +1477,7 @@ export default function App() {
               mode: webSourceDraft.mode,
               titlePrefix: webSourceDraft.titlePrefix.trim() || '[WEB]',
               granularityProfileId: webSourceDraft.granularityProfileId || selectedGranularityProfile.id,
+              promptCollectionId: webSourceDraft.promptCollectionId || activePromptCollectionId,
               semanticCollectionId: webSourceDraft.semanticCollectionId || '',
               similarityThreshold: clampSimilarity(webSourceDraft.similarityThreshold),
               vectorEngineMode: webSourceDraft.vectorEngineMode || 'local',
@@ -1203,8 +1531,10 @@ export default function App() {
       saved: 0,
       failed: 0,
     });
+    const initialPromptProfileId = activePromptCollectionId;
     try {
       const { analyzeAndSegmentConversation } = await loadGeminiService();
+      const promptCollectionIds = new Set(promptCollections.map((p) => p.id));
       let savedCount = 0;
       let failedCount = 0;
       let processedCount = 0;
@@ -1245,6 +1575,11 @@ export default function App() {
             ? 'local'
             : vectorEngineMode;
         const sourceRssMaxItems = clampRssItems(source.rssMaxItems ?? 5);
+        const sourcePromptProfileId = promptCollectionIds.has(String(source.promptCollectionId || ''))
+          ? String(source.promptCollectionId)
+          : initialPromptProfileId;
+        persistActivePromptCollectionId(sourcePromptProfileId);
+        setActivePromptCollectionId(sourcePromptProfileId);
         const titlePrefix = (source.titlePrefix || '[WEB]').trim();
         try {
           setWebCollectProgress((prev) => ({
@@ -1380,6 +1715,21 @@ export default function App() {
                   knowledgeGraph: applyAdherenceToGraph(seg.knowledgeGraph),
                 })),
               };
+              const interest = computeTraceInterestFromResult(
+                enrichedResult,
+                sourceSemanticAttributes.map((a) => a.label),
+                sourceSimilarity
+              );
+              enrichedResult.analysisTrace = buildSegmentationTrace({
+                ...analysisTrace,
+                semanticCollectionId: sourceCollection?.id || undefined,
+                semanticCollectionName: sourceCollection?.name || undefined,
+                semanticAttributeLabels: sourceSemanticAttributes.map((a) => a.label),
+                similarityThreshold: sourceSimilarity,
+                interestCollectionName: sourceCollection?.name || undefined,
+                interestGlobalScore: interest.globalScore,
+                interestAttributeScores: interest.entries,
+              });
               const host = (() => {
                 try { return new URL(doc.url || source.url).hostname; } catch { return source.url; }
               })();
@@ -1453,6 +1803,8 @@ export default function App() {
         setActiveTab('conv');
       }
     } finally {
+      persistActivePromptCollectionId(initialPromptProfileId);
+      setActivePromptCollectionId(initialPromptProfileId);
       setIsCollectingWeb(false);
       webCollectStopRequestedRef.current = false;
     }
@@ -1486,6 +1838,17 @@ export default function App() {
           knowledgeGraph: applyAdherenceToGraph(seg.knowledgeGraph),
         })),
       };
+      const interest = computeTraceInterestFromResult(
+        enrichedResult,
+        selectedSemanticAttributes.map((a) => a.label),
+        selectedSemanticSimilarity
+      );
+      enrichedResult.analysisTrace = buildSegmentationTrace({
+        ...analysisTrace,
+        interestCollectionName: selectedSemanticCollection?.name || undefined,
+        interestGlobalScore: interest.globalScore,
+        interestAttributeScores: interest.entries,
+      });
       setPotentialCapture(enrichedResult);
       setWizardTitle(enrichedResult.title);
       setIsWizardOpen(true);
@@ -1671,6 +2034,81 @@ export default function App() {
     }, 300);
   };
 
+  const buildPromptMapFromDraft = (draft: PromptCollectionConfig) => {
+    const prompts = {} as Record<PromptTemplateKey, string>;
+    PROMPT_TEMPLATE_DEFS.forEach((def) => {
+      const value = String(draft.prompts?.[def.key] || '').trim();
+      prompts[def.key] = value || def.defaultContent;
+    });
+    return prompts;
+  };
+
+  const handleCreatePromptCollection = () => {
+    const source = promptCollectionDraft || activePromptCollection || getDefaultPromptCollection();
+    const now = Date.now();
+    const next: PromptCollectionConfig = {
+      id: uuidv4(),
+      name: `${source.name} (copie)`,
+      description: source.description || '',
+      prompts: buildPromptMapFromDraft(source),
+      readOnly: false,
+      createdAt: now,
+      updatedAt: now,
+    };
+    setPromptCollections((prev) => [...prev, next]);
+    setActivePromptCollectionId(next.id);
+    persistActivePromptCollectionId(next.id);
+  };
+
+  const handleSavePromptCollection = () => {
+    if (!promptCollectionDraft || promptCollectionDraft.readOnly) return;
+    setIsSavingPromptCollections(true);
+    const now = Date.now();
+    const normalized: PromptCollectionConfig = {
+      ...promptCollectionDraft,
+      name: promptCollectionDraft.name.trim() || 'Collection de prompts',
+      description: promptCollectionDraft.description || '',
+      prompts: buildPromptMapFromDraft(promptCollectionDraft),
+      readOnly: false,
+      updatedAt: now,
+      createdAt: Number.isFinite(promptCollectionDraft.createdAt)
+        ? promptCollectionDraft.createdAt
+        : now,
+    };
+
+    setPromptCollections((prev) => {
+      const defaultCollection = prev.find((c) => c.readOnly) || getDefaultPromptCollection();
+      const customCollections = prev
+        .filter((c) => !c.readOnly && c.id !== normalized.id)
+        .concat(normalized);
+      saveCustomPromptCollections(customCollections);
+      return [defaultCollection, ...customCollections];
+    });
+
+    setPromptCollectionDraft(normalized);
+    setActivePromptCollectionId(normalized.id);
+    persistActivePromptCollectionId(normalized.id);
+
+    setTimeout(() => {
+      setIsSavingPromptCollections(false);
+      setPromptCollectionsSaveStamp(Date.now());
+    }, 250);
+  };
+
+  const handleDeletePromptCollection = () => {
+    if (!promptCollectionDraft || promptCollectionDraft.readOnly) return;
+    const toDeleteId = promptCollectionDraft.id;
+    setPromptCollections((prev) => {
+      const defaultCollection = prev.find((c) => c.readOnly) || getDefaultPromptCollection();
+      const customCollections = prev.filter((c) => !c.readOnly && c.id !== toDeleteId);
+      saveCustomPromptCollections(customCollections);
+      return [defaultCollection, ...customCollections];
+    });
+    const fallbackId = getDefaultPromptCollection().id;
+    setActivePromptCollectionId(fallbackId);
+    persistActivePromptCollectionId(fallbackId);
+  };
+
   const handleContextMenu = (e: React.MouseEvent, targetMessageId?: string) => {
     const selection = window.getSelection();
     const text = selection?.toString().trim();
@@ -1840,6 +2278,17 @@ export default function App() {
           knowledgeGraph: applyAdherenceToGraph(seg.knowledgeGraph),
         })),
       };
+      const interest = computeTraceInterestFromResult(
+        enrichedResult,
+        selectedSemanticAttributes.map((a) => a.label),
+        selectedSemanticSimilarity
+      );
+      enrichedResult.analysisTrace = buildSegmentationTrace({
+        ...analysisTrace,
+        interestCollectionName: selectedSemanticCollection?.name || undefined,
+        interestGlobalScore: interest.globalScore,
+        interestAttributeScores: interest.entries,
+      });
       
       // Update potentialCapture
       setPotentialCapture(enrichedResult);
@@ -1923,6 +2372,7 @@ export default function App() {
             <NavItem icon={<MessageSquare className="w-4 h-4" />} label="Conversations" active={activeTab === 'conv'} onClick={() => { setActiveTab('conv'); setSelectedConvId(null); }} count={conversations.length} />
             <NavItem icon={<Quote className="w-4 h-4" />} label="Segments" active={activeTab === 'segments'} onClick={() => { setActiveTab('segments'); setSelectedConvId(null); }} />
             <NavItem icon={<FileText className="w-4 h-4" />} label="Imports" active={activeTab === 'files'} onClick={() => { setActiveTab('files'); setSelectedConvId(null); }} count={files.length + conversations.filter((c) => !!(c.analysisTrace?.webSourceUrl || c.analysisTrace?.webDocumentUrl)).length} />
+            <NavItem icon={<BookOpenText className="w-4 h-4" />} label="Instructions" active={activeTab === 'instructions'} onClick={() => { setActiveTab('instructions'); setSelectedConvId(null); }} />
             <NavItem icon={<Settings className="w-4 h-4" />} label="Paramètres" active={activeTab === 'settings'} onClick={() => { setActiveTab('settings'); setSelectedConvId(null); }} />
             <NavItem icon={<MessageSquare className="w-4 h-4" />} label="Chat Socrate" active={activeTab === 'chat'} onClick={() => { setActiveTab('chat'); setSelectedConvId(null); }} />
           </nav>
@@ -2132,7 +2582,7 @@ export default function App() {
 	                          <option value="browser_proxy">Proxy navigateur</option>
 	                        </select>
 	                      </div>
-                      <div className="grid grid-cols-1 md:grid-cols-6 gap-2">
+                      <div className="grid grid-cols-1 md:grid-cols-7 gap-2">
                         <input
                           value={webSourceDraft.titlePrefix}
                           onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, titlePrefix: e.target.value }))}
@@ -2146,6 +2596,15 @@ export default function App() {
                         >
                           {granularityProfiles.map((profile) => (
                             <option key={profile.id} value={profile.id}>{profile.name}</option>
+                          ))}
+                        </select>
+                        <select
+                          value={webSourceDraft.promptCollectionId}
+                          onChange={(e) => setWebSourceDraft((prev) => ({ ...prev, promptCollectionId: e.target.value }))}
+                          className="md:col-span-1 p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
+                        >
+                          {promptCollections.map((collection) => (
+                            <option key={collection.id} value={collection.id}>{collection.name}</option>
                           ))}
                         </select>
                         <select
@@ -2191,7 +2650,7 @@ export default function App() {
 	                          />
 	                        )}
 	                        <p className={cn("text-[11px] text-natural-muted", webSourceDraft.mode === 'rss' ? "md:col-span-2" : "md:col-span-3")}>
-	                          Parametres appliques a cette source uniquement: granularite, collection, similarite, vecteur{webSourceDraft.mode === 'rss' ? ", et nombre max d'items RSS." : "."}
+	                          Parametres appliques a cette source uniquement: granularite, profil de prompt, collection, similarite, vecteur{webSourceDraft.mode === 'rss' ? ", et nombre max d'items RSS." : "."}
 	                        </p>
 	                      </div>
 		                      {webSourceDraft.mode === 'browser_proxy' && (
@@ -2323,7 +2782,7 @@ export default function App() {
                               <p className="text-xs font-bold text-natural-heading truncate">{source.name}</p>
                               <p className="text-[10px] text-natural-muted truncate">{source.url}</p>
 	                              <p className="text-[10px] text-natural-stone truncate">
-	                                Titre: {source.titlePrefix || '[WEB]'} | Mode: {source.mode === 'scrape' ? 'Scrape' : source.mode === 'browser_proxy' ? 'Proxy navigateur' : 'RSS'} | Granularite: {(granularityProfiles.find((p) => p.id === source.granularityProfileId)?.name) || source.granularityProfileId || 'balanced'} | Similarite: {Number(source.similarityThreshold ?? 0.35).toFixed(2)} | Vecteur: {source.vectorEngineMode || 'local'}{source.mode === 'rss' ? ` | RSS max: ${source.rssMaxItems ?? 5}` : ''}{source.mode === 'browser_proxy' ? ` | Capture: ${source.browserProxySnapshot?.capturedAt ? new Date(source.browserProxySnapshot.capturedAt).toLocaleString() : 'Aucune'}` : ''}
+	                                Titre: {source.titlePrefix || '[WEB]'} | Mode: {source.mode === 'scrape' ? 'Scrape' : source.mode === 'browser_proxy' ? 'Proxy navigateur' : 'RSS'} | Granularite: {(granularityProfiles.find((p) => p.id === source.granularityProfileId)?.name) || source.granularityProfileId || 'balanced'} | Prompt: {(promptCollections.find((p) => p.id === source.promptCollectionId)?.name) || 'Prompts coeur (par defaut)'} | Similarite: {Number(source.similarityThreshold ?? 0.35).toFixed(2)} | Vecteur: {source.vectorEngineMode || 'local'}{source.mode === 'rss' ? ` | RSS max: ${source.rssMaxItems ?? 5}` : ''}{source.mode === 'browser_proxy' ? ` | Capture: ${source.browserProxySnapshot?.capturedAt ? new Date(source.browserProxySnapshot.capturedAt).toLocaleString() : 'Aucune'}` : ''}
 	                              </p>
 	                            </div>
 	                            <span className={cn(
@@ -2503,6 +2962,107 @@ export default function App() {
                         </button>
                         <div className="flex-1 py-3 px-4 rounded-2xl border border-natural-sand bg-natural-bg/40 text-[10px] font-bold uppercase tracking-widest text-natural-muted flex items-center justify-center">
                           {granularitySaveStamp ? 'Granularités sauvegardées' : 'Sauvegarde auto active'}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm space-y-6">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 bg-natural-sand rounded-xl text-natural-accent"><Quote className="w-5 h-5" /></div>
+                        <h3 className="font-serif text-xl text-natural-heading">Configuration des prompts</h3>
+                      </div>
+                      <p className="text-sm text-natural-muted italic">
+                        Definis des collections de prompts (nom, descriptif, templates). La collection active est utilisee pour les appels IA.
+                      </p>
+
+                      <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
+                        <select
+                          value={activePromptCollectionId}
+                          onChange={(e) => {
+                            const nextId = e.target.value;
+                            setActivePromptCollectionId(nextId);
+                            persistActivePromptCollectionId(nextId);
+                          }}
+                          className="md:col-span-2 p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs font-semibold"
+                        >
+                          {promptCollections.map((collection) => (
+                            <option key={collection.id} value={collection.id}>
+                              {collection.name}{collection.readOnly ? ' (lecture seule)' : ''}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          onClick={handleCreatePromptCollection}
+                          className="md:col-span-1 px-4 py-2.5 bg-natural-heading text-white rounded-xl text-xs font-black uppercase tracking-widest"
+                        >
+                          Dupliquer active
+                        </button>
+                        <button
+                          onClick={handleDeletePromptCollection}
+                          disabled={!promptCollectionDraft || promptCollectionDraft.readOnly}
+                          className="md:col-span-1 px-4 py-2.5 bg-white border border-natural-sand text-red-600 rounded-xl text-xs font-black uppercase tracking-widest disabled:opacity-50"
+                        >
+                          Supprimer
+                        </button>
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                        <div className="space-y-1">
+                          <label className="text-[9px] font-black uppercase tracking-widest text-natural-muted">Nom de collection</label>
+                          <input
+                            value={promptCollectionDraft?.name || ''}
+                            onChange={(e) => setPromptCollectionDraft((prev) => prev ? { ...prev, name: e.target.value } : prev)}
+                            disabled={!promptCollectionDraft || !!promptCollectionDraft.readOnly}
+                            className="w-full p-3 bg-white border border-natural-sand rounded-xl text-xs disabled:bg-natural-bg/40 disabled:text-natural-muted"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-[9px] font-black uppercase tracking-widest text-natural-muted">Descriptif</label>
+                          <input
+                            value={promptCollectionDraft?.description || ''}
+                            onChange={(e) => setPromptCollectionDraft((prev) => prev ? { ...prev, description: e.target.value } : prev)}
+                            disabled={!promptCollectionDraft || !!promptCollectionDraft.readOnly}
+                            className="w-full p-3 bg-white border border-natural-sand rounded-xl text-xs disabled:bg-natural-bg/40 disabled:text-natural-muted"
+                            placeholder="A quoi sert cette collection de prompts ?"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="space-y-4">
+                        {PROMPT_TEMPLATE_DEFS.map((def) => (
+                          <div key={def.key} className="rounded-2xl border border-natural-sand bg-natural-bg/40 p-4 space-y-2">
+                            <p className="text-xs font-black uppercase tracking-widest text-natural-heading">{def.label}</p>
+                            <p className="text-[11px] text-natural-muted">{def.description}</p>
+                            <textarea
+                              value={promptCollectionDraft?.prompts?.[def.key] || ''}
+                              onChange={(e) => setPromptCollectionDraft((prev) => {
+                                if (!prev) return prev;
+                                const nextPrompts = { ...(prev.prompts || {}) } as Record<PromptTemplateKey, string>;
+                                nextPrompts[def.key] = e.target.value;
+                                return { ...prev, prompts: nextPrompts };
+                              })}
+                              disabled={!promptCollectionDraft || !!promptCollectionDraft.readOnly}
+                              className="w-full min-h-[140px] p-3 bg-white border border-natural-sand rounded-xl text-xs font-mono disabled:bg-natural-bg/40 disabled:text-natural-muted"
+                            />
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="flex flex-col md:flex-row gap-3">
+                        <button
+                          onClick={handleSavePromptCollection}
+                          disabled={!promptCollectionDraft || !!promptCollectionDraft.readOnly}
+                          className="flex-1 py-3 bg-natural-accent text-white rounded-2xl font-bold text-xs uppercase tracking-widest flex items-center justify-center gap-2 hover:bg-natural-accent/90 transition-all shadow-lg shadow-natural-accent/10 disabled:opacity-50"
+                        >
+                          {isSavingPromptCollections ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                          Sauvegarder la collection
+                        </button>
+                        <div className="flex-1 py-3 px-4 rounded-2xl border border-natural-sand bg-natural-bg/40 text-[10px] font-bold uppercase tracking-widest text-natural-muted flex items-center justify-center">
+                          {promptCollectionDraft?.readOnly
+                            ? 'Collection systeme (lecture seule)'
+                            : promptCollectionsSaveStamp
+                              ? 'Collection sauvegardee'
+                              : 'Edition en cours'}
                         </div>
                       </div>
                     </div>
@@ -2853,6 +3413,231 @@ export default function App() {
                     </div>
                   </div>
                 </motion.div>
+              ) : activeTab === 'instructions' ? (
+                <motion.div key="instructions" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} className="max-w-4xl mx-auto space-y-8">
+                  <header className="bg-white p-10 rounded-[32px] border border-natural-sand shadow-sm">
+                    <div className="flex items-center gap-4 mb-4">
+                      <div className="w-12 h-12 bg-natural-accent rounded-2xl flex items-center justify-center">
+                        <BookOpenText className="w-6 h-6 text-white" />
+                      </div>
+                      <div>
+                        <h1 className="font-serif text-3xl text-natural-heading">Instructions</h1>
+                        <p className="text-natural-muted text-xs uppercase tracking-widest font-bold">Notes internes éditables</p>
+                      </div>
+                    </div>
+                    <p className="text-sm text-natural-muted italic">
+                      Espace libre pour documenter le fonctionnement interne de l'application.
+                    </p>
+                  </header>
+
+                  <div className="bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm space-y-4">
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          onClick={() => setSelectedInstructionCategory('all')}
+                          className={cn(
+                            "px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-widest border",
+                            selectedInstructionCategory === 'all'
+                              ? "bg-natural-accent text-white border-natural-accent"
+                              : "bg-white text-natural-muted border-natural-sand"
+                          )}
+                        >
+                          Toutes
+                        </button>
+                        {instructionCategories.map((category) => (
+                          <button
+                            key={category}
+                            onClick={() => setSelectedInstructionCategory(category)}
+                            className={cn(
+                              "px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-widest border",
+                              selectedInstructionCategory === category
+                                ? "bg-natural-accent text-white border-natural-accent"
+                                : "bg-white text-natural-muted border-natural-sand"
+                            )}
+                          >
+                            {category}
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        onClick={() => setIsInstructionCategoryManagerOpen((prev) => !prev)}
+                        className={cn(
+                          "px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-widest border",
+                          isInstructionCategoryManagerOpen
+                            ? "bg-natural-accent text-white border-natural-accent"
+                            : "bg-white text-natural-heading border-natural-sand"
+                        )}
+                      >
+                        Ajouter/modifier categorie
+                      </button>
+                    </div>
+                    {isInstructionCategoryManagerOpen && (
+                      <div className="rounded-2xl border border-natural-sand bg-natural-bg/40 p-3 space-y-2">
+                        <div className="flex flex-col md:flex-row gap-2">
+                          <input
+                            value={instructionCategoryNewDraft}
+                            onChange={(e) => setInstructionCategoryNewDraft(e.target.value)}
+                            placeholder="Nouvelle categorie"
+                            className="flex-1 p-2.5 bg-white border border-natural-sand rounded-xl text-xs"
+                          />
+                          <button
+                            onClick={handleAddInstructionCategory}
+                            className="px-3 py-2.5 bg-natural-heading text-white rounded-xl text-[10px] font-black uppercase tracking-widest"
+                          >
+                            Ajouter
+                          </button>
+                        </div>
+                        <div className="flex flex-col md:flex-row gap-2">
+                          <input
+                            value={instructionCategoryRenameDraft}
+                            onChange={(e) => setInstructionCategoryRenameDraft(e.target.value)}
+                            disabled={selectedInstructionCategory === 'all'}
+                            placeholder={selectedInstructionCategory === 'all' ? 'Selectionnez un onglet categorie' : 'Renommer categorie active'}
+                            className="flex-1 p-2.5 bg-white border border-natural-sand rounded-xl text-xs disabled:opacity-60"
+                          />
+                          <button
+                            onClick={handleRenameInstructionCategory}
+                            disabled={selectedInstructionCategory === 'all'}
+                            className="px-3 py-2.5 bg-natural-accent text-white rounded-xl text-[10px] font-black uppercase tracking-widest disabled:opacity-60"
+                          >
+                            Renommer
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {internalInstructionsQA.length === 0 ? (
+                      <button
+                        onClick={handleAddInstructionQA}
+                        className="w-full py-3 border-2 border-dashed border-natural-sand rounded-2xl text-natural-muted hover:border-natural-accent hover:text-natural-accent transition-all flex items-center justify-center gap-2 font-bold text-xs uppercase tracking-widest"
+                      >
+                        <Plus className="w-4 h-4" />
+                      Creer une fiche Question/Reponse
+                    </button>
+                    ) : (
+                      <div className="space-y-3">
+                        {visibleInstructionsQA.map((item, index) => (
+                          <div key={item.id} className="rounded-2xl border border-natural-sand bg-natural-bg/30 p-3 space-y-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <p className="text-[10px] font-black uppercase tracking-widest text-natural-muted">Fiche {index + 1}</p>
+                              <div className="flex items-center gap-2">
+                                {editingInstructionIds[item.id] ? (
+                                  <>
+                                    <button
+                                      onClick={() => handleCancelEditInstruction(item.id)}
+                                      className="px-2 py-1 bg-white border border-natural-sand text-natural-muted rounded-lg text-[10px] font-black uppercase tracking-wider"
+                                    >
+                                      Annuler
+                                    </button>
+                                    <button
+                                      onClick={() => handleSaveInstruction(item.id)}
+                                      className="px-2 py-1 bg-natural-accent text-white rounded-lg text-[10px] font-black uppercase tracking-wider"
+                                    >
+                                      Sauvegarder
+                                    </button>
+                                  </>
+                                ) : (
+                                  <button
+                                    onClick={() => handleStartEditInstruction(item)}
+                                    className="px-2 py-1 bg-white border border-natural-sand text-natural-heading rounded-lg text-[10px] font-black uppercase tracking-wider"
+                                  >
+                                    Modifier
+                                  </button>
+                                )}
+                                <button
+                                  onClick={() => handleDeleteInstruction(item.id)}
+                                  className="p-1.5 text-natural-stone hover:text-red-500"
+                                  title="Supprimer"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              </div>
+                            </div>
+                            <textarea
+                              value={editingInstructionIds[item.id]
+                                ? (instructionDrafts[item.id]?.question ?? item.question ?? '')
+                                : (item.question || '')}
+                              onChange={(e) => {
+                                if (!editingInstructionIds[item.id]) return;
+                                const value = e.target.value;
+                                setInstructionDrafts((prev) => ({
+                                  ...prev,
+                                  [item.id]: {
+                                    question: value,
+                                    answer: prev[item.id]?.answer ?? item.answer ?? '',
+                                    category: prev[item.id]?.category ?? item.category ?? 'General',
+                                  },
+                                }));
+                              }}
+                              onInput={(e) => {
+                                const el = e.currentTarget;
+                                el.style.height = 'auto';
+                                el.style.height = `${el.scrollHeight}px`;
+                              }}
+                              placeholder="Question"
+                              rows={2}
+                              readOnly={!editingInstructionIds[item.id]}
+                              className="w-full min-h-[58px] p-3 bg-gray-100 border border-natural-sand rounded-xl text-sm outline-none focus:border-natural-accent resize-none overflow-hidden"
+                            />
+                            <input
+                              value={editingInstructionIds[item.id]
+                                ? (instructionDrafts[item.id]?.category ?? item.category ?? 'General')
+                                : (item.category || 'General')}
+                              onChange={(e) => {
+                                if (!editingInstructionIds[item.id]) return;
+                                const value = e.target.value;
+                                setInstructionDrafts((prev) => ({
+                                  ...prev,
+                                  [item.id]: {
+                                    question: prev[item.id]?.question ?? item.question ?? '',
+                                    answer: prev[item.id]?.answer ?? item.answer ?? '',
+                                    category: value,
+                                  },
+                                }));
+                              }}
+                              placeholder="Categorie (ex: Technique, Processus, API)"
+                              readOnly={!editingInstructionIds[item.id]}
+                              className="w-full p-2.5 bg-natural-sand/40 border border-natural-sand rounded-xl text-xs font-semibold outline-none focus:border-natural-accent"
+                            />
+                            <textarea
+                              value={editingInstructionIds[item.id]
+                                ? (instructionDrafts[item.id]?.answer ?? item.answer ?? '')
+                                : (item.answer || '')}
+                              onChange={(e) => {
+                                if (!editingInstructionIds[item.id]) return;
+                                const value = e.target.value;
+                                setInstructionDrafts((prev) => ({
+                                  ...prev,
+                                  [item.id]: {
+                                    question: prev[item.id]?.question ?? item.question ?? '',
+                                    answer: value,
+                                    category: prev[item.id]?.category ?? item.category ?? 'General',
+                                  },
+                                }));
+                              }}
+                              placeholder="Reponse"
+                              readOnly={!editingInstructionIds[item.id]}
+                              className="w-full min-h-[180px] p-3 pl-6 bg-white border border-natural-sand rounded-2xl text-sm leading-relaxed outline-none focus:border-natural-accent"
+                            />
+                          </div>
+                        ))}
+                        <button
+                          onClick={handleAddInstructionQA}
+                          className="w-full py-2.5 bg-natural-sand text-natural-heading rounded-xl text-[10px] font-black uppercase tracking-widest"
+                        >
+                          Ajouter un autre Q/R
+                        </button>
+                        {visibleInstructionsQA.length === 0 && (
+                          <div className="rounded-2xl border border-dashed border-natural-sand p-4 text-center text-xs text-natural-muted italic">
+                            Aucune fiche dans cette categorie.
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    <p className="text-[10px] uppercase tracking-widest text-natural-muted font-black">
+                      Sauvegarde automatique locale active
+                    </p>
+                  </div>
+                </motion.div>
               ) : activeTab === 'chat' ? (
                 <motion.div key="chat" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} className="max-w-4xl mx-auto flex flex-col h-[75vh]">
                   <div className="bg-white p-4 rounded-t-[32px] border-x border-t border-natural-sand shadow-sm flex items-center justify-between px-8">
@@ -2870,6 +3655,22 @@ export default function App() {
                         {granularityProfiles.map((profile) => (
                           <option key={profile.id} value={profile.id}>
                             {profile.name}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        value={activePromptCollectionId}
+                        onChange={(e) => {
+                          const id = e.target.value;
+                          setActivePromptCollectionId(id);
+                          persistActivePromptCollectionId(id);
+                        }}
+                        className="px-3 py-2 bg-white border border-natural-sand rounded-xl text-[10px] font-black uppercase tracking-wider text-natural-muted max-w-[220px]"
+                        title="Profil de prompt"
+                      >
+                        {promptCollections.map((collection) => (
+                          <option key={collection.id} value={collection.id}>
+                            {collection.name}
                           </option>
                         ))}
                       </select>
@@ -3221,6 +4022,26 @@ export default function App() {
                         </div>
                         <div className="flex flex-col items-center gap-2">
                           <label className="text-[10px] font-black text-natural-muted uppercase tracking-[0.2em]">
+                            Profil de prompt
+                          </label>
+                          <select
+                            value={activePromptCollectionId}
+                            onChange={(e) => {
+                              const id = e.target.value;
+                              setActivePromptCollectionId(id);
+                              persistActivePromptCollectionId(id);
+                            }}
+                            className="px-4 py-2.5 bg-white border border-natural-sand rounded-xl text-[11px] font-bold uppercase tracking-wider text-natural-muted"
+                          >
+                            {promptCollections.map((collection) => (
+                              <option key={collection.id} value={collection.id}>
+                                {collection.name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div className="flex flex-col items-center gap-2">
+                          <label className="text-[10px] font-black text-natural-muted uppercase tracking-[0.2em]">
                             Collection attributs
                           </label>
                           <select
@@ -3266,6 +4087,45 @@ export default function App() {
                         )}
                       </div>
                     </div>
+                </section>
+                <section className="mt-8 bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm">
+                  <div className="flex items-center justify-between mb-6">
+                    <div>
+                      <h2 className="font-serif text-2xl text-natural-heading">Conversations récentes</h2>
+                      <p className="text-[11px] uppercase tracking-wider font-semibold text-natural-muted mt-1">
+                        Ouvrez une conversation pour voir la synthèse et la comparaison d&apos;analyse
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => setIsSidebarOpen(true)}
+                      className="px-4 py-2 bg-natural-sand rounded-xl text-[10px] font-black uppercase tracking-widest text-natural-heading hover:bg-natural-beige transition-all"
+                    >
+                      Ouvrir le menu
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {conversations.slice(0, 8).map((c) => (
+                      <button
+                        key={c.id}
+                        onClick={() => {
+                          setSourceTab('conv');
+                          setActiveTab('conv');
+                          setSelectedConvId(c.id);
+                        }}
+                        className="text-left p-4 rounded-2xl border border-natural-sand bg-natural-bg/40 hover:border-natural-accent/40 hover:bg-white transition-all"
+                      >
+                        <p className="font-serif text-lg text-natural-heading line-clamp-2 leading-tight">{c.title}</p>
+                        <p className="text-[10px] uppercase tracking-wider font-bold text-natural-muted mt-2">
+                          {new Date(c.updatedAt).toLocaleString()}
+                        </p>
+                      </button>
+                    ))}
+                    {conversations.length === 0 && (
+                      <div className="md:col-span-2 p-8 text-center rounded-2xl border-2 border-dashed border-natural-sand text-natural-muted italic">
+                        Aucune conversation enregistrée pour le moment.
+                      </div>
+                    )}
+                  </div>
                 </section>
               </motion.div>
             ) : (

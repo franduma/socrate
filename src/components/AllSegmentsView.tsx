@@ -91,7 +91,10 @@ export function AllSegmentsView({ onSelectConversation }: AllSegmentsViewProps) 
                       const trace = (segment.analysisTrace || parentConv?.analysisTrace);
                       const origin = trace?.webDocumentUrl || trace?.webSourceUrl;
                       const originPart = origin ? ` | Origine: ${origin}` : '';
-                      return `Granularite: ${trace?.granularityName || 'n/a'} | Collection: ${trace?.semanticCollectionName || 'Aucune'} | Similarite: ${(trace?.similarityThreshold ?? 0.35).toFixed(2)} | Vecteur: ${trace?.vectorEngineMode || 'local'}${originPart}`;
+                      const interestPart = Number.isFinite(trace?.interestGlobalScore as number)
+                        ? ` | Interet: ${(Number(trace?.interestGlobalScore) * 100).toFixed(1)}%`
+                        : '';
+                      return `Granularite: ${trace?.granularityName || 'n/a'} | Collection: ${trace?.semanticCollectionName || 'Aucune'} | Similarite: ${(trace?.similarityThreshold ?? 0.35).toFixed(2)} | Vecteur: ${trace?.vectorEngineMode || 'local'}${interestPart}${originPart}`;
                     })()}`}
                   </div>
                 )}

@@ -16,6 +16,13 @@ export interface SegmentationTrace {
   semanticAttributeLabels: string[];
   similarityThreshold: number;
   includeTechnicalSegment?: boolean;
+  interestGlobalScore?: number;
+  interestCollectionName?: string;
+  interestAttributeScores?: Array<{
+    label: string;
+    score: number;
+    matched: boolean;
+  }>;
   webSourceName?: string;
   webSourceUrl?: string;
   webDocumentTitle?: string;
