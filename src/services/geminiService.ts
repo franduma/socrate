@@ -636,6 +636,83 @@ function extractStructuredDialogSegments(
   return segments.filter((s) => s.content.length >= 2);
 }
 
+function hasBracketedUserAssistantDialog(text: string): boolean {
+  const raw = String(text || "");
+  return /\[\s*user\s*\]\s*:/i.test(raw) && /\[\s*assistant\s*\]\s*:/i.test(raw);
+}
+
+function extractBracketedUserAssistantTurns(
+  text: string
+): Array<{ role: "user" | "assistant"; content: string }> {
+  const raw = String(text || "");
+  if (!hasBracketedUserAssistantDialog(raw)) return [];
+
+  const marker = /\[\s*(user|assistant)\s*\]\s*:/gi;
+  const matches = Array.from(raw.matchAll(marker));
+  if (matches.length < 2) return [];
+
+  const turns: Array<{ role: "user" | "assistant"; content: string }> = [];
+  for (let i = 0; i < matches.length; i++) {
+    const current = matches[i];
+    const next = matches[i + 1];
+    const roleRaw = String(current?.[1] || "").toLowerCase();
+    const role = roleRaw === "assistant" ? "assistant" : "user";
+    const start = (current.index ?? 0) + String(current[0] || "").length;
+    const end = next?.index ?? raw.length;
+    const payload = raw.slice(start, end).trim();
+    if (!payload) continue;
+    turns.push({ role, content: payload });
+  }
+
+  const hasUser = turns.some((t) => t.role === "user");
+  const hasAssistant = turns.some((t) => t.role === "assistant");
+  if (!hasUser || !hasAssistant) return [];
+  return turns;
+}
+
+function forceBracketedDialogTurnPreservation(parsed: any, originalText: string, options?: AnalyzeOptions): boolean {
+  const turns = extractBracketedUserAssistantTurns(originalText);
+  if (turns.length < 2) return false;
+
+  const similarity = getSimilarityThreshold(options);
+  const formatAssistantTurn = (content: string) => {
+    const raw = String(content || "").trim();
+    if (!raw) return raw;
+    // Preserve the exact number of [USER]/[ASSISTANT] turns while making similarity visible
+    // through internal response layout only (line-break grouping).
+    if (similarity <= 0.3) return raw;
+    const baseBudget = getWordBudgetForProgressiveSegmentation(options);
+    const adjustedBudget = similarity >= 0.65
+      ? Math.max(35, Math.round(baseBudget * 0.5))
+      : Math.max(55, Math.round(baseBudget * 0.75));
+    const parts = splitTextByWordBudget(raw, adjustedBudget);
+    if (parts.length <= 1) return raw;
+    return parts.join("\n\n");
+  };
+
+  parsed.segments = turns.map((turn, idx) => {
+    const prefix = turn.role === "user" ? "[USER]: " : "[ASSISTANT]: ";
+    const payload = turn.role === "assistant" ? formatAssistantTurn(turn.content) : String(turn.content || "").trim();
+    const text = `${prefix}${payload}`.trim();
+    return {
+      content: text,
+      originalText: text,
+      role: turn.role,
+      semanticSignature: `bracketed-turn-${idx}-${uuidv4().substring(0, 8)}`,
+      tags: [
+        "structured-dialog-bracketed",
+        "turn-preserved",
+        `sim-${getSimilarityThreshold(options).toFixed(2)}`,
+      ],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: {
+        reason: "Dialogue [USER]/[ASSISTANT] detecte: conservation stricte des tours question/reponse.",
+      },
+    };
+  });
+  return true;
+}
+
 function forceIntactFreeTextShape(parsed: any, originalText: string, options?: AnalyzeOptions) {
   if (!isIntactLikeMode(options)) return;
   if (isMarkupMode(options)) return;
@@ -1388,12 +1465,15 @@ function buildParseFallbackResult(originalText: string, parseError: any, options
 
 function normalizeAnalysisPayload(parsed: any, originalText: string, options?: AnalyzeOptions): AnalysisResult {
   const safeParsed = parsed || {};
-  forceIntactFreeTextShape(safeParsed, originalText, options);
-  forceMarkupSplitShape(safeParsed, originalText, options);
-  forceMarkupReadableSocraticShape(safeParsed, originalText, options);
-  forceSingleBlockSocraticPair(safeParsed, originalText, options);
-  forceLowCoverageSocraticFallback(safeParsed, originalText, options);
-  enforceProgressiveCoverageAndSimilarity(safeParsed, originalText, options);
+  const forcedBracketedDialog = forceBracketedDialogTurnPreservation(safeParsed, originalText, options);
+  if (!forcedBracketedDialog) {
+    forceIntactFreeTextShape(safeParsed, originalText, options);
+    forceMarkupSplitShape(safeParsed, originalText, options);
+    forceMarkupReadableSocraticShape(safeParsed, originalText, options);
+    forceSingleBlockSocraticPair(safeParsed, originalText, options);
+    forceLowCoverageSocraticFallback(safeParsed, originalText, options);
+    enforceProgressiveCoverageAndSimilarity(safeParsed, originalText, options);
+  }
 
   if (!safeParsed.segments || safeParsed.segments.length === 0) {
     safeParsed.segments = [

@@ -118,6 +118,48 @@ type InstructionQAItem = {
   category: string;
 };
 
+const INSTRUCTIONS_QA_STORAGE_KEY = 'SOCRATE_INTERNAL_INSTRUCTIONS_QA';
+const INSTRUCTIONS_CATEGORY_STORAGE_KEY = 'SOCRATE_INSTRUCTION_CATEGORY_CATALOG';
+const INSTRUCTIONS_REFRESH_EVENT = 'SOCRATE_INTERNAL_INSTRUCTIONS_REFRESH';
+
+function readInstructionsQAFromStorage(): InstructionQAItem[] {
+  const raw = localStorage.getItem(INSTRUCTIONS_QA_STORAGE_KEY);
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .filter((item) => item && typeof item.id === 'string')
+          .map((item) => ({
+            id: String(item.id),
+            question: String(item.question || ''),
+            answer: String(item.answer || ''),
+            category: String(item.category || 'General'),
+          }));
+      }
+    } catch {
+      // fallback below
+    }
+  }
+  const legacy = localStorage.getItem('SOCRATE_INTERNAL_INSTRUCTIONS_NOTES') || '';
+  if (legacy.trim()) {
+    return [{ id: uuidv4(), question: '', answer: legacy, category: 'General' }];
+  }
+  return [];
+}
+
+function readInstructionCategoryCatalogFromStorage(): string[] {
+  const raw = localStorage.getItem(INSTRUCTIONS_CATEGORY_STORAGE_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((v) => String(v || '').trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 const DEFAULT_GRANULARITY_PROFILES: GranularityProfile[] = [
   {
     id: 'intact',
@@ -317,45 +359,11 @@ export default function App() {
   const [isWizardOpen, setIsWizardOpen] = useState(false);
   const [wizardTitle, setWizardTitle] = useState('');
   const [isFinalizingCapture, setIsFinalizingCapture] = useState(false);
-  const [internalInstructionsQA, setInternalInstructionsQA] = useState<InstructionQAItem[]>(() => {
-    const raw = localStorage.getItem('SOCRATE_INTERNAL_INSTRUCTIONS_QA');
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          return parsed
-            .filter((item) => item && typeof item.id === 'string')
-            .map((item) => ({
-              id: String(item.id),
-              question: String(item.question || ''),
-              answer: String(item.answer || ''),
-              category: String(item.category || 'General'),
-            }));
-        }
-      } catch {
-        // fallback below
-      }
-    }
-    const legacy = localStorage.getItem('SOCRATE_INTERNAL_INSTRUCTIONS_NOTES') || '';
-    if (legacy.trim()) {
-      return [{ id: uuidv4(), question: '', answer: legacy, category: 'General' }];
-    }
-    return [];
-  });
+  const [internalInstructionsQA, setInternalInstructionsQA] = useState<InstructionQAItem[]>(() => readInstructionsQAFromStorage());
   const [editingInstructionIds, setEditingInstructionIds] = useState<Record<string, boolean>>({});
   const [instructionDrafts, setInstructionDrafts] = useState<Record<string, { question: string; answer: string; category: string }>>({});
   const [selectedInstructionCategory, setSelectedInstructionCategory] = useState<string>('all');
-  const [instructionCategoryCatalog, setInstructionCategoryCatalog] = useState<string[]>(() => {
-    const raw = localStorage.getItem('SOCRATE_INSTRUCTION_CATEGORY_CATALOG');
-    if (!raw) return [];
-    try {
-      const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed)) return [];
-      return parsed.map((v) => String(v || '').trim()).filter(Boolean);
-    } catch {
-      return [];
-    }
-  });
+  const [instructionCategoryCatalog, setInstructionCategoryCatalog] = useState<string[]>(() => readInstructionCategoryCatalogFromStorage());
   const [isInstructionCategoryManagerOpen, setIsInstructionCategoryManagerOpen] = useState(false);
   const [instructionCategoryNewDraft, setInstructionCategoryNewDraft] = useState('');
   const [instructionCategoryRenameDraft, setInstructionCategoryRenameDraft] = useState('');
@@ -383,11 +391,20 @@ export default function App() {
   }, [currentChatConvId]);
 
   useEffect(() => {
-    localStorage.setItem('SOCRATE_INTERNAL_INSTRUCTIONS_QA', JSON.stringify(internalInstructionsQA));
+    localStorage.setItem(INSTRUCTIONS_QA_STORAGE_KEY, JSON.stringify(internalInstructionsQA));
   }, [internalInstructionsQA]);
   useEffect(() => {
-    localStorage.setItem('SOCRATE_INSTRUCTION_CATEGORY_CATALOG', JSON.stringify(instructionCategoryCatalog));
+    localStorage.setItem(INSTRUCTIONS_CATEGORY_STORAGE_KEY, JSON.stringify(instructionCategoryCatalog));
   }, [instructionCategoryCatalog]);
+
+  useEffect(() => {
+    const refreshFromStorage = () => {
+      setInternalInstructionsQA(readInstructionsQAFromStorage());
+      setInstructionCategoryCatalog(readInstructionCategoryCatalogFromStorage());
+    };
+    window.addEventListener(INSTRUCTIONS_REFRESH_EVENT, refreshFromStorage);
+    return () => window.removeEventListener(INSTRUCTIONS_REFRESH_EVENT, refreshFromStorage);
+  }, []);
 
   const handleAddInstructionQA = () => {
     const id = uuidv4();
@@ -3715,7 +3732,7 @@ export default function App() {
                         className="px-4 py-2 bg-natural-sand hover:bg-natural-peach rounded-xl text-[10px] font-black uppercase tracking-widest text-natural-accent transition-all flex items-center gap-2 border border-natural-border shadow-sm disabled:opacity-30"
                       >
                         <Layers className="w-3.5 h-3.5" />
-                        Segmenter ce dialogue
+                        Analyser & Segmenter ce dialogue
                       </button>
                     </div>
                   </div>
