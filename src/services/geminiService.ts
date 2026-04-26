@@ -192,7 +192,7 @@ function cosineSimilarityMap(a: Map<string, number>, b: Map<string, number>): nu
 function isQuestionLike(text: string): boolean {
   const t = (text || "").toLowerCase();
   if (t.includes("?")) return true;
-  return /\b(pourquoi|comment|que|quoi|quel|quelle|quels|quelles|est-ce|peux-tu|pouvez-vous|dois-je)\b/.test(t);
+  return /\b(pourquoi|comment|qui|quand|que|quoi|quel|quelle|quels|quelles|est-ce|qu['’]est-ce|ou|où|peux-tu|pouvez-vous|dois-je)\b/.test(t);
 }
 
 function getAnalysisSignalScore(text: string): number {
@@ -577,6 +577,132 @@ function extractLeadingQuestionAndAnswer(text: string): { question: string; answ
   return { question, answer };
 }
 
+function isLikelyUnlabeledQuestionCandidate(text: string): boolean {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  const normalized = raw
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length < 3) return false;
+  const hasQuestionMark = normalized.includes("?");
+  const hasInterrogative =
+    /\b(qui|comment|pourquoi|quand|qu['’]est-ce|ou|quel(?:le|s)?|quoi|est-ce|peux-tu|pouvez-vous|dois-je)\b/.test(normalized);
+  if (!hasQuestionMark && !hasInterrogative) return false;
+  // A question candidate should not look like a long analysis block.
+  const analysisScore = getAnalysisSignalScore(normalized);
+  if (!hasQuestionMark && analysisScore >= 2) return false;
+  if (words.length > 55 && !hasQuestionMark) return false;
+  return true;
+}
+
+function extractUnlabeledQuestionAnswerPairs(
+  text: string
+): Array<{ question: string; answer: string }> {
+  const full = String(text || "").trim();
+  if (!full) return [];
+  if (looksLikeStructuredDialog(full)) return [];
+
+  const normalized = full.replace(/\r/g, "\n");
+  const paragraphBlocks = normalized
+    .split(/\n{2,}/)
+    .map((b) => b.trim())
+    .filter(Boolean);
+  const lineBlocks = normalized
+    .split(/\n+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const sentenceBlocks = normalized
+    .split(/(?<=[.!?])\s+(?=[A-Z0-9À-ÖØ-Þ])/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const blocks = paragraphBlocks.length >= 2
+    ? paragraphBlocks
+    : lineBlocks.length >= 3
+      ? lineBlocks
+      : sentenceBlocks;
+  if (blocks.length < 2) return [];
+
+  const pairs: Array<{ question: string; answer: string }> = [];
+  let i = 0;
+  while (i < blocks.length) {
+    const candidate = blocks[i];
+    if (!isLikelyUnlabeledQuestionCandidate(candidate)) {
+      i += 1;
+      continue;
+    }
+    const question = candidate.replace(/\s+/g, " ").trim();
+    let j = i + 1;
+    const answerParts: string[] = [];
+    while (j < blocks.length && !isLikelyUnlabeledQuestionCandidate(blocks[j])) {
+      answerParts.push(blocks[j]);
+      j += 1;
+    }
+    const answer = answerParts.join("\n\n").trim();
+    // Semantic confirmation: answer should look like explanatory content, not just another short question.
+    const answerLooksValid =
+      answer.length >= 20 &&
+      (getAnalysisSignalScore(answer) >= 0 || answer.split(/\s+/).length >= 10);
+    if (answerLooksValid) {
+      pairs.push({ question, answer });
+    }
+    i = Math.max(j, i + 1);
+    if (pairs.length >= 24) break;
+  }
+  return pairs;
+}
+
+function buildSegmentsFromUnlabeledPairs(
+  pairs: Array<{ question: string; answer: string }>,
+  options?: AnalyzeOptions,
+  tagPrefix = "heuristique"
+) {
+  const maxWords = getWordBudgetForProgressiveSegmentation(options);
+  const out: any[] = [];
+  pairs.forEach((pair, pairIdx) => {
+    out.push({
+      content: `Question : ${pair.question}`,
+      originalText: `Question : ${pair.question}`,
+      role: "user",
+      semanticSignature: `${tagPrefix}-q-${pairIdx}-${uuidv4().substring(0, 8)}`,
+      tags: ["question-detectee", tagPrefix],
+      knowledgeGraph: { nodes: [], edges: [] },
+      metadata: { reason: "Question detectee localement (texte non balise)." },
+    });
+    const answerParts = splitTextByWordBudget(pair.answer, maxWords);
+    const chunks = answerParts.length ? answerParts : [pair.answer];
+    chunks.forEach((chunk, idx) => {
+      const text = idx === 0 ? `Réponse : ${chunk}` : chunk;
+      out.push({
+        content: text,
+        originalText: text,
+        role: "assistant",
+        semanticSignature: `${tagPrefix}-a-${pairIdx}-${idx}-${uuidv4().substring(0, 8)}`,
+        tags: ["reponse-detectee", tagPrefix],
+        knowledgeGraph: { nodes: [], edges: [] },
+        metadata: { reason: "Réponse associee a la question detectee localement." },
+      });
+    });
+  });
+  return out;
+}
+
+function enforceUnlabeledQuestionPairs(parsed: any, originalText: string, options?: AnalyzeOptions) {
+  if (isMarkupMode(options)) return;
+  if (looksLikeStructuredDialog(originalText)) return;
+  const pairs = extractUnlabeledQuestionAnswerPairs(originalText);
+  if (pairs.length < 1) return;
+
+  const existingSegments = Array.isArray(parsed?.segments) ? parsed.segments : [];
+  const existingUsers = existingSegments.filter((s: any) => String(s?.role || "").toLowerCase() === "user").length;
+  const existingAssistants = existingSegments.filter((s: any) => String(s?.role || "").toLowerCase() === "assistant").length;
+  const alreadyCloseToExpected = existingUsers >= pairs.length && existingAssistants >= pairs.length;
+  if (alreadyCloseToExpected) return;
+
+  parsed.segments = buildSegmentsFromUnlabeledPairs(pairs, options, "qa-local");
+}
+
 function extractStructuredDialogSegments(
   text: string
 ): Array<{ role: "user" | "assistant"; content: string }> {
@@ -733,9 +859,15 @@ function forceIntactFreeTextShape(parsed: any, originalText: string, options?: A
   if (looksLikeStructuredDialog(originalText)) return;
 
   const fullText = String(originalText || "").trim() || "Texte indisponible.";
+  const unlabeledPairs = extractUnlabeledQuestionAnswerPairs(fullText);
+  if (unlabeledPairs.length >= 1) {
+    parsed.segments = buildSegmentsFromUnlabeledPairs(unlabeledPairs, options, "intact-heur");
+    return;
+  }
+
   const explicitPair = extractLeadingQuestionAndAnswer(fullText);
-  const inferredQuestion = explicitPair?.question || inferQuestionFromAnalysis(originalText);
-  const analysisBody = explicitPair?.answer || fullText;
+  const inferredQuestion = explicitPair ? `Question : ${explicitPair.question}` : inferQuestionFromAnalysis(originalText);
+  const analysisBody = explicitPair ? `Réponse : ${explicitPair.answer}` : fullText;
   const existingSegments = Array.isArray(parsed?.segments) ? parsed.segments : [];
   const roles = new Set(existingSegments.map((s: any) => String(s?.role || "").toLowerCase()));
   const maxSegmentTextLen = existingSegments.reduce((max: number, s: any) => {
@@ -985,21 +1117,34 @@ function ensureSpeakerPrefixesForStructuredDialog(parsed: any, originalText: str
 function buildSegmentsFromRawSource(originalText: string, options?: AnalyzeOptions) {
   const fullText = String(originalText || "").trim();
   if (!fullText) return [];
-  const explicitPair = extractLeadingQuestionAndAnswer(fullText);
+  const unlabeledPairs = extractUnlabeledQuestionAnswerPairs(fullText);
+  if (unlabeledPairs.length) {
+    const enriched = buildSegmentsFromUnlabeledPairs(unlabeledPairs, options, "raw-heur");
+    return enriched.map((seg) => ({
+      content: String(seg.content || ""),
+      originalText: String(seg.originalText || seg.content || ""),
+      role: String(seg.role || "") === "user" ? ("user" as const) : ("assistant" as const),
+    }));
+  }
+
   const maxWords = getWordBudgetForProgressiveSegmentation(options);
+  const explicitPair = extractLeadingQuestionAndAnswer(fullText);
   if (explicitPair) {
     const answerParts = splitTextByWordBudget(explicitPair.answer, maxWords);
     return [
       {
-        content: explicitPair.question,
-        originalText: explicitPair.question,
+        content: `Question : ${explicitPair.question}`,
+        originalText: `Question : ${explicitPair.question}`,
         role: "user" as const,
       },
-      ...(answerParts.length ? answerParts : [explicitPair.answer]).map((part) => ({
-        content: part,
-        originalText: part,
-        role: "assistant" as const,
-      })),
+      ...(answerParts.length ? answerParts : [explicitPair.answer]).map((part, idx) => {
+        const text = idx === 0 ? `Réponse : ${part}` : part;
+        return {
+          content: text,
+          originalText: text,
+          role: "assistant" as const,
+        };
+      }),
     ];
   }
 
@@ -1467,6 +1612,7 @@ function normalizeAnalysisPayload(parsed: any, originalText: string, options?: A
   const safeParsed = parsed || {};
   const forcedBracketedDialog = forceBracketedDialogTurnPreservation(safeParsed, originalText, options);
   if (!forcedBracketedDialog) {
+    enforceUnlabeledQuestionPairs(safeParsed, originalText, options);
     forceIntactFreeTextShape(safeParsed, originalText, options);
     forceMarkupSplitShape(safeParsed, originalText, options);
     forceMarkupReadableSocraticShape(safeParsed, originalText, options);

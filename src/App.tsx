@@ -121,6 +121,7 @@ type InstructionQAItem = {
 const INSTRUCTIONS_QA_STORAGE_KEY = 'SOCRATE_INTERNAL_INSTRUCTIONS_QA';
 const INSTRUCTIONS_CATEGORY_STORAGE_KEY = 'SOCRATE_INSTRUCTION_CATEGORY_CATALOG';
 const INSTRUCTIONS_REFRESH_EVENT = 'SOCRATE_INTERNAL_INSTRUCTIONS_REFRESH';
+const QUICK_CAPTURE_DRAFT_KEY = 'SOCRATE_QUICK_CAPTURE_DRAFT';
 
 function readInstructionsQAFromStorage(): InstructionQAItem[] {
   const raw = localStorage.getItem(INSTRUCTIONS_QA_STORAGE_KEY);
@@ -158,6 +159,29 @@ function readInstructionCategoryCatalogFromStorage(): string[] {
   } catch {
     return [];
   }
+}
+
+function InstructionMarkdown({ content }: { content: string }) {
+  return (
+    <div className="prose prose-sm max-w-none prose-headings:my-2 prose-p:my-1 prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5 prose-table:my-2">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          table: ({ ...props }) => (
+            <div className="overflow-x-auto border border-natural-sand rounded-xl my-2">
+              <table className="w-full border-collapse text-[12px]" {...props} />
+            </div>
+          ),
+          thead: ({ ...props }) => <thead className="bg-natural-bg/60" {...props} />,
+          th: ({ ...props }) => <th className="border border-natural-sand px-2 py-1 text-left font-bold" {...props} />,
+          td: ({ ...props }) => <td className="border border-natural-sand px-2 py-1 align-top" {...props} />,
+          p: ({ ...props }) => <p className="my-1 leading-relaxed" {...props} />,
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
 }
 
 const DEFAULT_GRANULARITY_PROFILES: GranularityProfile[] = [
@@ -343,7 +367,7 @@ export default function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [activeTab, setActiveTab] = useState<'conv' | 'files' | 'search' | 'segments' | 'settings' | 'chat' | 'instructions'>('conv');
   const [selectedConvId, setSelectedConvId] = useState<string | null>(null);
-  const [inputText, setInputText] = useState('');
+  const [inputText, setInputText] = useState(() => localStorage.getItem(QUICK_CAPTURE_DRAFT_KEY) || '');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [lastCapturedId, setLastCapturedId] = useState<string | null>(null);
   const [isReactionAdminOpen, setIsReactionAdminOpen] = useState(false);
@@ -384,6 +408,19 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('SOCRATE_CHAT_HISTORY', JSON.stringify(chatMessages));
   }, [chatMessages]);
+
+  useEffect(() => {
+    if (inputText) localStorage.setItem(QUICK_CAPTURE_DRAFT_KEY, inputText);
+    else localStorage.removeItem(QUICK_CAPTURE_DRAFT_KEY);
+  }, [inputText]);
+
+  useEffect(() => {
+    const isQuickCaptureScreen = activeTab === 'conv' && !selectedConvId;
+    if (!isQuickCaptureScreen) return;
+    if (inputText.trim()) return;
+    const saved = localStorage.getItem(QUICK_CAPTURE_DRAFT_KEY) || '';
+    if (saved.trim()) setInputText(saved);
+  }, [activeTab, selectedConvId, inputText]);
 
   useEffect(() => {
     if (currentChatConvId) localStorage.setItem('CURRENT_CHAT_CONV_ID', currentChatConvId);
@@ -3569,32 +3606,34 @@ export default function App() {
                                 </button>
                               </div>
                             </div>
-                            <textarea
-                              value={editingInstructionIds[item.id]
-                                ? (instructionDrafts[item.id]?.question ?? item.question ?? '')
-                                : (item.question || '')}
-                              onChange={(e) => {
-                                if (!editingInstructionIds[item.id]) return;
-                                const value = e.target.value;
-                                setInstructionDrafts((prev) => ({
-                                  ...prev,
-                                  [item.id]: {
-                                    question: value,
-                                    answer: prev[item.id]?.answer ?? item.answer ?? '',
-                                    category: prev[item.id]?.category ?? item.category ?? 'General',
-                                  },
-                                }));
-                              }}
-                              onInput={(e) => {
-                                const el = e.currentTarget;
-                                el.style.height = 'auto';
-                                el.style.height = `${el.scrollHeight}px`;
-                              }}
-                              placeholder="Question"
-                              rows={2}
-                              readOnly={!editingInstructionIds[item.id]}
-                              className="w-full min-h-[58px] p-3 bg-gray-100 border border-natural-sand rounded-xl text-sm outline-none focus:border-natural-accent resize-none overflow-hidden"
-                            />
+                            {editingInstructionIds[item.id] ? (
+                              <textarea
+                                value={instructionDrafts[item.id]?.question ?? item.question ?? ''}
+                                onChange={(e) => {
+                                  const value = e.target.value;
+                                  setInstructionDrafts((prev) => ({
+                                    ...prev,
+                                    [item.id]: {
+                                      question: value,
+                                      answer: prev[item.id]?.answer ?? item.answer ?? '',
+                                      category: prev[item.id]?.category ?? item.category ?? 'General',
+                                    },
+                                  }));
+                                }}
+                                onInput={(e) => {
+                                  const el = e.currentTarget;
+                                  el.style.height = 'auto';
+                                  el.style.height = `${el.scrollHeight}px`;
+                                }}
+                                placeholder="Question"
+                                rows={2}
+                                className="w-full min-h-[58px] p-3 bg-gray-100 border border-natural-sand rounded-xl text-sm outline-none focus:border-natural-accent resize-none overflow-hidden"
+                              />
+                            ) : (
+                              <div className="w-full min-h-[58px] p-3 bg-gray-100 border border-natural-sand rounded-xl text-sm">
+                                <InstructionMarkdown content={item.question || ''} />
+                              </div>
+                            )}
                             <input
                               value={editingInstructionIds[item.id]
                                 ? (instructionDrafts[item.id]?.category ?? item.category ?? 'General')
@@ -3615,26 +3654,28 @@ export default function App() {
                               readOnly={!editingInstructionIds[item.id]}
                               className="w-full p-2.5 bg-natural-sand/40 border border-natural-sand rounded-xl text-xs font-semibold outline-none focus:border-natural-accent"
                             />
-                            <textarea
-                              value={editingInstructionIds[item.id]
-                                ? (instructionDrafts[item.id]?.answer ?? item.answer ?? '')
-                                : (item.answer || '')}
-                              onChange={(e) => {
-                                if (!editingInstructionIds[item.id]) return;
-                                const value = e.target.value;
-                                setInstructionDrafts((prev) => ({
-                                  ...prev,
-                                  [item.id]: {
-                                    question: prev[item.id]?.question ?? item.question ?? '',
-                                    answer: value,
-                                    category: prev[item.id]?.category ?? item.category ?? 'General',
-                                  },
-                                }));
-                              }}
-                              placeholder="Reponse"
-                              readOnly={!editingInstructionIds[item.id]}
-                              className="w-full min-h-[180px] p-3 pl-6 bg-white border border-natural-sand rounded-2xl text-sm leading-relaxed outline-none focus:border-natural-accent"
-                            />
+                            {editingInstructionIds[item.id] ? (
+                              <textarea
+                                value={instructionDrafts[item.id]?.answer ?? item.answer ?? ''}
+                                onChange={(e) => {
+                                  const value = e.target.value;
+                                  setInstructionDrafts((prev) => ({
+                                    ...prev,
+                                    [item.id]: {
+                                      question: prev[item.id]?.question ?? item.question ?? '',
+                                      answer: value,
+                                      category: prev[item.id]?.category ?? item.category ?? 'General',
+                                    },
+                                  }));
+                                }}
+                                placeholder="Reponse"
+                                className="w-full min-h-[180px] p-3 pl-6 bg-white border border-natural-sand rounded-2xl text-sm leading-relaxed outline-none focus:border-natural-accent"
+                              />
+                            ) : (
+                              <div className="w-full min-h-[180px] p-3 pl-6 bg-white border border-natural-sand rounded-2xl text-sm leading-relaxed">
+                                <InstructionMarkdown content={item.answer || ''} />
+                              </div>
+                            )}
                           </div>
                         ))}
                         <button

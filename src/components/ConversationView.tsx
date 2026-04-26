@@ -795,6 +795,146 @@ function parseReconstructedPreviewTurns(text: string): Array<{ question: string;
   return turns;
 }
 
+function addSpacingAroundEnumerations(text: string): string {
+  const lines = String(text || '').split(/\r?\n/);
+  const isEnumLine = (line: string) => /^(\s*[-*•]\s+|\s*\d+[.)]\s+|\s*[a-zA-Z][.)]\s+)/.test(line);
+  const isTableSeparator = (line: string) =>
+    /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/.test(String(line || ''));
+  const hasPipe = (line: string) => /\|/.test(String(line || ''));
+  const tableRanges: Array<{ start: number; end: number }> = [];
+  for (let i = 1; i < lines.length - 1; i += 1) {
+    if (!isTableSeparator(lines[i])) continue;
+    if (!hasPipe(lines[i - 1])) continue;
+    let end = i + 1;
+    while (end < lines.length && String(lines[end] || '').trim() && hasPipe(lines[end])) {
+      end += 1;
+    }
+    tableRanges.push({ start: i - 1, end: end - 1 });
+    i = end - 1;
+  }
+  const isTableLine = (index: number) => tableRanges.some((r) => index >= r.start && index <= r.end);
+  const hasEnumBeforeSinceEmpty = (index: number) => {
+    for (let i = index - 1; i >= 0; i -= 1) {
+      const l = lines[i];
+      if (!String(l).trim()) break;
+      if (isTableLine(i)) break;
+      if (isEnumLine(l)) return true;
+    }
+    return false;
+  };
+  const hasEnumAfterUntilEmpty = (index: number) => {
+    for (let i = index + 1; i < lines.length; i += 1) {
+      const l = lines[i];
+      if (!String(l).trim()) break;
+      if (isTableLine(i)) break;
+      if (isEnumLine(l)) return true;
+    }
+    return false;
+  };
+  const out: string[] = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const currIsEnum = isEnumLine(line);
+    const prevOutLine = out.length > 0 ? out[out.length - 1] : '';
+    const hasEnumBefore = hasEnumBeforeSinceEmpty(i);
+    const hasEnumAfter = hasEnumAfterUntilEmpty(i);
+    const isBlank = !String(line).trim();
+    const tableLine = isTableLine(i);
+
+    if (tableLine) {
+      out.push(line);
+      continue;
+    }
+
+    // Never keep blank separators inside an enumeration block.
+    if (isBlank && hasEnumBefore && hasEnumAfter) {
+      continue;
+    }
+
+    // Add one blank line only at the start of an enumeration block
+    // (not between items, even with paragraph text between list items).
+    if (currIsEnum && !hasEnumBefore && prevOutLine.trim() !== '') {
+      out.push('');
+    }
+
+    out.push(line);
+
+    // Add one blank line only at the end of an enumeration block.
+    if (currIsEnum && !hasEnumAfter) {
+      out.push('');
+    }
+  }
+
+  return out.join('\n');
+}
+
+function addSpacingAroundMarkdownTables(text: string): string {
+  const lines = String(text || '').split(/\r?\n/);
+  if (!lines.length) return String(text || '');
+  const isSeparator = (line: string) =>
+    /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/.test(String(line || ''));
+  const hasPipe = (line: string) => /\|/.test(String(line || ''));
+
+  const tableRanges: Array<{ start: number; end: number }> = [];
+  for (let i = 1; i < lines.length - 1; i += 1) {
+    if (!isSeparator(lines[i])) continue;
+    if (!hasPipe(lines[i - 1])) continue;
+    let end = i + 1;
+    while (end < lines.length && String(lines[end] || '').trim() && hasPipe(lines[end])) {
+      end += 1;
+    }
+    tableRanges.push({ start: i - 1, end: end - 1 });
+    i = end - 1;
+  }
+
+  if (!tableRanges.length) return String(text || '');
+  const rangeByStart = new Map<number, { start: number; end: number }>();
+  const rangeByEnd = new Map<number, { start: number; end: number }>();
+  tableRanges.forEach((r) => {
+    rangeByStart.set(r.start, r);
+    rangeByEnd.set(r.end, r);
+  });
+
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const startsTable = rangeByStart.has(i);
+    const endsTable = rangeByEnd.has(i);
+    if (startsTable) {
+      const prevOut = out.length ? out[out.length - 1] : '';
+      if (String(prevOut).trim() !== '') out.push('');
+    }
+    out.push(lines[i]);
+    if (endsTable) out.push('');
+  }
+  return out.join('\n');
+}
+
+function PreviewMarkdown({ content }: { content: string }) {
+  return (
+    <div className="prose prose-sm max-w-none prose-headings:my-2 prose-p:my-1 prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5 prose-table:my-2">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          table: ({ ...props }) => (
+            <div className="overflow-x-auto border border-natural-sand rounded-xl my-2">
+              <table className="w-full border-collapse text-[12px]" {...props} />
+            </div>
+          ),
+          thead: ({ ...props }) => <thead className="bg-natural-bg/60" {...props} />,
+          th: ({ ...props }) => <th className="border border-natural-sand px-2 py-1 text-left font-bold" {...props} />,
+          td: ({ ...props }) => <td className="border border-natural-sand px-2 py-1 align-top" {...props} />,
+          ul: ({ ...props }) => <ul className="list-disc pl-5 my-2" {...props} />,
+          ol: ({ ...props }) => <ol className="list-decimal pl-5 my-2" {...props} />,
+          p: ({ ...props }) => <p className="my-1 leading-relaxed" {...props} />,
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 export function ConversationView({ convId, onBack }: ConversationViewProps) {
   const [viewMode, setViewMode] = useState<'flux' | 'carte' | 'graphe'>(() => {
     const saved = localStorage.getItem(`SOCRATE_CONV_VIEW_MODE_${convId}`);
@@ -982,21 +1122,36 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
       alert('Aucun texte disponible pour générer un Q&R Admin.');
       return;
     }
-    const { question, answer } = inferQuestionAnswerFromText(sourceText, title);
+    const reconstructedTurns = parseReconstructedPreviewTurns(sourceText)
+      .map((turn) => ({
+        question: String(turn.question || '').trim(),
+        answer: String(turn.answer || '').trim(),
+      }))
+      .filter((turn) => turn.question || turn.answer);
     const current = readInstructionsQAFromStorage();
-    const id =
+    const makeId = () =>
       typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
         ? crypto.randomUUID()
         : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const next = [
-      ...current,
-      {
-        id,
-        question: question || `Quels enseignements admin tirer de "${title}" ?`,
-        answer: answer || sourceText,
-        category: 'Admin',
-      },
-    ];
+
+    const generatedEntries = reconstructedTurns.length
+      ? reconstructedTurns.map((turn, idx) => ({
+          id: makeId(),
+          question: turn.question || `Question ${idx + 1} - ${title}`,
+          answer: turn.answer || '—',
+          category: 'Admin',
+        }))
+      : (() => {
+          const { question, answer } = inferQuestionAnswerFromText(sourceText, title);
+          return [{
+            id: makeId(),
+            question: question || `Quels enseignements admin tirer de "${title}" ?`,
+            answer: answer || sourceText,
+            category: 'Admin',
+          }];
+        })();
+
+    const next = [...current, ...generatedEntries];
     localStorage.setItem(INSTRUCTIONS_QA_STORAGE_KEY, JSON.stringify(next));
 
     const categories = readInstructionCategoriesFromStorage();
@@ -1006,7 +1161,7 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
     }
 
     window.dispatchEvent(new CustomEvent(INSTRUCTIONS_REFRESH_EVENT));
-    alert('Q&R Admin généré et ajouté dans la page Instructions.');
+    alert(`Q&R Admin généré: ${generatedEntries.length} entr${generatedEntries.length > 1 ? 'ées' : 'ée'} ajoutée${generatedEntries.length > 1 ? 's' : ''} dans Instructions.`);
   };
 
   const renderComparePreviewButton = (opts: { title: string; text: string }) => (
@@ -2512,7 +2667,7 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                   className="inline-flex items-center gap-1 px-3 py-2 rounded-xl border border-natural-sand bg-white text-[10px] font-black uppercase tracking-wider text-natural-stone hover:bg-natural-bg"
                 >
                   <Save className="w-3 h-3" />
-                  Sauvegarde
+                  {previewDialog.editor === 'libreoffice' ? 'Sauvegarde HTML' : 'Sauvegarde'}
                 </button>
                 <button
                   onClick={() => handleGenerateAdminQA(previewDialog.title, previewDialog.text)}
@@ -2551,14 +2706,14 @@ export function ConversationView({ convId, onBack }: ConversationViewProps) {
                   >
                     {turns.map((turn, idx) => (
                       <div key={`preview-turn-${idx}`} className="space-y-2">
-                        <p className="whitespace-pre-wrap break-words leading-relaxed">
-                          <span className="font-bold">Question :</span>{' '}
-                          {turn.question || '—'}
-                        </p>
-                        <p className="whitespace-pre-wrap break-words leading-relaxed">
-                          <span className="font-bold">Réponse:</span>{' '}
-                          {turn.answer || '—'}
-                        </p>
+                        <div className="leading-relaxed">
+                          <span className="font-bold">Question :</span>
+                          <PreviewMarkdown content={addSpacingAroundMarkdownTables(addSpacingAroundEnumerations(turn.question)) || '—'} />
+                        </div>
+                        <div className="leading-relaxed">
+                          <span className="font-bold">Réponse:</span>
+                          <PreviewMarkdown content={addSpacingAroundMarkdownTables(addSpacingAroundEnumerations(turn.answer)) || '—'} />
+                        </div>
                         {idx < turns.length - 1 && (
                           <div className="flex items-center justify-center py-1">
                             <span className="text-natural-heading font-bold tracking-[0.18em] text-[11px]">────────────────</span>
