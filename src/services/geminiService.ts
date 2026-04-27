@@ -587,14 +587,25 @@ function isLikelyUnlabeledQuestionCandidate(text: string): boolean {
   const words = normalized.split(/\s+/).filter(Boolean);
   if (words.length < 3) return false;
   const hasQuestionMark = normalized.includes("?");
+  const hasQuestionIntentPrefix =
+    /\b(je me demande|je me pose la question)\b/.test(normalized);
   const hasInterrogative =
     /\b(qui|comment|pourquoi|quand|qu['’]est-ce|ou|quel(?:le|s)?|quoi|est-ce|peux-tu|pouvez-vous|dois-je)\b/.test(normalized);
-  if (!hasQuestionMark && !hasInterrogative) return false;
+  if (!hasQuestionMark && !hasInterrogative && !hasQuestionIntentPrefix) return false;
   // A question candidate should not look like a long analysis block.
   const analysisScore = getAnalysisSignalScore(normalized);
   if (!hasQuestionMark && analysisScore >= 2) return false;
   if (words.length > 55 && !hasQuestionMark) return false;
   return true;
+}
+
+function isLikelyAnswerZone(text: string): boolean {
+  const normalized = String(text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+  if (!normalized.trim()) return false;
+  return /\b(tres bonne question|excellente question|la reponse est|la reponse depend|voici une reponse|je vais te donner une reponse)\b/.test(normalized);
 }
 
 function extractUnlabeledQuestionAnswerPairs(
@@ -643,14 +654,50 @@ function extractUnlabeledQuestionAnswerPairs(
     // Semantic confirmation: answer should look like explanatory content, not just another short question.
     const answerLooksValid =
       answer.length >= 20 &&
-      (getAnalysisSignalScore(answer) >= 0 || answer.split(/\s+/).length >= 10);
+      (isLikelyAnswerZone(answer) || getAnalysisSignalScore(answer) >= 0 || answer.split(/\s+/).length >= 10);
     if (answerLooksValid) {
       pairs.push({ question, answer });
     }
     i = Math.max(j, i + 1);
     if (pairs.length >= 24) break;
   }
-  return pairs;
+
+  // Fallback pass for monobloc inputs: detect every question ending with '?'
+  // and bind the following span as its answer until the next detected question.
+  const compact = normalized.replace(/\n+/g, "\n").trim();
+  const questionRegex = /[^?\n]{4,260}\?/g;
+  const qMatches: Array<{ start: number; end: number; text: string }> = [];
+  let m: RegExpExecArray | null = null;
+  while ((m = questionRegex.exec(compact)) !== null) {
+    const q = String(m[0] || "").replace(/\s+/g, " ").trim();
+    if (!isLikelyUnlabeledQuestionCandidate(q)) continue;
+    qMatches.push({ start: m.index, end: m.index + m[0].length, text: q });
+    if (qMatches.length >= 32) break;
+  }
+
+  if (qMatches.length >= 1) {
+    for (let k = 0; k < qMatches.length; k += 1) {
+      const curr = qMatches[k];
+      const next = qMatches[k + 1];
+      const rawAnswer = compact.slice(curr.end, next ? next.start : compact.length).trim();
+      const answer = rawAnswer.replace(/^[-–—:)\]\s]+/, "").trim();
+      const answerLooksValid =
+        answer.length >= 20 &&
+        (isLikelyAnswerZone(answer) || getAnalysisSignalScore(answer) >= 0 || answer.split(/\s+/).length >= 10);
+      if (!answerLooksValid) continue;
+      pairs.push({ question: curr.text, answer });
+      if (pairs.length >= 24) break;
+    }
+  }
+
+  const seen = new Set<string>();
+  const deduped = pairs.filter((p) => {
+    const key = `${p.question.toLowerCase()}||${p.answer.toLowerCase().slice(0, 180)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return deduped;
 }
 
 function buildSegmentsFromUnlabeledPairs(
