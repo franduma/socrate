@@ -29,6 +29,16 @@ export interface SegmentationTrace {
   webDocumentUrl?: string;
 }
 
+export interface ContextSnapshot {
+  schemaVersion: number;
+  contextVersion: number;
+  contextText: string;
+  contextSha256: string;
+  embeddingModel: string;
+  contextEmbedding: number[];
+  createdAt: number;
+}
+
 export interface Segment {
   id: string;
   conversationId: string;
@@ -51,6 +61,7 @@ export interface Segment {
     isDeviation?: boolean;
     reason?: string;
   };
+  schemaVersion?: number;
   analysisTrace?: SegmentationTrace;
 }
 
@@ -90,6 +101,8 @@ export interface Conversation {
   };
   deepAnalysis?: string;
   selectedModel?: string;
+  schemaVersion?: number;
+  contextSnapshot?: ContextSnapshot;
   analysisTrace?: SegmentationTrace;
   segmentationTraces?: SegmentationTrace[];
 }

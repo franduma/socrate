@@ -47,7 +47,8 @@ import { db } from './lib/db';
 import { getConversationStore } from './lib/conversationStore';
 import { flushReplicationQueue, getReplicationSummary } from './lib/conversationStore';
 import { isReplicationStubFailMode, setReplicationStubFailMode, clearSyncedReplicationEntries } from './lib/conversationStore';
-import { CustomReaction, ChatMessage, DictionaryEntry, SemanticAttribute, SemanticAttributeCollection, SegmentationTrace } from './types';
+import { getReplicationEndpoint, setReplicationEndpoint } from './lib/conversationStore';
+import { CustomReaction, ChatMessage, ContextSnapshot, DictionaryEntry, SemanticAttribute, SemanticAttributeCollection, SegmentationTrace } from './types';
 import { v4 as uuidv4 } from 'uuid';
 import { collectFromWebSource, fetchRawWebContent, WebSourceDefinition, WebSourceMode } from './services/webIngestionService';
 import {
@@ -366,6 +367,51 @@ function getCoreGranularity(id: string): 'intact' | 'balanced' | 'fine' | 'marku
   return 'balanced';
 }
 
+const GRAPH_SCHEMA_VERSION = 1;
+const CONTEXT_SCHEMA_VERSION = 1;
+const CONTEXT_EMBEDDING_DIM = 64;
+
+function fnv1aHash(value: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < value.length; i += 1) {
+    h ^= value.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+function buildLocalContextEmbedding(text: string, dim = CONTEXT_EMBEDDING_DIM): number[] {
+  const vec = new Array(dim).fill(0);
+  const tokens = tokenizeSemanticLocal(text);
+  if (!tokens.length) return vec;
+  for (const token of tokens) {
+    const idx = fnv1aHash(token) % dim;
+    vec[idx] += 1;
+  }
+  const norm = Math.sqrt(vec.reduce((s, v) => s + (v * v), 0)) || 1;
+  return vec.map((v) => Number((v / norm).toFixed(6)));
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const data = new TextEncoder().encode(String(text || ''));
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  const bytes = Array.from(new Uint8Array(digest));
+  return bytes.map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function buildContextSnapshot(contextText: string): Promise<ContextSnapshot> {
+  const context = String(contextText || '').trim();
+  return {
+    schemaVersion: GRAPH_SCHEMA_VERSION,
+    contextVersion: CONTEXT_SCHEMA_VERSION,
+    contextText: context,
+    contextSha256: await sha256Hex(context),
+    embeddingModel: `local_hashing_v${CONTEXT_SCHEMA_VERSION}`,
+    contextEmbedding: buildLocalContextEmbedding(context),
+    createdAt: Date.now(),
+  };
+}
+
 export default function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [activeTab, setActiveTab] = useState<'conv' | 'files' | 'search' | 'segments' | 'settings' | 'chat' | 'instructions'>('conv');
@@ -382,6 +428,7 @@ export default function App() {
     segments: any[], 
     analysis: any,
     analysisTrace?: SegmentationTrace,
+    __sourceText?: string,
   } | null>(null);
   const [isWizardOpen, setIsWizardOpen] = useState(false);
   const [wizardTitle, setWizardTitle] = useState('');
@@ -760,6 +807,7 @@ export default function App() {
   const [replicationSummary, setReplicationSummary] = useState(() => getReplicationSummary());
   const [isFlushingReplication, setIsFlushingReplication] = useState(false);
   const [replicationFailMode, setReplicationFailMode] = useState(() => isReplicationStubFailMode());
+  const [replicationEndpoint, setReplicationEndpointState] = useState(() => getReplicationEndpoint());
   const [storageBackend, setStorageBackend] = useState<'local' | 'hybrid' | 'neo4j_chroma'>(() => {
     const raw = String(localStorage.getItem('SOCRATE_STORAGE_BACKEND') || 'local');
     return raw === 'hybrid' || raw === 'neo4j_chroma' ? raw : 'local';
@@ -1189,7 +1237,7 @@ export default function App() {
 
   const persistAnalyzedConversation = async (
     enrichedResult: any,
-    options?: { title?: string; source?: 'copy-paste' | 'file' | 'session' }
+    options?: { title?: string; source?: 'copy-paste' | 'file' | 'session'; sourceText?: string }
   ) => {
     if (!enrichedResult?.segments || enrichedResult.segments.length === 0) {
       throw new Error("Aucun segment généré.");
@@ -1197,6 +1245,12 @@ export default function App() {
     const convId = uuidv4();
     const now = Date.now();
     const captureTrace: SegmentationTrace = enrichedResult.analysisTrace || buildSegmentationTrace();
+    const contextText =
+      String(options?.sourceText || enrichedResult?.__sourceText || '').trim()
+      || (Array.isArray(enrichedResult?.segments)
+        ? enrichedResult.segments.map((s: any) => String(s?.originalText || s?.content || '')).join('\n\n').trim()
+        : '');
+    const contextSnapshot = await buildContextSnapshot(contextText);
     const convData: any = {
       id: convId,
       title: options?.title || enrichedResult.title || "Conversation sans titre",
@@ -1212,6 +1266,8 @@ export default function App() {
       },
       semanticSignature: enrichedResult.analysis?.semanticSignature || uuidv4(),
       knowledgeGraph: enrichedResult.analysis?.knowledgeGraph || { nodes: [], edges: [] },
+      schemaVersion: GRAPH_SCHEMA_VERSION,
+      contextSnapshot,
       analysisTrace: captureTrace,
       segmentationTraces: [captureTrace],
     };
@@ -1235,6 +1291,7 @@ export default function App() {
         parentLabel: seg.metadata?.reason,
         knowledgeGraph: seg.knowledgeGraph,
         metadata: seg.metadata || {},
+        schemaVersion: GRAPH_SCHEMA_VERSION,
         analysisTrace: captureTrace,
       });
       prevId = segId;
@@ -1812,7 +1869,7 @@ export default function App() {
                 try { return new URL(doc.url || source.url).hostname; } catch { return source.url; }
               })();
               const title = `${titlePrefix} [${source.mode.toUpperCase()}] ${doc.title} - ${host}`;
-              const convId = await persistAnalyzedConversation(enrichedResult, { title, source: 'file' });
+              const convId = await persistAnalyzedConversation(enrichedResult, { title, source: 'file', sourceText: analysisPayload });
               savedCount += 1;
               processedCount += 1;
               setLastCapturedId(convId);
@@ -1927,6 +1984,7 @@ export default function App() {
         interestGlobalScore: interest.globalScore,
         interestAttributeScores: interest.entries,
       });
+      (enrichedResult as any).__sourceText = inputText;
       setPotentialCapture(enrichedResult);
       setWizardTitle(enrichedResult.title);
       setIsWizardOpen(true);
@@ -1954,6 +2012,12 @@ export default function App() {
       const now = Date.now();
       const captureTrace: SegmentationTrace = potentialCapture.analysisTrace || buildSegmentationTrace();
       const segmentationTraces = [captureTrace];
+      const contextText =
+        String(potentialCapture?.__sourceText || '').trim()
+        || (Array.isArray(potentialCapture?.segments)
+          ? potentialCapture.segments.map((s: any) => String(s?.originalText || s?.content || '')).join('\n\n').trim()
+          : '');
+      const contextSnapshot = await buildContextSnapshot(contextText);
 
       const convData: any = {
         id: convId,
@@ -1969,6 +2033,8 @@ export default function App() {
         },
         semanticSignature: potentialCapture.analysis?.semanticSignature || uuidv4(),
         knowledgeGraph: potentialCapture.analysis?.knowledgeGraph || { nodes: [], edges: [] },
+        schemaVersion: GRAPH_SCHEMA_VERSION,
+        contextSnapshot,
         analysisTrace: captureTrace,
         segmentationTraces,
       };
@@ -1997,6 +2063,7 @@ export default function App() {
           parentLabel: seg.metadata?.reason,
           knowledgeGraph: seg.knowledgeGraph,
           metadata: seg.metadata || {},
+          schemaVersion: GRAPH_SCHEMA_VERSION,
           analysisTrace: captureTrace,
         });
         prevId = segId;
@@ -2137,6 +2204,11 @@ export default function App() {
     const summary = clearSyncedReplicationEntries();
     setReplicationSummary(summary);
     alert(`Entrées synchronisées nettoyées. Pending: ${summary.pending} | Failed: ${summary.failed}`);
+  };
+
+  const handleSaveReplicationEndpoint = () => {
+    setReplicationEndpoint(replicationEndpoint);
+    alert('Endpoint de réplication sauvegardé.');
   };
 
   const buildPromptMapFromDraft = (draft: PromptCollectionConfig) => {
@@ -2396,6 +2468,7 @@ export default function App() {
       });
       
       // Update potentialCapture
+      (enrichedResult as any).__sourceText = fullText;
       setPotentialCapture(enrichedResult);
       
       // Nouveau format de titre : [Attr1, Attr2] - Socrate Chat - YYMMDD_HHMM
@@ -3558,6 +3631,23 @@ export default function App() {
                             className="px-3 py-2 rounded-xl border border-natural-sand bg-white text-[10px] font-black uppercase tracking-widest text-natural-stone hover:bg-natural-bg transition-all"
                           >
                             Nettoyer synced
+                          </button>
+                        </div>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <label className="text-[10px] uppercase tracking-widest font-black text-natural-muted">
+                            Endpoint réplication
+                          </label>
+                          <input
+                            value={replicationEndpoint}
+                            onChange={(e) => setReplicationEndpointState(e.target.value)}
+                            placeholder="http://127.0.0.1:3212/replicate"
+                            className="flex-1 min-w-[320px] p-2.5 bg-white border border-natural-sand rounded-xl text-xs"
+                          />
+                          <button
+                            onClick={handleSaveReplicationEndpoint}
+                            className="px-3 py-2 rounded-xl border border-natural-sand bg-white text-[10px] font-black uppercase tracking-widest text-natural-stone hover:bg-natural-bg transition-all"
+                          >
+                            Sauvegarder
                           </button>
                         </div>
                         <div className="flex items-center gap-3">

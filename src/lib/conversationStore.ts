@@ -75,6 +75,8 @@ type ReplicationSummary = {
 };
 
 const REPLICATION_STUB_FAIL_KEY = 'SOCRATE_REPLICATION_STUB_FAIL';
+const REPLICATION_ENDPOINT_KEY = 'SOCRATE_REPLICATION_ENDPOINT';
+const DEFAULT_REPLICATION_ENDPOINT = 'http://127.0.0.1:3212/replicate';
 
 function getReplicationSummaryInternal(): ReplicationSummary {
   const entries = readReplicationLog();
@@ -95,6 +97,77 @@ async function replicateEntryStub(entry: ReplicationLogEntry): Promise<void> {
   const failMode = localStorage.getItem(REPLICATION_STUB_FAIL_KEY) === '1';
   if (failMode) {
     throw new Error(`Stub replication failure for ${entry.backend}`);
+  }
+}
+
+function getReplicationEndpointInternal(): string {
+  return String(localStorage.getItem(REPLICATION_ENDPOINT_KEY) || DEFAULT_REPLICATION_ENDPOINT).trim();
+}
+
+async function toSha256Hex(text: string): Promise<string> {
+  const data = new TextEncoder().encode(String(text || ''));
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  const bytes = Array.from(new Uint8Array(digest));
+  return bytes.map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function buildReplicationPayload(entry: ReplicationLogEntry) {
+  const conversation = entry.payload.conversation;
+  const segments = entry.payload.segments;
+  const fullText = segments.map((s) => String(s.originalText || s.content || '')).join('\n\n');
+  const conversationSha256 = await toSha256Hex(fullText);
+  return {
+    schemaVersion: conversation.schemaVersion || 1,
+    backend: entry.backend,
+    replicationId: entry.id,
+    conversation: {
+      id: conversation.id,
+      sha256: conversationSha256,
+      title: conversation.title,
+      createdAt: conversation.createdAt,
+      updatedAt: conversation.updatedAt,
+      source: conversation.source,
+      segmentsCount: conversation.segmentsCount,
+      schemaVersion: conversation.schemaVersion || 1,
+      analysisTrace: conversation.analysisTrace,
+      semanticAnalysis: conversation.semanticAnalysis,
+      contextSnapshot: conversation.contextSnapshot,
+    },
+    segments: segments.map((s) => ({
+      id: s.id,
+      conversationId: s.conversationId,
+      schemaVersion: s.schemaVersion || 1,
+      role: s.role,
+      content: s.content,
+      originalText: s.originalText,
+      timestamp: s.timestamp,
+      tags: s.tags || [],
+      analysisTrace: s.analysisTrace,
+    })),
+    vectorDocument: {
+      id: conversationSha256,
+      document: fullText,
+      metadata: {
+        conversationId: conversation.id,
+        model: conversation.selectedModel || conversation.analysisTrace?.provider || 'unknown',
+        date: new Date(conversation.createdAt || Date.now()).toISOString(),
+      },
+    },
+  };
+}
+
+async function replicateEntryHttp(entry: ReplicationLogEntry): Promise<void> {
+  const endpoint = getReplicationEndpointInternal();
+  if (!endpoint) throw new Error('Replication endpoint is empty.');
+  const payload = await buildReplicationPayload(entry);
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Replication HTTP ${response.status}: ${text || response.statusText}`);
   }
 }
 
@@ -119,6 +192,7 @@ export async function flushReplicationQueue(maxEntries = 20): Promise<Replicatio
       current.lastAttemptAt = Date.now();
       try {
         await replicateEntryStub(current);
+        await replicateEntryHttp(current);
         current.status = 'synced';
         current.lastError = undefined;
       } catch (err: any) {
@@ -151,6 +225,19 @@ export function clearSyncedReplicationEntries(): ReplicationSummary {
   const entries = readReplicationLog().filter((e) => e.status !== 'synced');
   writeReplicationLog(entries);
   return getReplicationSummaryInternal();
+}
+
+export function getReplicationEndpoint(): string {
+  return getReplicationEndpointInternal();
+}
+
+export function setReplicationEndpoint(url: string): void {
+  const value = String(url || '').trim();
+  if (!value) {
+    localStorage.removeItem(REPLICATION_ENDPOINT_KEY);
+    return;
+  }
+  localStorage.setItem(REPLICATION_ENDPOINT_KEY, value);
 }
 
 class HybridConversationStore implements ConversationStore {
