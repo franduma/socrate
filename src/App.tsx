@@ -46,6 +46,7 @@ import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './lib/db';
 import { getConversationStore } from './lib/conversationStore';
 import { flushReplicationQueue, getReplicationSummary } from './lib/conversationStore';
+import { isReplicationStubFailMode, setReplicationStubFailMode, clearSyncedReplicationEntries } from './lib/conversationStore';
 import { CustomReaction, ChatMessage, DictionaryEntry, SemanticAttribute, SemanticAttributeCollection, SegmentationTrace } from './types';
 import { v4 as uuidv4 } from 'uuid';
 import { collectFromWebSource, fetchRawWebContent, WebSourceDefinition, WebSourceMode } from './services/webIngestionService';
@@ -758,6 +759,7 @@ export default function App() {
   const [promptCollectionsSaveStamp, setPromptCollectionsSaveStamp] = useState<number | null>(null);
   const [replicationSummary, setReplicationSummary] = useState(() => getReplicationSummary());
   const [isFlushingReplication, setIsFlushingReplication] = useState(false);
+  const [replicationFailMode, setReplicationFailMode] = useState(() => isReplicationStubFailMode());
   const [storageBackend, setStorageBackend] = useState<'local' | 'hybrid' | 'neo4j_chroma'>(() => {
     const raw = String(localStorage.getItem('SOCRATE_STORAGE_BACKEND') || 'local');
     return raw === 'hybrid' || raw === 'neo4j_chroma' ? raw : 'local';
@@ -2124,6 +2126,17 @@ export default function App() {
     } finally {
       setIsFlushingReplication(false);
     }
+  };
+
+  const handleToggleReplicationFailMode = (enabled: boolean) => {
+    setReplicationStubFailMode(enabled);
+    setReplicationFailMode(enabled);
+  };
+
+  const handleClearSyncedReplication = () => {
+    const summary = clearSyncedReplicationEntries();
+    setReplicationSummary(summary);
+    alert(`Entrées synchronisées nettoyées. Pending: ${summary.pending} | Failed: ${summary.failed}`);
   };
 
   const buildPromptMapFromDraft = (draft: PromptCollectionConfig) => {
@@ -3524,6 +3537,28 @@ export default function App() {
                             <option value="hybrid">hybrid</option>
                             <option value="neo4j_chroma">neo4j_chroma</option>
                           </select>
+                        </div>
+                        <div className="flex items-center gap-3 flex-wrap">
+                          <label className="text-[10px] uppercase tracking-widest font-black text-natural-muted">
+                            Mode échec simulé
+                          </label>
+                          <button
+                            onClick={() => handleToggleReplicationFailMode(!replicationFailMode)}
+                            className={cn(
+                              "px-3 py-2 rounded-xl border text-[10px] font-black uppercase tracking-widest transition-all",
+                              replicationFailMode
+                                ? "bg-red-100 text-red-800 border-red-300"
+                                : "bg-natural-bg text-natural-muted border-natural-sand"
+                            )}
+                          >
+                            {replicationFailMode ? 'ON' : 'OFF'}
+                          </button>
+                          <button
+                            onClick={handleClearSyncedReplication}
+                            className="px-3 py-2 rounded-xl border border-natural-sand bg-white text-[10px] font-black uppercase tracking-widest text-natural-stone hover:bg-natural-bg transition-all"
+                          >
+                            Nettoyer synced
+                          </button>
                         </div>
                         <div className="flex items-center gap-3">
                           <button

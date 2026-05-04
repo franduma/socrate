@@ -74,6 +74,8 @@ type ReplicationSummary = {
   total: number;
 };
 
+const REPLICATION_STUB_FAIL_KEY = 'SOCRATE_REPLICATION_STUB_FAIL';
+
 function getReplicationSummaryInternal(): ReplicationSummary {
   const entries = readReplicationLog();
   let pending = 0;
@@ -90,7 +92,7 @@ function getReplicationSummaryInternal(): ReplicationSummary {
 async function replicateEntryStub(entry: ReplicationLogEntry): Promise<void> {
   // Stage 3: deterministic local mock replication.
   // Set localStorage SOCRATE_REPLICATION_STUB_FAIL=1 to simulate transient failures.
-  const failMode = localStorage.getItem('SOCRATE_REPLICATION_STUB_FAIL') === '1';
+  const failMode = localStorage.getItem(REPLICATION_STUB_FAIL_KEY) === '1';
   if (failMode) {
     throw new Error(`Stub replication failure for ${entry.backend}`);
   }
@@ -133,6 +135,21 @@ export async function flushReplicationQueue(maxEntries = 20): Promise<Replicatio
 }
 
 export function getReplicationSummary(): ReplicationSummary {
+  return getReplicationSummaryInternal();
+}
+
+export function isReplicationStubFailMode(): boolean {
+  return localStorage.getItem(REPLICATION_STUB_FAIL_KEY) === '1';
+}
+
+export function setReplicationStubFailMode(enabled: boolean): void {
+  if (enabled) localStorage.setItem(REPLICATION_STUB_FAIL_KEY, '1');
+  else localStorage.removeItem(REPLICATION_STUB_FAIL_KEY);
+}
+
+export function clearSyncedReplicationEntries(): ReplicationSummary {
+  const entries = readReplicationLog().filter((e) => e.status !== 'synced');
+  writeReplicationLog(entries);
   return getReplicationSummaryInternal();
 }
 
