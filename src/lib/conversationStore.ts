@@ -171,6 +171,22 @@ async function replicateEntryHttp(entry: ReplicationLogEntry): Promise<void> {
   }
 }
 
+function isEndpointUnavailableError(err: unknown): boolean {
+  const msg = String((err as any)?.message || err || '').toLowerCase();
+  if (!msg) return false;
+  return (
+    msg.includes('failed to fetch') ||
+    msg.includes('networkerror') ||
+    msg.includes('network error') ||
+    msg.includes('econnrefused') ||
+    msg.includes('enotfound') ||
+    msg.includes('eai_again') ||
+    msg.includes('timed out') ||
+    msg.includes('timeout') ||
+    msg.includes('endpoint is empty')
+  );
+}
+
 let replicationInFlight = false;
 
 export async function flushReplicationQueue(maxEntries = 20): Promise<ReplicationSummary> {
@@ -196,8 +212,10 @@ export async function flushReplicationQueue(maxEntries = 20): Promise<Replicatio
         current.status = 'synced';
         current.lastError = undefined;
       } catch (err: any) {
-        current.status = 'failed';
-        current.lastError = String(err?.message || err || 'unknown replication error');
+        const lastError = String(err?.message || err || 'unknown replication error');
+        current.lastError = lastError;
+        // Endpoint/network unavailable should remain retryable without being marked as failed.
+        current.status = isEndpointUnavailableError(err) ? 'pending' : 'failed';
       }
       byId.set(current.id, current);
     }

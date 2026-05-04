@@ -817,6 +817,17 @@ export default function App() {
     localStorage.setItem('SOCRATE_STORAGE_BACKEND', storageBackend);
   }, [storageBackend]);
 
+  useEffect(() => {
+    if (storageBackend === 'local') return;
+    const timer = window.setInterval(async () => {
+      const summary = getReplicationSummary();
+      if (summary.pending <= 0) return;
+      const next = await flushReplicationQueue(10);
+      setReplicationSummary(next);
+    }, 8000);
+    return () => window.clearInterval(timer);
+  }, [storageBackend]);
+
   const handleTestConnection = async () => {
     setIsTestingConnection(true);
     try {
@@ -2072,6 +2083,11 @@ export default function App() {
         conversation: convData,
         segments: segmentsToPersist,
       });
+      setReplicationSummary(getReplicationSummary());
+      if (storageBackend !== 'local') {
+        const summary = await flushReplicationQueue(10);
+        setReplicationSummary(summary);
+      }
 
       await registerSemanticAttributesFromAnalysis(potentialCapture.analysis, potentialCapture.segments);
 
