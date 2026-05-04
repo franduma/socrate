@@ -44,6 +44,8 @@ import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db } from './lib/db';
+import { getConversationStore } from './lib/conversationStore';
+import { flushReplicationQueue, getReplicationSummary } from './lib/conversationStore';
 import { CustomReaction, ChatMessage, DictionaryEntry, SemanticAttribute, SemanticAttributeCollection, SegmentationTrace } from './types';
 import { v4 as uuidv4 } from 'uuid';
 import { collectFromWebSource, fetchRawWebContent, WebSourceDefinition, WebSourceMode } from './services/webIngestionService';
@@ -443,6 +445,13 @@ export default function App() {
     return () => window.removeEventListener(INSTRUCTIONS_REFRESH_EVENT, refreshFromStorage);
   }, []);
 
+  useEffect(() => {
+    const refresh = () => setReplicationSummary(getReplicationSummary());
+    refresh();
+    const timer = window.setInterval(refresh, 2500);
+    return () => window.clearInterval(timer);
+  }, []);
+
   const handleAddInstructionQA = () => {
     const id = uuidv4();
     const inferredCategory = selectedInstructionCategory === 'all' ? 'General' : selectedInstructionCategory;
@@ -747,6 +756,16 @@ export default function App() {
   const [isSavingPromptCollections, setIsSavingPromptCollections] = useState(false);
   const [granularitySaveStamp, setGranularitySaveStamp] = useState<number | null>(null);
   const [promptCollectionsSaveStamp, setPromptCollectionsSaveStamp] = useState<number | null>(null);
+  const [replicationSummary, setReplicationSummary] = useState(() => getReplicationSummary());
+  const [isFlushingReplication, setIsFlushingReplication] = useState(false);
+  const [storageBackend, setStorageBackend] = useState<'local' | 'hybrid' | 'neo4j_chroma'>(() => {
+    const raw = String(localStorage.getItem('SOCRATE_STORAGE_BACKEND') || 'local');
+    return raw === 'hybrid' || raw === 'neo4j_chroma' ? raw : 'local';
+  });
+
+  useEffect(() => {
+    localStorage.setItem('SOCRATE_STORAGE_BACKEND', storageBackend);
+  }, [storageBackend]);
 
   const handleTestConnection = async () => {
     setIsTestingConnection(true);
@@ -1194,13 +1213,12 @@ export default function App() {
       analysisTrace: captureTrace,
       segmentationTraces: [captureTrace],
     };
-    await db.conversations.add(convData);
-
+    const segmentsToPersist: any[] = [];
     let prevId: string | undefined = undefined;
     for (let i = 0; i < enrichedResult.segments.length; i++) {
       const seg = enrichedResult.segments[i];
       const segId = uuidv4();
-      await db.segments.add({
+      segmentsToPersist.push({
         id: segId,
         conversationId: convId,
         content: seg.content || '',
@@ -1219,6 +1237,10 @@ export default function App() {
       });
       prevId = segId;
     }
+    await getConversationStore().saveConversationWithSegments({
+      conversation: convData,
+      segments: segmentsToPersist,
+    });
     await registerSemanticAttributesFromAnalysis(enrichedResult.analysis, enrichedResult.segments);
     return convId;
   };
@@ -1950,8 +1972,7 @@ export default function App() {
       };
 
       convData.createdAt = now;
-      await db.conversations.add(convData);
-
+      const segmentsToPersist: any[] = [];
       // Si c'est une mise à jour, on peut éventuellement supprimer les anciens segments
       // mais l'utilisateur veut du "conservatif". On va faire un put pour écraser par ID si possible
       // ou simplement nettoyer si on re-segmente tout le fil.
@@ -1959,7 +1980,7 @@ export default function App() {
       for (let i = 0; i < potentialCapture.segments.length; i++) {
         const seg = potentialCapture.segments[i];
         const segId = uuidv4();
-        await db.segments.add({
+        segmentsToPersist.push({
           id: segId,
           conversationId: convId,
           content: seg.content || '',
@@ -1978,6 +1999,10 @@ export default function App() {
         });
         prevId = segId;
       }
+      await getConversationStore().saveConversationWithSegments({
+        conversation: convData,
+        segments: segmentsToPersist,
+      });
 
       await registerSemanticAttributesFromAnalysis(potentialCapture.analysis, potentialCapture.segments);
 
@@ -2086,6 +2111,19 @@ export default function App() {
       setIsSavingGranularity(false);
       setGranularitySaveStamp(Date.now());
     }, 300);
+  };
+
+  const handleFlushReplication = async () => {
+    setIsFlushingReplication(true);
+    try {
+      const summary = await flushReplicationQueue(50);
+      setReplicationSummary(summary);
+      alert(`Synchronisation terminée. Pending: ${summary.pending} | Synced: ${summary.synced} | Failed: ${summary.failed}`);
+    } catch (err: any) {
+      alert(`Échec de synchronisation: ${String(err?.message || err || 'unknown error')}`);
+    } finally {
+      setIsFlushingReplication(false);
+    }
   };
 
   const buildPromptMapFromDraft = (draft: PromptCollectionConfig) => {
@@ -3443,6 +3481,63 @@ export default function App() {
                           <BookOpenText className="w-4 h-4" />
                           Accéder au Dictionnaire
                         </button>
+                      </div>
+
+                      <div className="bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm space-y-6 md:col-span-2">
+                        <div className="flex items-center gap-3">
+                          <div className="p-2 bg-natural-sand rounded-xl text-natural-accent">
+                            <History className="w-5 h-5" />
+                          </div>
+                          <h3 className="font-serif text-xl text-natural-heading">État de synchronisation</h3>
+                        </div>
+                        <p className="text-sm text-natural-muted italic">
+                          Résilience hors-ligne: écritures locales + file de réplication vers backend distant.
+                        </p>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                          <div className="rounded-2xl border border-natural-sand bg-natural-bg/40 p-3">
+                            <p className="text-[10px] uppercase tracking-widest font-black text-natural-muted">Pending</p>
+                            <p className="text-xl font-black text-natural-heading mt-1">{replicationSummary.pending}</p>
+                          </div>
+                          <div className="rounded-2xl border border-natural-sand bg-natural-bg/40 p-3">
+                            <p className="text-[10px] uppercase tracking-widest font-black text-natural-muted">Synced</p>
+                            <p className="text-xl font-black text-natural-heading mt-1">{replicationSummary.synced}</p>
+                          </div>
+                          <div className="rounded-2xl border border-natural-sand bg-natural-bg/40 p-3">
+                            <p className="text-[10px] uppercase tracking-widest font-black text-natural-muted">Failed</p>
+                            <p className="text-xl font-black text-natural-heading mt-1">{replicationSummary.failed}</p>
+                          </div>
+                          <div className="rounded-2xl border border-natural-sand bg-natural-bg/40 p-3">
+                            <p className="text-[10px] uppercase tracking-widest font-black text-natural-muted">Total</p>
+                            <p className="text-xl font-black text-natural-heading mt-1">{replicationSummary.total}</p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <label className="text-[10px] uppercase tracking-widest font-black text-natural-muted">
+                            Backend actif
+                          </label>
+                          <select
+                            value={storageBackend}
+                            onChange={(e) => setStorageBackend(e.target.value as 'local' | 'hybrid' | 'neo4j_chroma')}
+                            className="px-3 py-2 bg-white border border-natural-sand rounded-xl text-[10px] font-black uppercase tracking-wider text-natural-muted"
+                          >
+                            <option value="local">local</option>
+                            <option value="hybrid">hybrid</option>
+                            <option value="neo4j_chroma">neo4j_chroma</option>
+                          </select>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <button
+                            onClick={handleFlushReplication}
+                            disabled={isFlushingReplication}
+                            className="px-4 py-3 bg-natural-accent text-white rounded-2xl font-bold text-xs uppercase tracking-widest hover:bg-natural-accent/90 transition-all disabled:opacity-60 flex items-center gap-2"
+                          >
+                            {isFlushingReplication ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
+                            Retry failed
+                          </button>
+                          <p className="text-[10px] uppercase tracking-widest font-black text-natural-muted">
+                            Rafraîchissement auto 2.5s
+                          </p>
+                        </div>
                       </div>
 
                       {/* Maintenance Config */}
