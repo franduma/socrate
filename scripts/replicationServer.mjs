@@ -301,12 +301,18 @@ async function neo4jReadConversationsByIds(conversationIds) {
 }
 
 async function neo4jLexicalSearch(queryText, topK = 10) {
-  const normalized = String(queryText || '').toLowerCase();
+  const normalizeLexical = (value) =>
+    String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+  const shortAllowed = new Set(['ia', 'ai', 'llm', 'gpt', 'nlp']);
+  const normalized = normalizeLexical(queryText);
   const terms = Array.from(new Set(
     normalized
-      .split(/[^a-z0-9\u00c0-\u024f]+/i)
+      .split(/[^a-z0-9]+/i)
       .map((t) => t.trim())
-      .filter((t) => t.length >= 3)
+      .filter((t) => t.length >= 3 || shortAllowed.has(t))
   ));
   if (!terms.length) return [];
 
@@ -326,16 +332,7 @@ async function neo4jLexicalSearch(queryText, topK = 10) {
             OPTIONAL MATCH (c)-[hs:HAS_SEGMENT]->(s:Segment)
             WITH c, collect(DISTINCT th.name) AS themes, hs, s
             ORDER BY hs.segmentOrder ASC
-            WITH c, themes, collect(DISTINCT s)[0..5] AS segs, $terms AS terms
-            WITH c, themes, segs, terms,
-                 toLower(coalesce(c.title, '')) AS t,
-                 toLower(coalesce(c.semanticSummary, '')) AS ss,
-                 reduce(acc = '', seg IN segs | acc + ' ' + toLower(coalesce(seg.originalText, seg.content, ''))) AS corpus
-            WITH c, themes, segs, terms, t, ss, corpus,
-                 [term IN terms WHERE t CONTAINS term OR ss CONTAINS term OR corpus CONTAINS term] AS matched
-            WHERE size(matched) > 0
-            WITH c, themes, segs, matched, toFloat(size(matched)) / toFloat(size(terms)) AS score
-            ORDER BY score DESC, c.updatedAt DESC
+            WITH c, themes, collect(DISTINCT s)[0..6] AS segs
             RETURN
               c.id AS id,
               c.title AS title,
@@ -346,11 +343,11 @@ async function neo4jLexicalSearch(queryText, topK = 10) {
               c.sha256 AS sha256,
               c.semanticSummary AS semanticSummary,
               themes AS themes,
-              [seg IN segs | coalesce(seg.originalText, seg.content)] AS previewSegments,
-              score AS score
-            LIMIT $limit
+              [seg IN segs | coalesce(seg.originalText, seg.content)] AS previewSegments
+            ORDER BY c.updatedAt DESC
+            LIMIT $fetchLimit
           `,
-          parameters: { terms, limit: Math.max(1, Number(topK || 10)) },
+          parameters: { fetchLimit: Math.max(50, Number(topK || 10) * 20) },
         },
       ],
     }),
@@ -364,20 +361,30 @@ async function neo4jLexicalSearch(queryText, topK = 10) {
     throw new Error(`Neo4j lexical error: ${json.errors[0]?.message || 'unknown'}`);
   }
   const rows = json?.results?.[0]?.data || [];
-  return rows.map((r) => r.row).map((row) => ({
-    conversationId: String(row[0] || ''),
-    score: typeof row[10] === 'number' ? Number(row[10].toFixed(4)) : null,
-    distance: null,
-    title: String(row[1] || ''),
-    source: String(row[2] || ''),
-    createdAt: Number(row[3] || 0),
-    updatedAt: Number(row[4] || 0),
-    themes: Array.isArray(row[8]) ? row[8].filter(Boolean) : [],
-    semanticSummary: String(row[7] || ''),
-    preview: Array.isArray(row[9]) ? row[9].filter(Boolean).join('\n\n').slice(0, 1200) : '',
-    vectorSnippet: '',
-    metadata: { mode: 'neo4j_lexical_fallback' },
-  }));
+  const scored = rows.map((r) => r.row).map((row) => {
+    const title = String(row[1] || '');
+    const summary = String(row[7] || '');
+    const preview = Array.isArray(row[9]) ? row[9].filter(Boolean).join('\n\n').slice(0, 1200) : '';
+    const corpus = normalizeLexical(`${title}\n${summary}\n${preview}`);
+    const matched = terms.filter((term) => corpus.includes(term));
+    const score = matched.length ? Number((matched.length / terms.length).toFixed(4)) : 0;
+    return {
+      conversationId: String(row[0] || ''),
+      score,
+      distance: null,
+      title,
+      source: String(row[2] || ''),
+      createdAt: Number(row[3] || 0),
+      updatedAt: Number(row[4] || 0),
+      themes: Array.isArray(row[8]) ? row[8].filter(Boolean) : [],
+      semanticSummary: summary,
+      preview,
+      vectorSnippet: '',
+      metadata: { mode: 'neo4j_lexical_fallback', matchedTerms: matched },
+    };
+  }).filter((x) => x.score > 0);
+  scored.sort((a, b) => (b.score - a.score) || (b.updatedAt - a.updatedAt));
+  return scored.slice(0, Math.max(1, Number(topK || 10)));
 }
 
 function applyLocalFilters(items, filters) {

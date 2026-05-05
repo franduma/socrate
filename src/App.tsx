@@ -464,6 +464,7 @@ export default function App() {
     localStorage.setItem('SOCRATE_CHAT_HISTORY', JSON.stringify(chatMessages));
   }, [chatMessages]);
 
+
   useEffect(() => {
     if (inputText) localStorage.setItem(QUICK_CAPTURE_DRAFT_KEY, inputText);
     else localStorage.removeItem(QUICK_CAPTURE_DRAFT_KEY);
@@ -638,6 +639,14 @@ export default function App() {
   const [activeParentId, setActiveParentId] = useState<string | null>(null);
   const [customQuestionInput, setCustomQuestionInput] = useState('');
   const chatContainerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (activeTab !== 'chat') return;
+    const el = chatContainerRef.current;
+    if (!el) return;
+    requestAnimationFrame(() => {
+      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    });
+  }, [chatMessages, isChatLoading, activeTab]);
 
   // Settings State
   const [apiKeyOverride, setApiKeyOverride] = useState(localStorage.getItem('GEMINI_API_KEY_OVERRIDE') || '');
