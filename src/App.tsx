@@ -413,6 +413,7 @@ async function buildContextSnapshot(contextText: string): Promise<ContextSnapsho
 }
 
 export default function App() {
+  type ChatRoutingMode = 'ia' | 'memory' | 'hybrid';
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [activeTab, setActiveTab] = useState<'conv' | 'files' | 'search' | 'segments' | 'settings' | 'chat' | 'instructions'>('conv');
   const [selectedConvId, setSelectedConvId] = useState<string | null>(null);
@@ -450,6 +451,10 @@ export default function App() {
     return saved ? JSON.parse(saved) : [];
   });
   const [isChatLoading, setIsChatLoading] = useState(false);
+  const [chatRoutingMode, setChatRoutingMode] = useState<ChatRoutingMode>(() => {
+    const raw = String(localStorage.getItem('SOCRATE_CHAT_ROUTING_MODE') || 'hybrid');
+    return raw === 'ia' || raw === 'memory' || raw === 'hybrid' ? raw : 'hybrid';
+  });
   
   const [currentChatConvId, setCurrentChatConvId] = useState<string | null>(() => {
     return localStorage.getItem('CURRENT_CHAT_CONV_ID');
@@ -476,6 +481,10 @@ export default function App() {
     if (currentChatConvId) localStorage.setItem('CURRENT_CHAT_CONV_ID', currentChatConvId);
     else localStorage.removeItem('CURRENT_CHAT_CONV_ID');
   }, [currentChatConvId]);
+
+  useEffect(() => {
+    localStorage.setItem('SOCRATE_CHAT_ROUTING_MODE', chatRoutingMode);
+  }, [chatRoutingMode]);
 
   useEffect(() => {
     localStorage.setItem(INSTRUCTIONS_QA_STORAGE_KEY, JSON.stringify(internalInstructionsQA));
@@ -2394,13 +2403,80 @@ export default function App() {
     setChatInput('');
     setIsChatLoading(true);
     try {
-      const { chatWithGemini } = await loadGeminiService();
+      const resolveSearchEndpoint = () => {
+        const replicateEndpoint = String(getReplicationEndpoint() || '').trim();
+        if (!replicateEndpoint) return 'http://127.0.0.1:3213/search/hybrid';
+        return replicateEndpoint.endsWith('/replicate')
+          ? replicateEndpoint.replace(/\/replicate$/i, '/search/hybrid')
+          : `${replicateEndpoint.replace(/\/$/, '')}/search/hybrid`;
+      };
+      const fetchMemoryResults = async () => {
+        const searchEndpoint = resolveSearchEndpoint();
+        const response = await fetch(searchEndpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: actualContent, topK: 5 }),
+        });
+        if (!response.ok) {
+          const text = await response.text().catch(() => '');
+          throw new Error(`Recherche memoire indisponible (${response.status}) ${text}`);
+        }
+        return response.json();
+      };
       const modelHistory = chatMessages.map(m => ({ role: m.role, content: m.content }));
-      const responsePromise = chatWithGemini(actualContent, modelHistory);
-      const response = await responsePromise;
+      let response = '';
+      let routeLabel = 'IA directe';
+
+      if (chatRoutingMode === 'memory') {
+        const memory = await fetchMemoryResults();
+        const results = Array.isArray(memory?.results) ? memory.results : [];
+        routeLabel = 'Memoire locale (Neo4j/Chroma)';
+        if (!results.length) {
+          response = "Aucun resultat trouve dans la memoire locale pour cette requete.";
+        } else {
+          const lines = results.slice(0, 5).map((r: any, idx: number) => {
+            const title = String(r?.title || '(sans titre)');
+            const source = String(r?.source || 'n/a');
+            const score = typeof r?.score === 'number' ? `${Math.round(r.score * 100)}%` : 'n/a';
+            const preview = String(r?.preview || r?.vectorSnippet || '').replace(/\s+/g, ' ').trim().slice(0, 220);
+            return `${idx + 1}. ${title}\n   Source: ${source} | Score: ${score}\n   ${preview}`;
+          });
+          response = `Resultats memoire locale:\n\n${lines.join('\n\n')}`;
+        }
+      } else if (chatRoutingMode === 'hybrid') {
+        const { chatWithGemini } = await loadGeminiService();
+        let memoryContext = '';
+        try {
+          const memory = await fetchMemoryResults();
+          const results = Array.isArray(memory?.results) ? memory.results : [];
+          if (results.length) {
+            memoryContext = results.slice(0, 3).map((r: any, idx: number) => {
+              const title = String(r?.title || '(sans titre)');
+              const preview = String(r?.preview || r?.vectorSnippet || '').replace(/\s+/g, ' ').trim().slice(0, 320);
+              return `[Contexte ${idx + 1}] ${title}\n${preview}`;
+            }).join('\n\n');
+          }
+        } catch {
+          // If local memory is unavailable, fallback to pure IA without failing the chat.
+        }
+        routeLabel = memoryContext ? 'Hybride (Memoire + IA)' : 'IA directe (fallback)';
+        const hybridPrompt = memoryContext
+          ? `Contexte memoire locale:\n${memoryContext}\n\nQuestion utilisateur:\n${actualContent}`
+          : actualContent;
+        response = await chatWithGemini(hybridPrompt, modelHistory);
+      } else {
+        const { chatWithGemini } = await loadGeminiService();
+        response = await chatWithGemini(actualContent, modelHistory);
+      }
       if (abortControllerRef.current?.signal.aborted) return;
       const assistantMsgId = uuidv4();
-      setChatMessages(prev => [...prev, { id: assistantMsgId, role: 'assistant', content: response, parentId: userMsgId }]);
+      setChatMessages(prev => [...prev, {
+        id: assistantMsgId,
+        role: 'assistant',
+        content: response,
+        parentId: userMsgId,
+        parentLabel: routeLabel,
+      }]);
     } catch (error: any) {
       console.error("Chat failed:", error);
       alert("Erreur chat : " + (error.message || "Inconnue"));
@@ -3941,6 +4017,16 @@ export default function App() {
                     </div>
                     <div className="flex items-center gap-3">
                       <select
+                        value={chatRoutingMode}
+                        onChange={(e) => setChatRoutingMode(e.target.value as ChatRoutingMode)}
+                        className="px-3 py-2 bg-white border border-natural-sand rounded-xl text-[10px] font-black uppercase tracking-wider text-natural-muted max-w-[220px]"
+                        title="Mode d'interrogation"
+                      >
+                        <option value="hybrid">Hybride (Memoire + IA)</option>
+                        <option value="memory">Memoire locale</option>
+                        <option value="ia">IA directe</option>
+                      </select>
+                      <select
                         value={selectedGranularityId}
                         onChange={(e) => setSelectedGranularityId(e.target.value)}
                         className="px-3 py-2 bg-white border border-natural-sand rounded-xl text-[10px] font-black uppercase tracking-wider text-natural-muted max-w-[220px]"
@@ -4080,6 +4166,11 @@ export default function App() {
                               {m.role === 'user' ? <User className="w-6 h-6" /> : <Bot className="w-6 h-6" />}
                             </div>
                             <div className="flex flex-col gap-3 max-w-full">
+                              {m.role === 'assistant' && m.parentLabel && (
+                                <div className="px-3 py-1 rounded-full bg-natural-sand text-[9px] font-black uppercase tracking-wider text-natural-accent w-fit">
+                                  Source: {m.parentLabel}
+                                </div>
+                              )}
                               <div 
                                 onContextMenu={(e) => handleContextMenu(e, m.id)}
                                 className={cn(
