@@ -36,6 +36,12 @@ Start the development server:
 npm run dev
 ```
 
+Start the full local stack (Docker Neo4j+Chroma + replication server + Vite):
+
+```bash
+npm run dev:full
+```
+
 Run the TypeScript check:
 
 ```bash
@@ -53,6 +59,7 @@ npm run build
 - Conversation data is stored locally in IndexedDB through Dexie.
 - API keys can also be overridden from the app settings and are persisted in local storage.
 - `.env*` files are ignored by git except for `.env.example`.
+- Operational guide (single source of truth): `docs/OPERATIONS_RUNBOOK.md`
 
 ## Optional Local Infra (Neo4j + Chroma)
 
@@ -93,6 +100,8 @@ By default it listens on `http://127.0.0.1:3213` and exposes:
 
 - `GET /health`
 - `POST /replicate`
+
+`/health` now checks both Neo4j and Chroma connectivity and returns `503` if one dependency is down.
 
 In Socrate settings, keep replication endpoint set to:
 

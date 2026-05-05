@@ -110,6 +110,32 @@ async function neo4jWrite(payload) {
   }
 }
 
+async function neo4jBootstrap() {
+  const txUrl = `${NEO4J_HTTP_URL}/db/neo4j/tx/commit`;
+  const statements = [
+    { statement: 'CREATE CONSTRAINT conversation_id_unique IF NOT EXISTS FOR (c:Conversation) REQUIRE c.id IS UNIQUE' },
+    { statement: 'CREATE CONSTRAINT segment_id_unique IF NOT EXISTS FOR (s:Segment) REQUIRE s.id IS UNIQUE' },
+    { statement: 'CREATE INDEX theme_name_idx IF NOT EXISTS FOR (t:Theme) ON (t.name)' },
+    { statement: 'CREATE INDEX conversation_sha_idx IF NOT EXISTS FOR (c:Conversation) ON (c.sha256)' },
+  ];
+  const response = await fetch(txUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: toNeo4jAuthHeader(),
+    },
+    body: JSON.stringify({ statements }),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Neo4j bootstrap HTTP ${response.status}: ${text || response.statusText}`);
+  }
+  const json = await response.json().catch(() => ({}));
+  if (Array.isArray(json?.errors) && json.errors.length > 0) {
+    throw new Error(`Neo4j bootstrap error: ${json.errors[0]?.message || 'unknown'}`);
+  }
+}
+
 async function ensureChromaCollection() {
   const createBody = { name: CHROMA_COLLECTION, get_or_create: true };
   let response = await fetch(`${CHROMA_URL}/api/v1/collections`, {
@@ -160,15 +186,53 @@ async function chromaWrite(payload) {
   }
 }
 
+async function checkNeo4jHealth() {
+  const txUrl = `${NEO4J_HTTP_URL}/db/neo4j/tx/commit`;
+  const response = await fetch(txUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: toNeo4jAuthHeader(),
+    },
+    body: JSON.stringify({ statements: [{ statement: 'RETURN 1 AS ok' }] }),
+  });
+  if (!response.ok) throw new Error(`Neo4j HTTP ${response.status}`);
+  const json = await response.json().catch(() => ({}));
+  if (Array.isArray(json?.errors) && json.errors.length > 0) {
+    throw new Error(json.errors[0]?.message || 'Neo4j query error');
+  }
+  return true;
+}
+
+async function checkChromaHealth() {
+  const response = await fetch(`${CHROMA_URL}/api/v1/heartbeat`);
+  if (!response.ok) throw new Error(`Chroma HTTP ${response.status}`);
+  return true;
+}
+
 app.get('/health', async (_req, res) => {
   const status = {
     ok: true,
     service: 'replication-server',
-    neo4j: NEO4J_HTTP_URL,
-    chroma: CHROMA_URL,
+    neo4j: { url: NEO4J_HTTP_URL, ok: false },
+    chroma: { url: CHROMA_URL, ok: false },
     collection: CHROMA_COLLECTION,
   };
-  res.json(status);
+  try {
+    await checkNeo4jHealth();
+    status.neo4j.ok = true;
+  } catch (error) {
+    status.ok = false;
+    status.neo4j.error = String(error?.message || error);
+  }
+  try {
+    await checkChromaHealth();
+    status.chroma.ok = true;
+  } catch (error) {
+    status.ok = false;
+    status.chroma.error = String(error?.message || error);
+  }
+  res.status(status.ok ? 200 : 503).json(status);
 });
 
 app.post('/replicate', async (req, res) => {
@@ -188,4 +252,11 @@ app.post('/replicate', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`[replication-server] listening on http://127.0.0.1:${PORT}`);
   console.log(`[replication-server] neo4j=${NEO4J_HTTP_URL} chroma=${CHROMA_URL} collection=${CHROMA_COLLECTION}`);
+  neo4jBootstrap()
+    .then(() => {
+      console.log('[replication-server] neo4j bootstrap complete (constraints/indexes ensured)');
+    })
+    .catch((error) => {
+      console.error(`[replication-server] neo4j bootstrap failed: ${String(error?.message || error)}`);
+    });
 });

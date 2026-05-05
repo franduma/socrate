@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "node scripts/devRunner.mjs",
+    "dev:full": "node scripts/fullDevRunner.mjs",
     "dev:vite": "vite --port=3001 --host=0.0.0.0",
     "build": "vite build",
     "preview": "vite preview --port=3002 --host=0.0.0.0",
