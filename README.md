@@ -100,9 +100,18 @@ By default it listens on `http://127.0.0.1:3213` and exposes:
 
 - `GET /health`
 - `POST /replicate`
+- `POST /search/hybrid`
 
 `/health` now checks both Neo4j and Chroma connectivity and returns `503` if one dependency is down.
 
 In Socrate settings, keep replication endpoint set to:
 
 `http://127.0.0.1:3213/replicate`
+
+Hybrid search example:
+
+```bash
+curl -X POST http://127.0.0.1:3213/search/hybrid ^
+  -H "Content-Type: application/json" ^
+  -d "{\"query\":\"ethique IA\", \"topK\":10, \"filters\":{\"sourceContains\":\"chat\"}}"
+```

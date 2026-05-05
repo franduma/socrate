@@ -36,8 +36,10 @@ Raccourcis dans le terminal `dev:full`:
 - Neo4j Browser: `http://127.0.0.1:7474`
 - Chroma heartbeat: `http://127.0.0.1:8000/api/v1/heartbeat`
 - Replication health: `http://127.0.0.1:3213/health`
+- Recherche hybride (POST): `http://127.0.0.1:3213/search/hybrid`
 
 Note: `http://127.0.0.1:3213/replicate` est un endpoint `POST` (un `GET` renverra "Cannot GET /replicate").
+Note: `http://127.0.0.1:3213/search/hybrid` est aussi un endpoint `POST`.
 
 ---
 
@@ -62,6 +64,10 @@ Resultat attendu apres sauvegarde d'une analyse:
 3. Dans l'app:
    - faire une analyse + sauvegarde
    - confirmer evolution des compteurs (`pending -> synced`)
+4. (Optionnel) Requete hybride:
+   - POST vers `/search/hybrid` avec `{"query":"...", "topK":10}`
+   - verifier la presence de resultats enrichis (titre, themes, preview, score)
+   - si Chroma exige `query_embeddings`, le serveur bascule automatiquement en `neo4j_lexical_fallback`
 
 ---
 
