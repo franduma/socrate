@@ -415,7 +415,7 @@ async function buildContextSnapshot(contextText: string): Promise<ContextSnapsho
 export default function App() {
   type ChatRoutingMode = 'ia' | 'memory' | 'hybrid';
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-  const [activeTab, setActiveTab] = useState<'conv' | 'files' | 'search' | 'segments' | 'settings' | 'chat' | 'instructions'>('conv');
+  const [activeTab, setActiveTab] = useState<'conv' | 'files' | 'search' | 'explorer' | 'segments' | 'settings' | 'chat' | 'instructions'>('conv');
   const [selectedConvId, setSelectedConvId] = useState<string | null>(null);
   const [inputText, setInputText] = useState(() => localStorage.getItem(QUICK_CAPTURE_DRAFT_KEY) || '');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -423,7 +423,7 @@ export default function App() {
   const [isReactionAdminOpen, setIsReactionAdminOpen] = useState(false);
   const [isDictionaryOpen, setIsDictionaryOpen] = useState(false);
   const [dictSearch, setDictSearch] = useState('');
-  const [sourceTab, setSourceTab] = useState<'conv' | 'files' | 'search' | 'segments' | 'settings' | 'chat' | 'instructions'>('conv');
+  const [sourceTab, setSourceTab] = useState<'conv' | 'files' | 'search' | 'explorer' | 'segments' | 'settings' | 'chat' | 'instructions'>('conv');
   const [potentialCapture, setPotentialCapture] = useState<{ 
     title: string, 
     segments: any[], 
@@ -467,6 +467,10 @@ export default function App() {
   const [hybridSearchMode, setHybridSearchMode] = useState('');
   const [isHybridSearching, setIsHybridSearching] = useState(false);
   const [hybridSearchResults, setHybridSearchResults] = useState<any[]>([]);
+  const [explorerCollectionId, setExplorerCollectionId] = useState<string>('');
+  const [explorerAttributeIds, setExplorerAttributeIds] = useState<string[]>([]);
+  const [selectedExplorerFolder, setSelectedExplorerFolder] = useState<string>('');
+  const [explorerTreeOpen, setExplorerTreeOpen] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     localStorage.setItem('SOCRATE_CHAT_HISTORY', JSON.stringify(chatMessages));
@@ -494,6 +498,7 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('SOCRATE_CHAT_ROUTING_MODE', chatRoutingMode);
   }, [chatRoutingMode]);
+
 
   useEffect(() => {
     localStorage.setItem(INSTRUCTIONS_QA_STORAGE_KEY, JSON.stringify(internalInstructionsQA));
@@ -2542,6 +2547,64 @@ export default function App() {
     }
   };
 
+  const normalizeFacetText = (value: string) =>
+    String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+
+  const scoreTextAgainstKeywords = (rawText: string, keywords: string[]): number => {
+    const text = normalizeFacetText(rawText);
+    if (!text.trim() || !keywords.length) return 0;
+    const matches = keywords.filter((kw) => {
+      const token = normalizeFacetText(kw).trim();
+      return token.length > 0 && text.includes(token);
+    }).length;
+    return matches > 0 ? Number((matches / keywords.length).toFixed(4)) : 0;
+  };
+  const activeExplorerCollection = semanticAttributeCollections.find((c) => c.id === explorerCollectionId) || semanticAttributeCollections[0] || null;
+  const defaultExplorerAttributeIds = (activeExplorerCollection?.attributeIds || []).slice(0, 8);
+  const effectiveExplorerAttributeIds = explorerAttributeIds.length > 0 ? explorerAttributeIds : defaultExplorerAttributeIds;
+  const explorerCandidateAttributes = semanticAttributes.filter((attr) =>
+    (activeExplorerCollection?.attributeIds || []).includes(attr.id)
+  );
+  const explorerSelectedAttributes = semanticAttributes.filter((attr) =>
+    effectiveExplorerAttributeIds.includes(attr.id)
+  );
+  const keywordSetFromLabel = (label: string): string[] => {
+    const base = normalizeFacetText(label);
+    const parts = base.split(/[^a-z0-9]+/).filter(Boolean);
+    const set = new Set<string>([base, ...parts]);
+    return Array.from(set).filter((x) => x.length >= 2);
+  };
+  const explorerScoredFolders = explorerSelectedAttributes.map((attr) => {
+    const keywords = keywordSetFromLabel(attr.label);
+    const items = conversations.map((conv) => {
+      const convSegs = segments.filter((s) => s.conversationId === conv.id).slice(0, 8);
+      const corpus = `${conv.title || ''}\n${conv.semanticAnalysis?.summary || ''}\n${convSegs.map((s) => s.originalText || s.content || '').join('\n\n')}`;
+      const score = scoreTextAgainstKeywords(corpus, keywords);
+      return { conv, score };
+    }).filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score || b.conv.updatedAt - a.conv.updatedAt);
+    return {
+      folder: attr.label,
+      attributeId: attr.id,
+      keywords,
+      count: items.length,
+      items,
+    };
+  });
+  const activeExplorerFolder = explorerScoredFolders.find((f) => f.folder === selectedExplorerFolder) || explorerScoredFolders[0];
+  useEffect(() => {
+    if (!explorerScoredFolders.length) {
+      if (selectedExplorerFolder) setSelectedExplorerFolder('');
+      return;
+    }
+    if (!selectedExplorerFolder || !explorerScoredFolders.some((f) => f.folder === selectedExplorerFolder)) {
+      setSelectedExplorerFolder(explorerScoredFolders[0].folder);
+    }
+  }, [explorerScoredFolders, selectedExplorerFolder]);
+
   const handleInterruptChat = () => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -2697,6 +2760,7 @@ export default function App() {
           <nav className="px-3 space-y-1.5">
             <NavItem icon={<MessageSquare className="w-4 h-4" />} label="Conversations" active={activeTab === 'conv'} onClick={() => { setActiveTab('conv'); setSelectedConvId(null); }} count={conversations.length} />
             <NavItem icon={<Search className="w-4 h-4" />} label="Recherche" active={activeTab === 'search'} onClick={() => { setActiveTab('search'); setSelectedConvId(null); }} />
+            <NavItem icon={<FolderOpen className="w-4 h-4" />} label="Explorateur" active={activeTab === 'explorer'} onClick={() => { setActiveTab('explorer'); setSelectedConvId(null); }} />
             <NavItem icon={<Quote className="w-4 h-4" />} label="Segments" active={activeTab === 'segments'} onClick={() => { setActiveTab('segments'); setSelectedConvId(null); }} />
             <NavItem icon={<FileText className="w-4 h-4" />} label="Imports" active={activeTab === 'files'} onClick={() => { setActiveTab('files'); setSelectedConvId(null); }} count={files.length + conversations.filter((c) => !!(c.analysisTrace?.webSourceUrl || c.analysisTrace?.webDocumentUrl)).length} />
             <NavItem icon={<BookOpenText className="w-4 h-4" />} label="Instructions" active={activeTab === 'instructions'} onClick={() => { setActiveTab('instructions'); setSelectedConvId(null); }} />
@@ -4532,6 +4596,168 @@ export default function App() {
                       ))}
                     </div>
                   )}
+                </section>
+              </motion.div>
+            ) : activeTab === 'explorer' && !selectedConvId ? (
+              <motion.div key="explorer-view" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }} className="max-w-6xl mx-auto w-full space-y-6">
+                <section className="bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm space-y-5">
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <h1 className="font-serif text-3xl text-natural-heading">Explorateur à Facettes</h1>
+                      <p className="text-xs uppercase tracking-wider text-natural-muted font-semibold mt-1">
+                        Arborescence configurable selon les attributs officiels
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <label className="text-[10px] font-black uppercase tracking-wider text-natural-muted">Collection</label>
+                      <select
+                        value={explorerCollectionId || activeExplorerCollection?.id || ''}
+                        onChange={(e) => {
+                          const id = e.target.value;
+                          setExplorerCollectionId(id);
+                          setExplorerAttributeIds([]);
+                        }}
+                        className="px-4 py-2.5 bg-white border border-natural-sand rounded-xl text-[11px] font-bold uppercase tracking-wider text-natural-muted"
+                      >
+                        {semanticAttributeCollections.map((c) => (
+                          <option key={c.id} value={c.id}>{c.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-natural-sand bg-natural-bg/30 p-4">
+                    <p className="text-[10px] font-black uppercase tracking-wider text-natural-muted mb-2">
+                      Attributs actifs pour la classification (tree configurable)
+                    </p>
+                    <div className="max-h-[130px] overflow-y-auto grid grid-cols-1 md:grid-cols-2 gap-2">
+                      {explorerCandidateAttributes.map((attr) => {
+                        const checked = effectiveExplorerAttributeIds.includes(attr.id);
+                        return (
+                          <label key={attr.id} className="flex items-center gap-2 text-xs text-natural-heading">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(e) => {
+                                const on = e.target.checked;
+                                setExplorerAttributeIds((prev) => {
+                                  if (on) return Array.from(new Set([...prev, attr.id]));
+                                  return prev.filter((x) => x !== attr.id);
+                                });
+                              }}
+                            />
+                            <span className="font-semibold">{attr.label}</span>
+                          </label>
+                        );
+                      })}
+                      {explorerCandidateAttributes.length === 0 && (
+                        <p className="text-xs italic text-natural-muted">Aucun attribut disponible dans cette collection.</p>
+                      )}
+                    </div>
+                  </div>
+                </section>
+
+                <section className="bg-white p-6 rounded-[32px] border border-natural-sand shadow-sm grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-6 min-h-[520px]">
+                  <aside className="border border-natural-sand rounded-2xl p-3 bg-natural-bg/30 overflow-y-auto">
+                    <p className="text-[10px] uppercase tracking-widest font-black text-natural-muted px-2 py-2">Arborescence</p>
+                    <div className="space-y-2">
+                      <div className="px-2 py-2 rounded-lg bg-white border border-natural-sand">
+                        <div className="flex items-center gap-2 text-[11px] font-black uppercase tracking-wider text-natural-heading">
+                          <FolderOpen className="w-4 h-4 text-natural-accent" />
+                          <span>{activeExplorerCollection?.name || 'Collection'}</span>
+                        </div>
+                      </div>
+                      {explorerScoredFolders.map((folder) => {
+                        const isOpen = explorerTreeOpen[folder.folder] !== false;
+                        return (
+                          <div key={folder.folder} className="rounded-xl border border-natural-sand bg-white/70">
+                            <button
+                              onClick={() => {
+                                setSelectedExplorerFolder(folder.folder);
+                                setExplorerTreeOpen((prev) => ({ ...prev, [folder.folder]: !isOpen }));
+                              }}
+                              className={cn(
+                                "w-full text-left px-3 py-2.5 transition-all",
+                                selectedExplorerFolder === folder.folder ? "bg-natural-bg/60" : "hover:bg-natural-bg/40"
+                              )}
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <ChevronRight className={cn("w-3.5 h-3.5 text-natural-stone transition-transform", isOpen ? "rotate-90" : "")} />
+                                  {isOpen ? <FolderOpen className="w-4 h-4 text-natural-accent" /> : <FolderOpen className="w-4 h-4 text-natural-stone" />}
+                                  <span className="font-bold text-[11px] uppercase tracking-wider text-natural-heading truncate">{folder.folder}</span>
+                                </div>
+                                <span className="text-[10px] font-black text-natural-accent">{folder.count}</span>
+                              </div>
+                            </button>
+                            {isOpen && (
+                              <div className="px-3 pb-2 space-y-1 border-t border-natural-sand/70">
+                                {folder.items.slice(0, 5).map(({ conv, score }) => (
+                                  <button
+                                    key={`${folder.folder}-${conv.id}`}
+                                    onClick={() => {
+                                      setSourceTab('explorer');
+                                      setSelectedConvId(conv.id);
+                                      setActiveTab('conv');
+                                    }}
+                                    className="w-full text-left px-2 py-1.5 rounded-md hover:bg-natural-bg/50 text-[11px] text-natural-muted"
+                                    title={conv.title}
+                                  >
+                                    <span className="font-semibold text-natural-heading">•</span> {conv.title}
+                                    <span className="ml-1 text-natural-accent font-black">({Math.round(score * 100)}%)</span>
+                                  </button>
+                                ))}
+                                {folder.items.length > 5 && (
+                                  <p className="text-[10px] italic text-natural-muted px-2">+ {folder.items.length - 5} autres...</p>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </aside>
+                  <div className="border border-natural-sand rounded-2xl p-4 bg-white overflow-y-auto">
+                    <div className="flex items-center justify-between mb-3">
+                      <h2 className="font-serif text-2xl text-natural-heading">
+                        {activeExplorerFolder?.folder ? `Dossier: ${activeExplorerFolder.folder}` : 'Dossier'}
+                      </h2>
+                      <span className="text-[10px] uppercase tracking-wider font-black text-natural-muted">
+                        {activeExplorerFolder?.count || 0} conversation(s)
+                      </span>
+                    </div>
+                    {(!activeExplorerFolder || activeExplorerFolder.items.length === 0) ? (
+                      <div className="rounded-2xl border-2 border-dashed border-natural-sand p-10 text-center text-natural-muted italic">
+                        Aucune conversation classée dans ce dossier pour l’instant.
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        {activeExplorerFolder.items.map(({ conv, score }) => (
+                          <button
+                            key={conv.id}
+                            onClick={() => {
+                              setSourceTab('explorer');
+                              setSelectedConvId(conv.id);
+                              setActiveTab('conv');
+                            }}
+                            className="w-full text-left p-4 rounded-2xl border border-natural-sand hover:border-natural-accent/40 hover:bg-natural-bg/30 transition-all"
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <p className="font-serif text-xl text-natural-heading line-clamp-2">{conv.title}</p>
+                              <span className="text-[10px] uppercase tracking-wider font-black text-natural-accent">
+                                {Math.round(score * 100)}%
+                              </span>
+                            </div>
+                            <p className="text-[10px] uppercase tracking-widest font-semibold text-natural-muted mt-2">
+                              {new Date(conv.updatedAt).toLocaleString()}
+                            </p>
+                            <p className="text-sm text-natural-text mt-2 line-clamp-4">
+                              {conv.semanticAnalysis?.summary || 'Résumé non disponible.'}
+                            </p>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </section>
               </motion.div>
             ) : activeTab === 'segments' && !selectedConvId ? (
