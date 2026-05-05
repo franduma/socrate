@@ -459,6 +459,14 @@ export default function App() {
   const [currentChatConvId, setCurrentChatConvId] = useState<string | null>(() => {
     return localStorage.getItem('CURRENT_CHAT_CONV_ID');
   });
+  const [hybridSearchQuery, setHybridSearchQuery] = useState('');
+  const [hybridSearchTopK, setHybridSearchTopK] = useState(10);
+  const [hybridSearchSource, setHybridSearchSource] = useState('');
+  const [hybridSearchTitle, setHybridSearchTitle] = useState('');
+  const [hybridSearchTheme, setHybridSearchTheme] = useState('');
+  const [hybridSearchMode, setHybridSearchMode] = useState('');
+  const [isHybridSearching, setIsHybridSearching] = useState(false);
+  const [hybridSearchResults, setHybridSearchResults] = useState<any[]>([]);
 
   useEffect(() => {
     localStorage.setItem('SOCRATE_CHAT_HISTORY', JSON.stringify(chatMessages));
@@ -2495,6 +2503,45 @@ export default function App() {
     }
   };
 
+  const handleRunHybridSearch = async () => {
+    const query = hybridSearchQuery.trim();
+    if (!query || isHybridSearching) return;
+    setIsHybridSearching(true);
+    try {
+      const replicateEndpoint = String(getReplicationEndpoint() || '').trim();
+      const searchEndpoint = !replicateEndpoint
+        ? 'http://127.0.0.1:3213/search/hybrid'
+        : replicateEndpoint.endsWith('/replicate')
+          ? replicateEndpoint.replace(/\/replicate$/i, '/search/hybrid')
+          : `${replicateEndpoint.replace(/\/$/, '')}/search/hybrid`;
+      const payload = {
+        query,
+        topK: Math.max(1, Math.min(50, Number(hybridSearchTopK || 10))),
+        filters: {
+          sourceContains: hybridSearchSource.trim() || undefined,
+          titleContains: hybridSearchTitle.trim() || undefined,
+          themeIncludes: hybridSearchTheme.trim() || undefined,
+        },
+      };
+      const response = await fetch(searchEndpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(`Recherche hybride indisponible (${response.status}) ${text}`);
+      }
+      const json = await response.json();
+      setHybridSearchMode(String(json?.mode || ''));
+      setHybridSearchResults(Array.isArray(json?.results) ? json.results : []);
+    } catch (error: any) {
+      alert(`Erreur recherche hybride: ${String(error?.message || error || 'inconnue')}`);
+    } finally {
+      setIsHybridSearching(false);
+    }
+  };
+
   const handleInterruptChat = () => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -2649,6 +2696,7 @@ export default function App() {
 
           <nav className="px-3 space-y-1.5">
             <NavItem icon={<MessageSquare className="w-4 h-4" />} label="Conversations" active={activeTab === 'conv'} onClick={() => { setActiveTab('conv'); setSelectedConvId(null); }} count={conversations.length} />
+            <NavItem icon={<Search className="w-4 h-4" />} label="Recherche" active={activeTab === 'search'} onClick={() => { setActiveTab('search'); setSelectedConvId(null); }} />
             <NavItem icon={<Quote className="w-4 h-4" />} label="Segments" active={activeTab === 'segments'} onClick={() => { setActiveTab('segments'); setSelectedConvId(null); }} />
             <NavItem icon={<FileText className="w-4 h-4" />} label="Imports" active={activeTab === 'files'} onClick={() => { setActiveTab('files'); setSelectedConvId(null); }} count={files.length + conversations.filter((c) => !!(c.analysisTrace?.webSourceUrl || c.analysisTrace?.webDocumentUrl)).length} />
             <NavItem icon={<BookOpenText className="w-4 h-4" />} label="Instructions" active={activeTab === 'instructions'} onClick={() => { setActiveTab('instructions'); setSelectedConvId(null); }} />
@@ -4380,6 +4428,112 @@ export default function App() {
                     </section>
                   </div>
                 </motion.div>
+            ) : activeTab === 'search' && !selectedConvId ? (
+              <motion.div key="search-view" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }} className="max-w-5xl mx-auto w-full space-y-6">
+                <section className="bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm space-y-5">
+                  <div className="flex items-center gap-3">
+                    <Search className="w-5 h-5 text-natural-accent" />
+                    <h1 className="font-serif text-3xl text-natural-heading">Recherche Hybride</h1>
+                  </div>
+                  <p className="text-xs uppercase tracking-wider text-natural-muted font-semibold">
+                    Chroma + Neo4j (avec fallback lexical automatique)
+                  </p>
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                    <input
+                      value={hybridSearchQuery}
+                      onChange={(e) => setHybridSearchQuery(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && handleRunHybridSearch()}
+                      placeholder="Requete..."
+                      className="md:col-span-2 px-4 py-3 bg-natural-bg border border-natural-sand rounded-xl text-sm outline-none focus:border-natural-accent"
+                    />
+                    <input
+                      value={String(hybridSearchTopK)}
+                      onChange={(e) => setHybridSearchTopK(Number(e.target.value || 10))}
+                      placeholder="TopK"
+                      type="number"
+                      min={1}
+                      max={50}
+                      className="px-4 py-3 bg-natural-bg border border-natural-sand rounded-xl text-sm outline-none focus:border-natural-accent"
+                    />
+                    <button
+                      onClick={handleRunHybridSearch}
+                      disabled={isHybridSearching || !hybridSearchQuery.trim()}
+                      className="px-4 py-3 bg-natural-accent text-white rounded-xl text-sm font-bold disabled:opacity-40 flex items-center justify-center gap-2"
+                    >
+                      {isHybridSearching ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+                      Rechercher
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <input
+                      value={hybridSearchSource}
+                      onChange={(e) => setHybridSearchSource(e.target.value)}
+                      placeholder="Filtre source"
+                      className="px-4 py-3 bg-natural-bg border border-natural-sand rounded-xl text-sm outline-none focus:border-natural-accent"
+                    />
+                    <input
+                      value={hybridSearchTitle}
+                      onChange={(e) => setHybridSearchTitle(e.target.value)}
+                      placeholder="Filtre titre"
+                      className="px-4 py-3 bg-natural-bg border border-natural-sand rounded-xl text-sm outline-none focus:border-natural-accent"
+                    />
+                    <input
+                      value={hybridSearchTheme}
+                      onChange={(e) => setHybridSearchTheme(e.target.value)}
+                      placeholder="Filtre theme"
+                      className="px-4 py-3 bg-natural-bg border border-natural-sand rounded-xl text-sm outline-none focus:border-natural-accent"
+                    />
+                  </div>
+                  {hybridSearchMode && (
+                    <div className="text-[10px] uppercase tracking-widest font-black text-natural-muted">
+                      Mode courant: {hybridSearchMode}
+                    </div>
+                  )}
+                </section>
+
+                <section className="bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm space-y-4">
+                  <h2 className="font-serif text-2xl text-natural-heading">Resultats</h2>
+                  {hybridSearchResults.length === 0 ? (
+                    <div className="rounded-2xl border-2 border-dashed border-natural-sand p-8 text-center text-natural-muted italic">
+                      Aucun resultat pour le moment.
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      {hybridSearchResults.map((r: any, idx: number) => (
+                        <button
+                          key={`${r?.conversationId || 'result'}-${idx}`}
+                          onClick={() => {
+                            const convId = String(r?.conversationId || '').trim();
+                            if (!convId) return;
+                            setSourceTab('search');
+                            setSelectedConvId(convId);
+                            setActiveTab('conv');
+                          }}
+                          className="w-full text-left p-5 rounded-2xl border border-natural-sand hover:border-natural-accent/40 hover:bg-natural-bg/40 transition-all"
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <p className="font-serif text-xl text-natural-heading line-clamp-2">{String(r?.title || '(sans titre)')}</p>
+                            <span className="text-[10px] uppercase tracking-wider font-black text-natural-accent">
+                              Score {typeof r?.score === 'number' ? `${Math.round(r.score * 100)}%` : 'n/a'}
+                            </span>
+                          </div>
+                          <p className="text-[10px] uppercase tracking-widest text-natural-muted font-semibold mt-2">
+                            Source: {String(r?.source || 'n/a')}
+                          </p>
+                          {Array.isArray(r?.themes) && r.themes.length > 0 && (
+                            <p className="text-[10px] uppercase tracking-widest text-natural-muted font-semibold mt-1">
+                              Themes: {r.themes.slice(0, 6).join(', ')}
+                            </p>
+                          )}
+                          <p className="text-sm text-natural-text mt-3 whitespace-pre-wrap line-clamp-5">
+                            {String(r?.preview || r?.vectorSnippet || '')}
+                          </p>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </section>
+              </motion.div>
             ) : activeTab === 'segments' && !selectedConvId ? (
               <motion.div key="segments-view" initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -15 }} className="max-w-4xl mx-auto w-full">
                 {renderDeferredView(<AllSegmentsView onSelectConversation={(convId) => { setSelectedConvId(convId); setSourceTab('segments'); }} />)}
