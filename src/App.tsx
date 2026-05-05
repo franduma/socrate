@@ -3656,7 +3656,7 @@ export default function App() {
                           <input
                             value={replicationEndpoint}
                             onChange={(e) => setReplicationEndpointState(e.target.value)}
-                            placeholder="http://127.0.0.1:3212/replicate"
+                                  placeholder="http://127.0.0.1:3213/replicate"
                             className="flex-1 min-w-[320px] p-2.5 bg-white border border-natural-sand rounded-xl text-xs"
                           />
                           <button

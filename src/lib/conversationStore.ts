@@ -76,7 +76,7 @@ type ReplicationSummary = {
 
 const REPLICATION_STUB_FAIL_KEY = 'SOCRATE_REPLICATION_STUB_FAIL';
 const REPLICATION_ENDPOINT_KEY = 'SOCRATE_REPLICATION_ENDPOINT';
-const DEFAULT_REPLICATION_ENDPOINT = 'http://127.0.0.1:3212/replicate';
+const DEFAULT_REPLICATION_ENDPOINT = 'http://127.0.0.1:3213/replicate';
 
 function getReplicationSummaryInternal(): ReplicationSummary {
   const entries = readReplicationLog();

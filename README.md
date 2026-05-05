@@ -53,3 +53,47 @@ npm run build
 - Conversation data is stored locally in IndexedDB through Dexie.
 - API keys can also be overridden from the app settings and are persisted in local storage.
 - `.env*` files are ignored by git except for `.env.example`.
+
+## Optional Local Infra (Neo4j + Chroma)
+
+This project now includes a local Docker stack to prepare real replication targets.
+
+1. Create env file:
+
+```bash
+copy .env.neo4j-chroma.example .env.neo4j-chroma
+```
+
+2. Start services:
+
+```bash
+docker compose --env-file .env.neo4j-chroma -f docker-compose.neo4j-chroma.yml up -d
+```
+
+3. Check endpoints:
+
+- Neo4j Browser: `http://127.0.0.1:7474`
+- Chroma: `http://127.0.0.1:8000`
+
+4. Stop services:
+
+```bash
+docker compose -f docker-compose.neo4j-chroma.yml down
+```
+
+## Replication Server (real Neo4j + Chroma writes)
+
+When Docker services are up, run:
+
+```bash
+npm run replication:server
+```
+
+By default it listens on `http://127.0.0.1:3213` and exposes:
+
+- `GET /health`
+- `POST /replicate`
+
+In Socrate settings, keep replication endpoint set to:
+
+`http://127.0.0.1:3213/replicate`

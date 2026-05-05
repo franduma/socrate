@@ -3,7 +3,7 @@ import express from 'express';
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-const PORT = Number(process.env.REPLICATION_MOCK_PORT || 3212);
+const PORT = Number(process.env.REPLICATION_MOCK_PORT || 3213);
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'replication-mock', port: PORT });
@@ -31,4 +31,3 @@ app.listen(PORT, () => {
   console.log('[replication-mock] health: GET /health');
   console.log('[replication-mock] endpoint: POST /replicate');
 });
-

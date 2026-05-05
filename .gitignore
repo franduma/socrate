@@ -6,4 +6,5 @@ coverage/
 *.log
 .env*
 !.env.example
+!.env.neo4j-chroma.example
 .socrate-browser-proxy.json

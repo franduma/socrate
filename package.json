@@ -10,6 +10,7 @@
     "preview": "vite preview --port=3002 --host=0.0.0.0",
     "proxy-relay": "node scripts/browserProxyRelay.mjs",
     "replication:mock": "node scripts/replicationMock.mjs",
+    "replication:server": "node scripts/replicationServer.mjs",
     "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
     "lint": "tsc --noEmit"
   },
