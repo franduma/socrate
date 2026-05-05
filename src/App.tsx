@@ -500,6 +500,7 @@ export default function App() {
   }, [chatRoutingMode]);
 
 
+
   useEffect(() => {
     localStorage.setItem(INSTRUCTIONS_QA_STORAGE_KEY, JSON.stringify(internalInstructionsQA));
   }, [internalInstructionsQA]);
@@ -839,6 +840,9 @@ export default function App() {
   const [isFlushingReplication, setIsFlushingReplication] = useState(false);
   const [replicationFailMode, setReplicationFailMode] = useState(() => isReplicationStubFailMode());
   const [replicationEndpoint, setReplicationEndpointState] = useState(() => getReplicationEndpoint());
+  const [adminConversationFilter, setAdminConversationFilter] = useState('');
+  const [adminSelectedConversationIds, setAdminSelectedConversationIds] = useState<string[]>([]);
+  const [isDeletingSelectedConversations, setIsDeletingSelectedConversations] = useState(false);
   const [storageBackend, setStorageBackend] = useState<'local' | 'hybrid' | 'neo4j_chroma'>(() => {
     const raw = String(localStorage.getItem('SOCRATE_STORAGE_BACKEND') || 'local');
     return raw === 'hybrid' || raw === 'neo4j_chroma' ? raw : 'local';
@@ -916,6 +920,17 @@ export default function App() {
   const facetCollections = useLiveQuery(() => db.facetCollections.toArray()) || [];
   const semanticAttributes = useLiveQuery(() => db.semanticAttributes.orderBy('updatedAt').reverse().toArray()) || [];
   const semanticAttributeCollections = useLiveQuery(() => db.semanticAttributeCollections.orderBy('updatedAt').reverse().toArray()) || [];
+  const filteredAdminConversations = conversations.filter((conv) => {
+    const q = adminConversationFilter.trim().toLowerCase();
+    if (!q) return true;
+    const title = String(conv.title || '').toLowerCase();
+    const summary = String(conv.semanticAnalysis?.summary || '').toLowerCase();
+    return title.includes(q) || summary.includes(q) || String(conv.id || '').toLowerCase().includes(q);
+  });
+  useEffect(() => {
+    const validIds = new Set(conversations.map((c) => c.id));
+    setAdminSelectedConversationIds((prev) => prev.filter((id) => validIds.has(id)));
+  }, [conversations]);
 
   const [selectedSemanticCollectionId, setSelectedSemanticCollectionId] = useState<string>(() =>
     localStorage.getItem('SELECTED_SEMANTIC_COLLECTION_ID') || ''
@@ -1356,6 +1371,56 @@ export default function App() {
     if (selectedConvId === conversationId) {
       setSelectedConvId(null);
       setActiveTab('files');
+    }
+  };
+
+  const handleDeleteSelectedConversationsFromAllDbs = async () => {
+    const ids = Array.from(new Set(adminSelectedConversationIds.map((id) => String(id || '').trim()).filter(Boolean)));
+    if (!ids.length || isDeletingSelectedConversations) return;
+    const confirmed = confirm(
+      `Supprimer ${ids.length} conversation(s) sélectionnée(s) ?\n\n` +
+      `Cette action retirera localement les conversations/segments, et demandera aussi le retrait dans Neo4j/Chroma.`
+    );
+    if (!confirmed) return;
+
+    setIsDeletingSelectedConversations(true);
+    try {
+      const replicateEndpoint = String(getReplicationEndpoint() || '').trim();
+      const adminDeleteEndpoint = !replicateEndpoint
+        ? 'http://127.0.0.1:3213/admin/delete-conversations'
+        : replicateEndpoint.endsWith('/replicate')
+          ? replicateEndpoint.replace(/\/replicate$/i, '/admin/delete-conversations')
+          : `${replicateEndpoint.replace(/\/$/, '')}/admin/delete-conversations`;
+
+      // Best effort remote cleanup first.
+      try {
+        const response = await fetch(adminDeleteEndpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ conversationIds: ids }),
+        });
+        if (!response.ok) {
+          const text = await response.text().catch(() => '');
+          console.warn(`Remote delete failed (${response.status}): ${text}`);
+        }
+      } catch (error) {
+        console.warn('Remote delete request failed:', error);
+      }
+
+      // Local source-of-truth cleanup.
+      for (const convId of ids) {
+        await db.segments.where('conversationId').equals(convId).delete();
+        await db.conversations.delete(convId);
+      }
+      if (selectedConvId && ids.includes(selectedConvId)) {
+        setSelectedConvId(null);
+      }
+      setAdminSelectedConversationIds((prev) => prev.filter((id) => !ids.includes(id)));
+      alert(`Suppression terminée pour ${ids.length} conversation(s).`);
+    } catch (error: any) {
+      alert(`Erreur suppression: ${String(error?.message || error || 'inconnue')}`);
+    } finally {
+      setIsDeletingSelectedConversations(false);
     }
   };
 
@@ -2939,6 +3004,79 @@ export default function App() {
                             {includeTechnicalSegment ? 'Actif' : 'Inactif'}
                           </button>
                         </div>
+                      </div>
+                    </div>
+
+                    <div className="bg-white p-8 rounded-[32px] border border-natural-sand shadow-sm space-y-6">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 bg-natural-sand rounded-xl text-natural-accent"><Trash2 className="w-5 h-5" /></div>
+                        <h3 className="font-serif text-xl text-natural-heading">Administration des bases de données</h3>
+                      </div>
+                      <p className="text-sm text-natural-muted italic">
+                        Sélectionnez des conversations puis supprimez-les localement et dans Neo4j/Chroma.
+                      </p>
+                      <div className="grid grid-cols-1 md:grid-cols-[1fr_150px] gap-2">
+                        <input
+                          value={adminConversationFilter}
+                          onChange={(e) => setAdminConversationFilter(e.target.value)}
+                          placeholder="Filtrer par titre, résumé, ID..."
+                          className="p-3 bg-natural-bg border border-natural-sand rounded-xl text-xs"
+                        />
+                        <div className="flex items-center justify-end gap-2">
+                          <button
+                            onClick={() => setAdminSelectedConversationIds(filteredAdminConversations.map((c) => c.id))}
+                            className="px-3 py-2 bg-white border border-natural-sand text-natural-heading rounded-xl text-[10px] font-black uppercase tracking-widest"
+                          >
+                            Tout
+                          </button>
+                          <button
+                            onClick={() => setAdminSelectedConversationIds([])}
+                            className="px-3 py-2 bg-white border border-natural-sand text-natural-heading rounded-xl text-[10px] font-black uppercase tracking-widest"
+                          >
+                            Aucun
+                          </button>
+                        </div>
+                      </div>
+                      <div className="rounded-2xl border border-natural-sand bg-natural-bg/30 p-3 max-h-[280px] overflow-y-auto custom-scrollbar space-y-2">
+                        {filteredAdminConversations.length === 0 ? (
+                          <p className="text-xs italic text-natural-muted">Aucune conversation trouvée.</p>
+                        ) : (
+                          filteredAdminConversations.map((conv) => {
+                            const checked = adminSelectedConversationIds.includes(conv.id);
+                            return (
+                              <label key={conv.id} className="flex items-start gap-2 bg-white border border-natural-sand rounded-xl p-2.5">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={(e) => {
+                                    const on = e.target.checked;
+                                    setAdminSelectedConversationIds((prev) => on ? Array.from(new Set([...prev, conv.id])) : prev.filter((id) => id !== conv.id));
+                                  }}
+                                />
+                                <div className="min-w-0">
+                                  <p className="text-xs font-bold text-natural-heading truncate">{conv.title}</p>
+                                  <p className="text-[10px] text-natural-stone truncate">{conv.id}</p>
+                                  <p className="text-[10px] text-natural-muted mt-1">
+                                    {new Date(conv.updatedAt).toLocaleString()} • segments: {conv.segmentsCount}
+                                  </p>
+                                </div>
+                              </label>
+                            );
+                          })
+                        )}
+                      </div>
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="text-[10px] uppercase tracking-widest font-black text-natural-muted">
+                          Sélection: {adminSelectedConversationIds.length}
+                        </p>
+                        <button
+                          onClick={handleDeleteSelectedConversationsFromAllDbs}
+                          disabled={isDeletingSelectedConversations || adminSelectedConversationIds.length === 0}
+                          className="px-4 py-2.5 bg-red-600 text-white rounded-xl text-xs font-black uppercase tracking-widest disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                        >
+                          {isDeletingSelectedConversations ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                          Effacer sélection (BD)
+                        </button>
                       </div>
                     </div>
 

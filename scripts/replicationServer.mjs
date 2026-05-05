@@ -387,6 +387,76 @@ async function neo4jLexicalSearch(queryText, topK = 10) {
   return scored.slice(0, Math.max(1, Number(topK || 10)));
 }
 
+async function neo4jDeleteConversations(conversationIds) {
+  const ids = Array.from(new Set((conversationIds || []).map((x) => String(x || '').trim()).filter(Boolean)));
+  if (!ids.length) return;
+  const txUrl = `${NEO4J_HTTP_URL}/db/neo4j/tx/commit`;
+  const response = await fetch(txUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: toNeo4jAuthHeader(),
+    },
+    body: JSON.stringify({
+      statements: [
+        {
+          statement: `
+            MATCH (c:Conversation)
+            WHERE c.id IN $ids
+            OPTIONAL MATCH (c)-[:HAS_SEGMENT]->(s:Segment)
+            DETACH DELETE s
+          `,
+          parameters: { ids },
+        },
+        {
+          statement: `
+            MATCH (c:Conversation)
+            WHERE c.id IN $ids
+            DETACH DELETE c
+          `,
+          parameters: { ids },
+        },
+        {
+          statement: `
+            MATCH (t:Theme)
+            WHERE NOT (t)<-[:HAS_THEME]-(:Conversation)
+            DETACH DELETE t
+          `,
+          parameters: {},
+        },
+      ],
+    }),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Neo4j delete HTTP ${response.status}: ${text || response.statusText}`);
+  }
+  const json = await response.json().catch(() => ({}));
+  if (Array.isArray(json?.errors) && json.errors.length > 0) {
+    throw new Error(`Neo4j delete error: ${json.errors[0]?.message || 'unknown'}`);
+  }
+}
+
+async function chromaDeleteConversations(conversationIds) {
+  const ids = Array.from(new Set((conversationIds || []).map((x) => String(x || '').trim()).filter(Boolean)));
+  if (!ids.length) return;
+  const collection = await ensureChromaCollection();
+  const collectionId = String(collection?.id || '');
+  if (!collectionId) throw new Error('Chroma collection id missing.');
+
+  const response = await fetch(`${CHROMA_URL}/api/v1/collections/${collectionId}/delete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      where: { conversationId: { '$in': ids } },
+    }),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Chroma delete HTTP ${response.status}: ${text || response.statusText}`);
+  }
+}
+
 function applyLocalFilters(items, filters) {
   const sourceContains = String(filters?.sourceContains || '').trim().toLowerCase();
   const titleContains = String(filters?.titleContains || '').trim().toLowerCase();
@@ -525,6 +595,24 @@ app.post('/search/hybrid', async (req, res) => {
   } catch (error) {
     const msg = String(error?.message || error || 'unknown');
     console.error(`[replication-server] hybrid search failed: ${msg}`);
+    res.status(500).json({ ok: false, error: msg });
+  }
+});
+
+app.post('/admin/delete-conversations', async (req, res) => {
+  const conversationIds = Array.isArray(req.body?.conversationIds) ? req.body.conversationIds : [];
+  const ids = Array.from(new Set(conversationIds.map((x) => String(x || '').trim()).filter(Boolean)));
+  if (!ids.length) {
+    res.status(400).json({ ok: false, error: 'conversationIds is required' });
+    return;
+  }
+  try {
+    await neo4jDeleteConversations(ids);
+    await chromaDeleteConversations(ids);
+    res.json({ ok: true, deleted: ids.length, conversationIds: ids });
+  } catch (error) {
+    const msg = String(error?.message || error || 'unknown');
+    console.error(`[replication-server] delete conversations failed: ${msg}`);
     res.status(500).json({ ok: false, error: msg });
   }
 });
